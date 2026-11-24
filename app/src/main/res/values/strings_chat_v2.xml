@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- ========== 聊天详情 v2（分组气泡 / 表情面板 / 附件面板）补充文案 ========== -->
+    <!-- 表情面板：全部表情分区标题 -->
+    <string name="chat_v2_all_emoji_title">全部表情</string>
+    <!-- 表情面板：GIF 标签页占位 -->
+    <string name="chat_v2_gif_placeholder">GIF 面板待接入</string>
+    <!-- 表情面板：表情包搜索无结果 -->
+    <string name="chat_v2_sticker_empty">没有找到相关表情包</string>
+    <!-- 表情面板：清空搜索 -->
+    <string name="chat_v2_clear_search">清空搜索</string>
+    <!-- 附件面板：关闭底部提示（仅隐藏提示，不收起面板） -->
+    <string name="chat_v2_hint_dismiss">关闭提示</string>
+</resources>

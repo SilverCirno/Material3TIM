@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- ========== 聊天详情页专属文案（chat_detail_ 前缀，避免与其他页面冲突） ========== -->
+    <!-- 附件面板 4x2 动作 -->
+    <string name="chat_detail_action_photo">照片</string>
+    <string name="chat_detail_action_camera">拍摄</string>
+    <string name="chat_detail_action_file">文件</string>
+    <string name="chat_detail_action_red_packet">红包</string>
+    <string name="chat_detail_action_location">位置</string>
+    <string name="chat_detail_action_contact">名片</string>
+    <string name="chat_detail_action_voice_call">语音通话</string>
+    <string name="chat_detail_action_favorites">收藏</string>
+    <!-- 红包气泡 -->
+    <string name="chat_detail_red_packet_open">领取</string>
+    <!-- 聊天信息页：单聊的 TIM 号 / 群公告等 -->
+    <string name="chat_detail_tim_id">TIM 号：%s</string>
+</resources>

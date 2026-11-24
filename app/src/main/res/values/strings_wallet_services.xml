@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- ========== 钱包页 ========== -->
+    <string name="wallet_amount">¥ %s</string>
+    <string name="wallet_security_summary">实名认证、支付密码与资金安全保障</string>
+
+    <!-- ========== 服务页 ========== -->
+    <string name="services_empty">没有找到相关服务</string>
+</resources>

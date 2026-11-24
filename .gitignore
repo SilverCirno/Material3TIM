@@ -1,0 +1,25 @@
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+/buildSrc/build
+/app/build
+.kotlin
+
+# APK / AAB 构建产物（根目录历史 APK 不入库，Release 通过 Releases/网盘分发）
+*.apk
+*.aab
+
+# 本地签名/密钥（TM_KEYSTORE 等配置放 ~/.gradle/gradle.properties，不入库）
+*.jks
+*.keystore
+
+# 文档不收录截图（含真实聊天数据，避免隐私泄露）
+docs/screenshots/
+docs/refs/

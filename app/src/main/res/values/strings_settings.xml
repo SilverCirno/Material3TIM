@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 「设置」「我的」「关于」页面补充文案。公共文案见 values/strings.xml。 -->
+<resources>
+    <!-- ========== 关于页 ========== -->
+    <string name="about_version_format">版本 %1$s（%2$d）</string>
+    <string name="about_ui_style_format">界面风格：%1$s</string>
+    <string name="about_license_apache">Apache License 2.0</string>
+    <string name="about_license_gpl3">GNU GPL v3.0</string>
+    <string name="about_license_mit">MIT License</string>
+    <string name="about_license_ofl">SIL OFL 1.1</string>
+    <string name="about_third_party_kernelsu">KernelSU Manager</string>
+    <string name="about_third_party_miuix">Miuix</string>
+    <string name="about_third_party_kolor">material-kolor</string>
+    <string name="about_third_party_google_sans">Google Sans Flex</string>
+</resources>

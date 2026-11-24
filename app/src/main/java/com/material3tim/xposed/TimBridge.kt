@@ -1,0 +1,21392 @@
+package com.material3tim.xposed
+
+import android.app.Activity
+import android.content.Context
+import android.content.Intent
+import android.util.Log
+import com.material3tim.AppEnvironment
+import com.material3tim.data.model.AddFriendGroup
+import com.material3tim.data.model.AddFriendSearchResult
+import com.material3tim.data.model.AddFriendSettingInfo
+import com.material3tim.data.model.AddFriendUser
+import com.material3tim.data.model.ChatInfoData
+import com.material3tim.data.model.ChatItem
+import com.material3tim.data.model.ChatMember
+import com.material3tim.data.model.ChatMessage
+import com.material3tim.data.model.ChatMessageType
+import com.material3tim.data.model.ChatPart
+import com.material3tim.data.model.ChatPartKind
+import com.material3tim.data.model.ChatPreviewTag
+import com.material3tim.data.model.ContactDetail
+import com.material3tim.data.model.ContactItem
+import com.material3tim.data.model.CustomEmoji
+import com.material3tim.data.model.GroupFileDownload
+import com.material3tim.data.model.GroupFileEntry
+import com.material3tim.data.model.FriendRequest
+import com.material3tim.data.model.FriendRequestState
+import com.material3tim.data.model.GlobalSearchMessage
+import com.material3tim.data.model.StickerPack
+import com.material3tim.data.model.GroupAssistantData
+import com.material3tim.data.model.GlobalSearchResult
+import com.material3tim.data.model.GroupFilePage
+import com.material3tim.data.model.GroupMemberRole
+import com.material3tim.data.model.GroupNotice
+import com.material3tim.data.model.UserProfile
+import com.material3tim.data.repository.LiveChats
+import com.material3tim.data.repository.formatChatTimeLabel
+import com.material3tim.data.source.AddFriendSource
+import com.material3tim.data.source.AppUiState
+import com.material3tim.data.source.AtTarget
+import com.material3tim.data.source.DataUpdate
+import com.material3tim.data.source.ChatSettingSource
+import com.material3tim.data.source.ChatSource
+import com.material3tim.data.source.ContactSource
+import com.material3tim.data.source.EmojiSource
+import com.material3tim.data.source.GroupCreateSource
+import com.material3tim.data.source.CallSource
+import com.material3tim.data.source.FriendManageSource
+import com.material3tim.data.source.GroupFileSource
+import com.material3tim.data.source.SearchSource
+import com.material3tim.data.source.GroupManageSource
+import com.material3tim.data.source.LiveEvents
+import com.material3tim.data.source.MessageEvent
+import com.material3tim.data.source.MessageSource
+import com.material3tim.data.source.QrActionSource
+import com.material3tim.data.source.VoicePlaybackSource
+import java.lang.reflect.Proxy
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+
+/**
+ * 第 3 步：从 TIM 进程内取真实数据的反射桥。
+ *
+ * 数据入口（TIM 4.1.0 NT）：
+ * ```
+ * mqq.app.MobileQQ.sMobileQQ.peekAppRuntime()
+ *     .getRuntimeService(IKernelService::class.java, "")
+ *     ├─ getRecentContactService().a()                        → 最近会话（同步）
+ *     ├─ getMsgService()                                       → 读消息 / 发消息
+ *     ├─ getAvatarService().getAvatarPath/getGroupAvatarPath   → 头像本地路径
+ *     └─ runtime.getCurrentUin()/getCurrentNickname()          → 我的资料
+ * ```
+ *
+ * TIM 的接口类名/方法名是混淆过的（如 `com.tencent.qqnt.kernel.api.x.a()`），
+ * 这里全部用反射按“方法形状”查找，并只依赖 `kernel.nativeinterface` 里
+ * 未混淆的 native 数据类 getter。
+ */
+internal object TimBridge {
+
+    private const val TAG = "Material3Tim"
+
+    /** 内核消息监听注册失败后的最小重试间隔：ensureServices 会被高频调用，避免刷日志/反复注册。 */
+    private const val MSG_LISTENER_RETRY_MS = 10_000L
+
+    /** 会话列表刷新的合并去抖窗口：一次消息风暴只触发一次 loadChats。 */
+    private const val LIVE_REFRESH_DEBOUNCE_MS = 900L
+
+    /** 单次内核回调最多处理的会话数 / 消息 id 数，防止异常回调把日志与内存打爆。 */
+    private const val MAX_PUSH_CHATS_PER_CALLBACK = 20
+    private const val MAX_PUSH_MSG_IDS = 200
+
+    /** 同一回调节点的详细日志最小间隔（消息风暴时不逐条刷屏）。 */
+    private const val PUSH_LOG_INTERVAL_MS = 500L
+
+    @Volatile
+    var isHost: Boolean = false
+        private set
+
+    @Volatile
+    private var servicesReady = false
+
+    private var kernelService: Any? = null
+    private var recentContactService: Any? = null
+    private var msgService: Any? = null
+    private var avatarService: Any? = null
+    private var nativeAvatarService: Any? = null
+    private var appRuntime: Any? = null
+    private var faceDecoder: Any? = null
+    private var buddyService: Any? = null
+    private var profileService: Any? = null
+    private var avatarSizeClass: Class<*>? = null
+    private var avatarSizeSmall: Any? = null
+    private var avatarSizeBig: Any? = null
+
+    /** chatId -> TIM Contact 对象（拉消息/发消息用）。 */
+    private val contacts = ConcurrentHashMap<String, Any>()
+
+    /** chatId -> 会话的 peer 信息（头像/群标识用）。 */
+    private val chatMeta = ConcurrentHashMap<String, ChatMeta>()
+
+    /** uid -> uin 缓存（legacy 头像缓存按 uin 索引）。 */
+    private val uidToUin = ConcurrentHashMap<String, Long>()
+
+    /** uin -> legacy 头像磁盘缓存路径（空串表示已检查过、不存在）。 */
+    private val legacyHeadPathCache = ConcurrentHashMap<Long, String>()
+
+    /** 已经触发过头像下载的 uid/uin，避免重复请求。 */
+    private val avatarDownloadRequested = ConcurrentHashMap.newKeySet<String>()
+
+    /** 最近会话群头像：后台下载排队（同群去重，避免 loadRecentChats 反复触发）。 */
+    private val groupAvatarDownloadRequested = ConcurrentHashMap.newKeySet<Long>()
+
+    /** 群头像日志去重（每个群每种状态只打一次，避免会话列表刷新刷屏）。 */
+    private val groupAvatarLogged = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    private val groupAvatarExecutor =
+        java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, "m3tim-group-avatar").apply { isDaemon = true }
+        }
+
+    /** 最近一次加载的好友列表（联系人详情用）。 */
+    @Volatile
+    private var loadedContacts: List<ContactItem> = emptyList()
+
+    @Volatile
+    private var myUid: String? = null
+
+    @Volatile
+    private var myUin: String? = null
+
+    @Volatile
+    private var selfAvatarPathCache: String? = null
+
+    /** 已经触发过下载的图片元素（msgId:elementId），避免反复请求。 */
+    private val imageDownloadRequested = ConcurrentHashMap.newKeySet<String>()
+
+    private val videoThumbRequested = ConcurrentHashMap.newKeySet<String>()
+
+    /** 聊天记录内视频文件下载+抽帧请求去重（key = "videoFile:msgId:elementId"）。 */
+    private val videoFileDownloadStarted = ConcurrentHashMap.newKeySet<String>()
+
+    /** 视频消息所属会话上下文（合并转发内层消息可能是别的会话）：msgId -> (peerUid, chatType)。 */
+    private data class VideoPlayContext(val peerUid: String, val chatType: Int, val at: Long)
+
+    private val videoPlayContextByMsg = ConcurrentHashMap<Long, VideoPlayContext>()
+    private val videoPlayCtxLogged = ConcurrentHashMap.newKeySet<Long>()
+
+    /** 记录视频消息所属会话 peer/chatType（含聊天记录/嵌套记录里的跨会话视频），供 videoPlayUrl 使用。 */
+    private fun cacheVideoPlayContext(record: Any?, msgId: Long) {
+        if (record == null || msgId == 0L) return
+        val peerUid = (invokeGetter(record, "getPeerUid") as? String)?.takeIf { it.isNotBlank() }
+            ?: return
+        val chatType = (invokeGetter(record, "getChatType") as? Number)?.toInt() ?: return
+        if (chatType <= 0) return
+        val now = perfUptime()
+        if (videoPlayContextByMsg.size > 500) {
+            videoPlayContextByMsg.entries.removeAll { now - it.value.at > 10 * 60_000L }
+            if (videoPlayContextByMsg.size > 500) videoPlayContextByMsg.clear()
+        }
+        videoPlayContextByMsg[msgId] = VideoPlayContext(peerUid, chatType, now)
+        if (videoPlayCtxLogged.size < 300 && videoPlayCtxLogged.add(msgId)) {
+            Log.i(TAG, "videoCtx: msg=$msgId peer=$peerUid chatType=$chatType")
+        }
+    }
+
+    /** 视频首帧兜底缩略图：elementId -> 本地 jpg 路径（RichMedia 缩略图拿不到时用）。 */
+    private val videoFrameThumbs = ConcurrentHashMap<Long, String>()
+
+    /** ARK 卡片预览图：远程 URL -> 本地缓存路径；以及已发起过的下载 URL（避免重复请求）。 */
+    private val arkPreviewCache = ConcurrentHashMap<String, String>()
+    private val arkPreviewRequested = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /** ARK bytesData 首次日志：每个 app 只打一次完整 JSON（截断 2000 字符），供真机核对结构。 */
+    private val loggedArkRawApps = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /** 聊天记录类 ARK 检测日志去重（同一条消息只打一次）。 */
+    private val loggedChatRecordArk = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
+
+    /** ARK base64 兜底解码日志去重（msgId|field|raw）。 */
+    private val loggedArkBase64 = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /** 群公告 ARK 识别日志去重（同一条消息只打一次）。 */
+    private val loggedArkGroupNotice = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
+
+    /** 红包 WalletElement 字段日志去重（msgId:elementId），第一次解析时打全字段供真机核对。 */
+    private val loggedWalletElements = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * 正在等待内核回显的自发视频：sendMsg 回调 result 在 TIM 上可能为 -1（超时/未知语义），
+     * 但内核会通过 onAddSendMsg/onMsgInfoListUpdate 把消息加回来；用 chatId + fileSize 匹配。
+     */
+    private class PendingVideoSend(
+        val chatId: String,
+        val fileSize: Long,
+        val filePath: String,
+        val thumbPath: String?,
+        val durationSeconds: Int,
+        val width: Int,
+        val height: Int,
+        val startedAt: Long,
+    ) {
+        val latch = CountDownLatch(1)
+        @Volatile
+        var msgId: Long = 0L
+    }
+
+    private val pendingVideoSends = java.util.concurrent.CopyOnWriteArrayList<PendingVideoSend>()
+
+    /** 自己发出的视频元数据（key=fileSize，TTL 10 分钟）：reload 后服务端元素字段为空时回填。 */
+    private class SentVideoMeta(
+        val filePath: String?,
+        val thumbPath: String?,
+        val durationSeconds: Int,
+        val width: Int,
+        val height: Int,
+        val at: Long,
+    )
+
+    private val sentVideoMeta = ConcurrentHashMap<Long, SentVideoMeta>()
+    private val SENT_VIDEO_META_TTL_MS = 10 * 60 * 1000L
+
+    /** 视频消息缩略图缺失时，用 RichMedia 请求一次缩略图下载（downType=1）。 */
+    /** 触发内核下载语音（TIM PttMsgItem.h2 同款 RichMediaElementGetReq）。 */
+    private fun requestPttDownload(record: Any, msgId: Long, elementId: Long) {
+        if (!isHost || msgId == 0L || elementId == 0L) return
+        val service = msgService ?: return
+        val cl = hostClassLoader() ?: return
+        if (!pttDownloadRequested.add("$msgId:$elementId")) return
+        runCatching {
+            val reqClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.RichMediaElementGetReq", false, cl,
+            )
+            val req = reqClass.getConstructor().newInstance()
+            val peerUid = invokeGetter(record, "getPeerUid") as? String ?: ""
+            val chatType = (invokeGetter(record, "getChatType") as? Number)?.toInt() ?: 0
+            reqClass.getField("msgId").setLong(req, msgId)
+            reqClass.getField("peerUid").set(req, peerUid)
+            reqClass.getField("chatType").setInt(req, chatType)
+            reqClass.getField("elementId").setLong(req, elementId)
+            reqClass.getField("downloadType").setInt(req, 1)
+            reqClass.getField("downSourceType").setInt(req, 1)
+            reqClass.getField("triggerType").setInt(req, 1)
+            val method = service.javaClass.methods.firstOrNull {
+                it.name == "getRichMediaElement" && it.parameterCount == 1
+            } ?: return@runCatching
+            method.invoke(service, req)
+            Log.i(TAG, "pttDownload: requested msg=$msgId elem=$elementId")
+        }.onFailure { t ->
+            Log.w(TAG, "pttDownload failed: ${t.javaClass.simpleName} ${t.message}")
+        }
+    }
+
+    /**
+     * 请求视频缩略图下载（与 TIM `ShortVideoMsgItem.j2()` 同款参数）：
+     * RichMediaElementGetReq{msgId, peerUid, chatType, elementId, downloadType=2, thumbSize=0,
+     * downSourceType=1, triggerType=1}。之前误用 downloadType=1（下载视频本体），所以缩略图一直不来。
+     */
+    private fun requestVideoThumb(chatId: String, msgId: Long, elementId: Long) {
+        val service = msgService ?: return
+        val meta = chatMeta[chatId] ?: return
+        val cl = hostClassLoader() ?: return
+        if (elementId == 0L) return
+        val key = "$msgId:$elementId"
+        if (!videoThumbRequested.add(key)) return
+        runCatching {
+            val method = service.javaClass.methods.firstOrNull {
+                it.name == "getRichMediaElement" && it.parameterCount == 1
+            } ?: return@runCatching
+            val request = buildRichMediaElementGetReq(
+                cl,
+                peerUid = meta.peerUid,
+                chatType = meta.chatType,
+                msgId = msgId,
+                elementId = elementId,
+                downloadType = 2,
+                thumbSize = 0,
+                downSourceType = 1,
+                triggerType = 1,
+            ) ?: return@runCatching
+            mainHandler.post {
+                runCatching { method.invoke(service, request) }
+                Log.i(TAG, "requested video thumb: msg=$msgId elem=$elementId (downloadType=2)")
+            }
+        }.onFailure { Log.w(TAG, "request video thumb failed: ${it.javaClass.simpleName} ${it.message}") }
+    }
+
+    /** 构造 RichMediaElementGetReq（字段赋值版，便于区分缩略图/视频本体请求）。 */
+    private fun buildRichMediaElementGetReq(
+        cl: ClassLoader,
+        peerUid: String,
+        chatType: Int,
+        msgId: Long,
+        elementId: Long,
+        downloadType: Int,
+        thumbSize: Int,
+        downSourceType: Int,
+        triggerType: Int,
+        filePath: String = "",
+        fileModelId: Long = 0L,
+    ): Any? = runCatching {
+        val reqClass = Class.forName(
+            "com.tencent.qqnt.kernel.nativeinterface.RichMediaElementGetReq", false, cl,
+        )
+        val req = reqClass.getConstructor().newInstance()
+        reqClass.getField("msgId").setLong(req, msgId)
+        reqClass.getField("peerUid").set(req, peerUid)
+        reqClass.getField("chatType").setInt(req, chatType)
+        reqClass.getField("elementId").setLong(req, elementId)
+        reqClass.getField("downloadType").setInt(req, downloadType)
+        reqClass.getField("thumbSize").setInt(req, thumbSize)
+        reqClass.getField("downSourceType").setInt(req, downSourceType)
+        reqClass.getField("triggerType").setInt(req, triggerType)
+        reqClass.getField("filePath").set(req, filePath)
+        reqClass.getField("fileModelId").setLong(req, fileModelId)
+        req
+    }.getOrNull()
+
+    /**
+     * 用内核 `IKernelMsgService.assembleMobileQQRichMediaFilePath(RichMediaFilePathInfo)` 组装富媒体本地路径
+     * （TIM `aio/utils/v.e/f` 同款）：接收到的 VideoElement 的 filePath/thumbPath 常为空，但可用
+     * videoMd5/fileName/importRichMediaContext/fileUuid 经此 API 拼出真实缓存路径。
+     * elementType=5（视频），downloadType=1（视频本体）/2（缩略图）。
+     */
+    private fun assembleRichMediaPath(
+        elementType: Int,
+        elementSubType: Int,
+        md5HexStr: String,
+        fileName: String,
+        downloadType: Int,
+        thumbSize: Int,
+        importRichMediaContext: ByteArray?,
+        fileUuid: String,
+        needCreate: Boolean,
+    ): String? {
+        val service = msgService ?: return null
+        val cl = hostClassLoader() ?: return null
+        return runCatching {
+            val infoClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.RichMediaFilePathInfo", false, cl,
+            )
+            val info = infoClass.getConstructor(
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                String::class.java,
+                String::class.java,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                ByteArray::class.java,
+                String::class.java,
+                Boolean::class.javaPrimitiveType,
+            ).newInstance(
+                elementType,
+                elementSubType,
+                md5HexStr,
+                fileName,
+                downloadType,
+                thumbSize,
+                importRichMediaContext,
+                fileUuid,
+                needCreate,
+            )
+            val method = service.javaClass.methods.firstOrNull {
+                it.name == "assembleMobileQQRichMediaFilePath" && it.parameterCount == 1
+            } ?: return@runCatching null
+            (method.invoke(service, info) as? String)?.takeIf { it.isNotBlank() }
+        }.getOrNull()
+    }
+
+    /** 是否是图片扩展名（视频缩略图/首帧兜底只接受可解码图片）。 */
+    private fun isImageFilePath(path: String?): Boolean {
+        val lower = path?.lowercase(Locale.ROOT) ?: return false
+        return listOf(".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic").any {
+            lower.endsWith(it)
+        }
+    }
+
+    /** 是否是视频扩展名（视频本体路径）。 */
+    private fun isVideoFilePath(path: String?): Boolean {
+        val lower = path?.lowercase(Locale.ROOT) ?: return false
+        return listOf(".mp4", ".mov", ".3gp", ".mkv", ".avi", ".wmv", ".webm", ".m4v").any {
+            lower.endsWith(it)
+        }
+    }
+
+    /**
+     * 扫 TIM 短视频缓存目录找视频本体：`<externalFilesDir.parent>/Tencent/Tim/shortvideo/<md5>/<md5>.mp4`。
+     * 接收消息的 VideoElement.filePath 常为空，但 TIM 可能已自动下载到该目录（真机已确认存在与
+     * fileSize 完全一致的 mp4）。优先文件名含 videoMd5/fileName，其次大小匹配。
+     */
+    private fun findTimShortVideoFile(
+        videoMd5: String,
+        fileName: String,
+        fileSize: Long,
+    ): String? {
+        val context = timApplicationContext() ?: hostContext() ?: return null
+        val extDataDir = runCatching { context.getExternalFilesDir(null)?.parentFile }.getOrNull()
+            ?: return null
+        val root = java.io.File(extDataDir, "Tencent/Tim/shortvideo")
+        if (!root.isDirectory) return null
+        val candidates = ArrayList<java.io.File>()
+        fun scan(dir: java.io.File?, depth: Int) {
+            if (dir == null || depth > 2) return
+            val list = runCatching { dir.listFiles() }.getOrNull() ?: return
+            if (list.size > 500) return
+            for (entry in list) {
+                entry ?: continue
+                if (runCatching { entry.isDirectory }.getOrDefault(false)) {
+                    scan(entry, depth + 1)
+                } else if (isVideoFilePath(entry.name)) {
+                    candidates.add(entry)
+                }
+            }
+        }
+        scan(root, 0)
+        if (candidates.isEmpty()) return null
+        val needles = listOf(videoMd5, fileName)
+            .map { it.substringAfterLast('/') }
+            .filter { it.isNotBlank() }
+        candidates.firstOrNull { file -> needles.any { file.name.contains(it, true) } }
+            ?.let { return it.absolutePath }
+        if (fileSize > 0L) {
+            candidates.firstOrNull { it.length() == fileSize }?.let { return it.absolutePath }
+            candidates.firstOrNull { kotlin.math.abs(it.length() - fileSize) <= 4096L }
+                ?.let { return it.absolutePath }
+        }
+        return null
+    }
+
+    /** 用 MediaMetadataRetriever 探测视频元数据（时长/宽高/旋转）。 */
+    private class VideoProbeMeta(
+        val durationMs: Long,
+        val width: Int,
+        val height: Int,
+        val rotation: Int,
+    )
+
+    private fun probeVideoMetadata(filePath: String): VideoProbeMeta? {
+        val retriever = android.media.MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(filePath)
+            val durationMs = retriever
+                .extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toLongOrNull() ?: 0L
+            val widthRaw = retriever
+                .extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
+                ?.toIntOrNull() ?: 0
+            val heightRaw = retriever
+                .extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
+                ?.toIntOrNull() ?: 0
+            val rotation = retriever
+                .extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
+                ?.toIntOrNull() ?: 0
+            val (width, height) = if (rotation == 90 || rotation == 270) {
+                heightRaw to widthRaw
+            } else {
+                widthRaw to heightRaw
+            }
+            Log.i(
+                TAG,
+                "videoProbe: path=$filePath durMs=$durationMs ${width}x$height rotation=$rotation",
+            )
+            VideoProbeMeta(durationMs, width, height, rotation)
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "videoProbe failed path=$filePath: ${t.javaClass.simpleName} ${t.message}",
+            )
+            null
+        } finally {
+            runCatching { retriever.release() }
+        }
+    }
+
+    /** 从视频文件截首帧存本地 jpg（MediaMetadataRetriever），用于缩略图/发送封面兜底。 */
+    private fun generateVideoFrameJpg(videoPath: String, cacheKey: String): String? {
+        val context = timApplicationContext() ?: hostContext() ?: run {
+            Log.w(TAG, "videoFrameJpg: no context path=$videoPath")
+            return null
+        }
+        val retriever = android.media.MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(videoPath)
+            val bitmap = retriever.getFrameAtTime(0L)
+            if (bitmap == null) {
+                Log.w(TAG, "videoFrameJpg: getFrameAtTime returned null path=$videoPath")
+                return null
+            }
+            try {
+                val dir = java.io.File(context.cacheDir, "m3tim_video_thumbs")
+                dir.mkdirs()
+                val out = java.io.File(
+                    dir,
+                    "${cacheKey.replace(Regex("[^A-Za-z0-9_-]"), "_").take(48)}.jpg",
+                )
+                java.io.FileOutputStream(out).use { fos ->
+                    bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 70, fos)
+                }
+                out.absolutePath.takeIf { pathUsable(it) }
+            } finally {
+                bitmap.recycle()
+            }
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "videoFrameJpg failed path=$videoPath: ${t.javaClass.simpleName} ${t.message}",
+            )
+            null
+        } finally {
+            runCatching { retriever.release() }
+        }
+    }
+
+    /** 视频消息首帧兜底缩略图（按 elementId 缓存，只截一次）。 */
+    private fun videoFrameThumb(elementId: Long, videoPath: String): String? {
+        if (elementId == 0L) return null
+        videoFrameThumbs[elementId]?.takeIf { pathUsable(it) }?.let { return it }
+        val path = generateVideoFrameJpg(videoPath, "video_$elementId") ?: return null
+        videoFrameThumbs[elementId] = path
+        Log.i(TAG, "video frame thumb: elem=$elementId path=${path.take(100)}")
+        return path
+    }
+
+    /** 内核下载完成的图片：msgId -> 本地文件（缩略图优先，用于气泡展示）。 */
+    private val downloadedImageThumbs = ConcurrentHashMap<Long, String>()
+    private val downloadedImageOrig = ConcurrentHashMap<Long, String>()
+
+    /** 我们自己指定的富媒体下载落盘路径（key = "msgId:elementId"），用于聊天记录里的图片/视频封面。 */
+    private val pendingRichMediaPaths = ConcurrentHashMap<String, String>()
+
+    /** 已请求过的语音下载 msgId:elementId，避免重复请求。 */
+    private val pttDownloadRequested = ConcurrentHashMap.newKeySet<String>()
+
+    private val urlImageDownloadStarted = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /** 下载完成回调按元素 id 记录路径：合并转发里的元素 msgId 不是本地 msgId，只能靠 elementId 对上。 */
+    private val downloadedMediaByElement = ConcurrentHashMap<Long, String>()
+    // 自己发送的语音：内核消息回读时 PttElement.filePath 可能为空，用 md5/uuid/文件名映射到本地 silk 文件，
+    // 保证自己发的语音气泡可点击播放。
+    private val sentVoiceLocalPaths = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    private val loggedTimCachedImages = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
+
+    /** 聊天记录里的图片拿不到本地路径时，直接用 originImageUrl 下载缩略图。 */
+    private fun requestImageUrlDownload(msgId: Long, elementId: Long, url: String) {
+        val key = "$msgId:$elementId"
+        if (!urlImageDownloadStarted.add(key)) return
+        val context = appContext() ?: return
+        val target = java.io.File(cacheDirForImages(context), "$key.${extForUrl(url)}")
+            .apply { parentFile?.mkdirs() }
+        if (target.isFile && target.length() > 0L) {
+            pendingRichMediaPaths[key] = target.absolutePath
+            return
+        }
+        Log.i(TAG, "download image url: $key ${url.take(80)}")
+        Thread {
+            runCatching {
+                val connection = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+                connection.connectTimeout = 10_000
+                connection.readTimeout = 20_000
+                connection.instanceFollowRedirects = true
+                connection.setRequestProperty(
+                    "User-Agent",
+                    "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 (KHTML, like Gecko) " +
+                        "Version/4.0 Chrome/126.0 Mobile Safari/537.36",
+                )
+                connection.inputStream.use { input ->
+                    target.outputStream().use { output -> input.copyTo(output) }
+                }
+                connection.disconnect()
+                if (target.length() > 0L) {
+                    pendingRichMediaPaths[key] = target.absolutePath
+                    Log.i(TAG, "image url downloaded: $key -> ${target.length()}B")
+                }
+            }.onFailure { Log.w(TAG, "image url download failed: $key ${it.javaClass.simpleName} ${it.message}") }
+        }.start()
+    }
+
+    private fun cacheDirForImages(context: android.content.Context): java.io.File =
+        java.io.File(context.cacheDir, "m3tim_richmedia")
+
+    private fun extForUrl(url: String): String = when {
+        url.contains(".png", ignoreCase = true) -> "png"
+        url.contains(".webp", ignoreCase = true) -> "webp"
+        url.contains(".gif", ignoreCase = true) -> "gif"
+        else -> "jpg"
+    }
+
+    /** 内核消息监听是否**注册成功**（只有 addMsgListener 成功后才置 true，失败保留重试能力）。 */
+    @Volatile
+    private var msgListenerRegistered = false
+
+    /** 上次尝试注册监听的时间（uptimeMillis），用于失败后的最小重试间隔。 */
+    @Volatile
+    private var msgListenerRegisterAttemptAt = 0L
+
+    /** 是否已打印过 IKernelMsgListener 的方法清单（注册时打印一次，供真机 logcat 对照）。 */
+    @Volatile
+    private var msgListenerMethodsLogged = false
+
+    /** 注册监听用的锁：ensureServices() 可能被多个 IO 线程并发调用。 */
+    private val msgListenerLock = Any()
+
+    /** 已打印过“未处理回调”的回调名，避免逐条刷屏。 */
+    private val loggedListenerCallbacks = ConcurrentHashMap.newKeySet<String>()
+
+    /** 已打印过提醒标签的 chatId|tag（首条日志诊断用，避免每次刷屏）。 */
+    private val loggedChatTags = ConcurrentHashMap.newKeySet<String>()
+
+    /** 文件下载进度日志去重：chatId:msgId:elementId -> 上次进度（仅在变化时打日志）。 */
+    private val fileProgressLogged = ConcurrentHashMap<String, Int>()
+
+    /** 文件进度重查节流：key -> 上次重查时间（uptimeMillis），避免 UI 轮询每次都查内核。 */
+    private val fileProgressLastAt = ConcurrentHashMap<String, Long>()
+
+    /** 文件下载中的候选临时文件路径：chatId:msgId:elementId -> path（首次扫描后只 stat）。 */
+    private val filePartialCandidate = ConcurrentHashMap<String, String>()
+
+    /** 候选临时文件对应的文件总大小（FileElement.fileSize）。 */
+    private val filePartialTotalSize = ConcurrentHashMap<String, Long>()
+
+    /** 候选临时文件上次 length（length 不变时保持上次百分比）。 */
+    private val filePartialLastLen = ConcurrentHashMap<String, Long>()
+
+    /** 目录扫描节流：key -> 上次扫描时间（未找到候选时避免每 500ms 重复扫目录）。 */
+    private val filePartialScanAt = ConcurrentHashMap<String, Long>()
+
+    /** 「进度未知」日志已打过的 key（防止 UI 轮询刷屏）。 */
+    private val fileProgressUnknownLogged = ConcurrentHashMap.newKeySet<String>()
+
+    /** 内核 richmedia 真实传输进度（onRichMediaProgerssUpdate）：elementId -> 0..100。 */
+    private val richMediaProgressByElement = ConcurrentHashMap<Long, Int>()
+
+    /** 同上，按 msgId 兜底（个别元素拿不到 elementId 时记录）。 */
+    private val richMediaProgressByMsgId = ConcurrentHashMap<Long, Int>()
+
+    /** 当前正在播放的语音本地路径（seekVoice 重播用）。 */
+    @Volatile
+    private var lastVoicePath: String? = null
+
+    /** 语音暂停状态：暂停时记录位置/路径，resume 从原位置继续。 */
+    @Volatile
+    private var voicePausedFlag = false
+    @Volatile
+    private var voicePausedPositionMs = 0
+    @Volatile
+    private var voicePausedPath: String? = null
+
+    /** 最近一次非 0 的语音总时长（解码器被 stop 后 n() 会归 0，UI 进度条用缓存兜底）。 */
+    @Volatile
+    private var lastVoiceDurationMs = 0
+
+    /** 懒创建的 TIM 语音播放器（com.tencent.mobileqq.qqaudio.audioplayer.CommonAudioPlayer）。 */
+    @Volatile
+    private var voicePlayer: Any? = null
+
+    /** 创建语音播放器的锁（playVoice 可能来自 IO 线程）。 */
+    private val voicePlayerLock = Any()
+
+    /** 播放器 listener c3(完成)/j3(错误) 维护的兜底状态（r() 不可用时使用）。 */
+    @Volatile
+    private var voicePlayingFlag = false
+
+    /** 语音播放路由：false=听筒（默认），true=扬声器；用户切换后对所有语音生效。 */
+    @Volatile
+    private var voiceSpeakerEnabled = false
+
+    /** recent 快照日志只打一次（成功/失败各一次）。 */
+    @Volatile
+    private var snapshotLogDone = false
+
+    @Volatile
+    private var snapshotFailLogDone = false
+
+    /** 快照连续失败后的冷却时间（uptimeMillis），避免每次刷新都等 3s。 */
+    @Volatile
+    private var snapshotRetryAt = 0L
+
+    /** 推送日志节流：回调名 -> 上次打印时间（uptimeMillis）。 */
+    private val pushLogAt = ConcurrentHashMap<String, Long>()
+
+    /** 内核回调线程里不能阻塞：会话列表刷新统一丢到这个后台单线程。 */
+    /** 聊天记录内图片 HTTP 兜底下载（内核 richmedia 不响应时用；不阻塞加载线程）。 */
+    private val chatRecordImageExecutor =
+        java.util.concurrent.Executors.newFixedThreadPool(2) { r ->
+            Thread(r, "m3tim-chatrecord-image").apply { isDaemon = true }
+        }
+
+    private val liveRefreshExecutor = java.util.concurrent.Executors.newSingleThreadExecutor(
+        java.util.concurrent.ThreadFactory { runnable ->
+            Thread(runnable, "m3tim-live-refresh").apply { isDaemon = true }
+        },
+    )
+
+    /**
+     * 会话列表刷新合并器（真正 trailing debounce）：
+     * - 事件只会在最后一个事件后完整等待 [LIVE_REFRESH_DEBOUNCE_MS] 才刷新；
+     * - 刷新进行中到达的事件不会立即排下一次，而是等本轮刷新结束后再完整等一个 debounce；
+     * - 首页消息风暴下刷新频率从 ~2.5/s 降到 ≤1.2/s，避免滑动掉帧。
+     */
+    private val liveRefreshLock = Any()
+    private var liveRefreshInFlight = false
+    private var liveRefreshScheduledCount = 0L
+
+    private val unknownElementLogged = java.util.concurrent.ConcurrentHashMap.newKeySet<Int>()
+
+    /** chatId -> 更早消息分页状态（下一页的 seq 游标 + 已加载的更早消息）。 */
+    private class OlderState(var nextSeq: Long) {
+        val cached: MutableList<ChatMessage> = mutableListOf()
+    }
+
+    private val olderStates = ConcurrentHashMap<String, OlderState>()
+
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
+    private data class ChatMeta(
+        val chatType: Int,
+        val peerUid: String,
+        val peerUin: Long,
+        val name: String,
+        val isGroup: Boolean,
+    ) {
+        /** 群号：新版 NT 的 RecentContactInfo 可能把群号放在 peerUid 字符串里。 */
+        val groupCode: Long
+            get() = if (!isGroup) 0L else peerUin.takeIf { it != 0L }
+                ?: peerUid.toLongOrNull() ?: 0L
+    }
+
+    // ---------------------------------------------------------------------
+    // 初始化
+    // ---------------------------------------------------------------------
+
+    fun install() {
+        isHost = true
+    }
+
+    private fun hostClassLoader(): ClassLoader? = MainModule.hostClassLoader
+
+    /** 只初始化 kernel 本身；各个子服务在 [ensureServices] 里懒加载重试（kernel 也可能晚就绪）。 */
+    private fun initKernel(): Boolean {
+        if (kernelService != null) return true
+        return try {
+            val cl = hostClassLoader() ?: return false
+            val mobileQQClass = Class.forName("mqq.app.MobileQQ", false, cl)
+            val mobileQQ = mobileQQClass.getField("sMobileQQ").get(null) ?: return false
+            val runtime = mobileQQClass.getMethod("peekAppRuntime").invoke(mobileQQ) ?: return false
+            appRuntime = runtime
+            val kernelClass = Class.forName("com.tencent.qqnt.kernel.api.IKernelService", false, cl)
+            val kernel = runtime.javaClass
+                .getMethod("getRuntimeService", Class::class.java, String::class.java)
+                .invoke(runtime, kernelClass, "")
+                ?: return false
+            kernelService = kernel
+            avatarSizeClass = runCatching {
+                Class.forName("com.tencent.qqnt.kernel.nativeinterface.AvatarSize", false, cl)
+            }.getOrNull()
+            avatarSizeClass?.enumConstants?.forEach { constant ->
+                val name = (constant as? Enum<*>)?.name
+                if (name == "SMALL") avatarSizeSmall = constant
+                if (name == "BIG") avatarSizeBig = constant
+            }
+            Log.i(TAG, "TimBridge kernel ready: ${kernel.javaClass.simpleName}")
+            true
+        } catch (t: Throwable) {
+            Log.e(TAG, "TimBridge kernel init failed: ${t.javaClass.simpleName} ${t.message}", t)
+            false
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 收藏表情（用户「添加到表情」收集的单张表情图片）
+    // ---------------------------------------------------------------------
+
+    /** 漫游收藏表情管理器（IFavroamingDBManagerService）懒加载实例。 */
+    @Volatile
+    private var favroamingService: Any? = null
+
+    @Synchronized
+    private fun favroamingService(): Any? {
+        favroamingService?.let { return it }
+        return runCatching {
+            val cl = hostClassLoader() ?: return null
+            val mobileQQClass = Class.forName("mqq.app.MobileQQ", false, cl)
+            val mobileQQ = mobileQQClass.getField("sMobileQQ").get(null) ?: return null
+            val runtime = mobileQQClass.getMethod("peekAppRuntime").invoke(mobileQQ) ?: return null
+            val iface = Class.forName(
+                "com.tencent.mobileqq.emosm.api.IFavroamingDBManagerService",
+                false,
+                cl,
+            )
+            val svc = runtime.javaClass
+                .getMethod("getRuntimeService", Class::class.java)
+                .invoke(runtime, iface)
+            favroamingService = svc
+            svc
+        }.getOrNull()
+    }
+
+    /** 阻塞加载 TIM 收藏表情（必须在后台线程调用）；失败返回 null。 */
+    fun loadFavoriteEmojis(): List<CustomEmoji>? {
+        val svc = favroamingService() ?: return null
+        val dataList = runCatching {
+            svc.javaClass.getMethod("getEmoticonDataList").invoke(svc) as? List<*>
+        }.getOrNull() ?: return null
+        // TIM 的 getEmoticonDataList() 按添加时间正序返回（最早添加的在前）；
+        // 收藏页按用户直觉改成「最后添加的排最前」。
+        val started = perfUptime()
+        val result = dataList.asReversed().mapNotNull { data -> data?.let { toCustomEmoji(svc, it) } }
+        Log.i(
+            TAG,
+            "emoji: favorites loaded count=${result.size} withPath=${result.count { it.imagePath != null }} " +
+                "raw=${dataList.size} ms=${perfUptime() - started}",
+        )
+        return result
+    }
+
+    private fun toCustomEmoji(service: Any, data: Any): CustomEmoji? {
+        fun field(name: String): Any? = runCatching {
+            data.javaClass.getField(name).get(data)
+        }.getOrNull()
+
+        val emoId = (field("emoId") as? Number)?.toInt()
+        val resid = field("resid") as? String
+        val md5 = field("md5") as? String
+        val id = resid?.takeIf { it.isNotBlank() }
+            ?: md5?.takeIf { it.isNotBlank() }
+            ?: emoId?.toString()
+            ?: return null
+        val desc = (field("modifyWord") as? String)?.trim()?.takeIf { it.isNotEmpty() }
+            ?: (field("ocrWord") as? String)?.trim().orEmpty()
+        val isMarkFace = field("isMarkFace") as? Boolean ?: false
+        val imagePath = resolveCustomEmojiPath(service, data)
+        return CustomEmoji(id = id, imagePath = imagePath, desc = desc, isMarkFace = isMarkFace)
+    }
+
+    /** 收藏表情本地缓存目录：cacheDir/fav_emoji（新 sync 下来但 TIM 尚未下载的图片由我们补齐）。 */
+    private fun favEmojiCacheDir(): java.io.File? {
+        val context = appContext() ?: hostContext() ?: return null
+        return java.io.File(context.cacheDir, "fav_emoji").apply { mkdirs() }
+    }
+
+    private fun favEmojiExt(url: String): String = when {
+        url.contains(".gif", ignoreCase = true) -> "gif"
+        url.contains(".png", ignoreCase = true) -> "png"
+        url.contains(".webp", ignoreCase = true) -> "webp"
+        url.contains(".apng", ignoreCase = true) -> "apng"
+        url.contains(".jpg", ignoreCase = true) || url.contains(".jpeg", ignoreCase = true) -> "jpg"
+        url.contains(".bmp", ignoreCase = true) -> "bmp"
+        else -> "gif"
+    }
+
+    /** 从收藏数据里取稳定 id（resid / md5 / emoId）与下载 URL（CustomEmotionData.url）。 */
+    private fun favEmojiIdentity(data: Any): Pair<String, String> {
+        fun field(name: String): Any? = runCatching {
+            data.javaClass.getField(name).get(data)
+        }.getOrNull()
+        val resid = (field("resid") as? String)?.takeIf { it.isNotBlank() }
+        val md5 = (field("md5") as? String)?.takeIf { it.isNotBlank() }
+        val emoId = field("emoId") as? Number
+        val id = resid ?: md5 ?: emoId?.toString().orEmpty()
+        val url = (field("url") as? String)?.takeIf { it.startsWith("http", ignoreCase = true) }.orEmpty()
+        return id to url
+    }
+
+    /**
+     * TIM 收藏表情文件缺失时按 `CustomEmotionData.url`（服务端下载地址）同步下载到
+     * `cacheDir/fav_emoji/<resid|md5|emoId>.<ext>`（≤5s 超时），校验 >0 返回路径。
+     * 新 syncRoaming 下来的收藏表情本地图片往往还没被 TIM 下载，这里补齐以保证面板显示/发送。
+     */
+    private fun downloadFavEmoji(data: Any): String? {
+        val (id, url) = favEmojiIdentity(data)
+        if (id.isBlank()) return null
+        if (url.isBlank()) {
+            Log.w(TAG, "emoji: downloadFav id=$id no url")
+            return null
+        }
+        val dir = favEmojiCacheDir() ?: return null
+        val target = java.io.File(dir, "$id.${favEmojiExt(url)}")
+        if (target.isFile && target.length() > 0L) return target.absolutePath
+        Log.i(TAG, "emoji: downloadFav start id=$id url=${url.take(120)} target=${target.name}")
+        return runCatching {
+            val connection = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+            connection.connectTimeout = 3_000
+            connection.readTimeout = 5_000
+            connection.instanceFollowRedirects = true
+            connection.setRequestProperty(
+                "User-Agent",
+                "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 (KHTML, like Gecko) " +
+                    "Version/4.0 Chrome/126.0 Mobile Safari/537.36",
+            )
+            val tmp = java.io.File(dir, "$id.${favEmojiExt(url)}.tmp")
+            connection.inputStream.use { input ->
+                tmp.outputStream().use { output -> input.copyTo(output) }
+            }
+            connection.disconnect()
+            if (tmp.isFile && tmp.length() > 0L) {
+                if (target.exists()) target.delete()
+                tmp.renameTo(target)
+            } else {
+                tmp.delete()
+            }
+            val path = target.takeIf { it.isFile && it.length() > 0L }?.absolutePath
+            Log.i(
+                TAG,
+                "emoji: downloadFav done id=$id path=${path?.take(120)} " +
+                    "size=${if (path != null) target.length() else -1}",
+            )
+            path
+        }.getOrElse { t ->
+            Log.w(
+                TAG,
+                "emoji: downloadFav failed id=$id: ${t.javaClass.simpleName} ${t.message}",
+            )
+            null
+        }
+    }
+
+    /**
+     * 解析收藏表情的本地图片路径：只返回**存在**的文件；TIM 缓存路径都不存在时
+     * 按 url 下载到 cacheDir/fav_emoji 后再返回（失败 null）。
+     */
+    private fun resolveCustomEmojiPath(service: Any, data: Any): String? {
+        val candidates = LinkedHashSet<String>()
+        runCatching {
+            val path = service.javaClass
+                .getMethod("getCustomEmoticonPath", data.javaClass)
+                .invoke(service, data) as? String
+            if (!path.isNullOrBlank()) candidates.add(path)
+        }
+        listOf("emoPath", "thumbPath", "emoOriginalPath").forEach { name ->
+            runCatching {
+                val path = data.javaClass.getField(name).get(data) as? String
+                if (!path.isNullOrBlank()) candidates.add(path)
+            }
+        }
+        for (candidate in candidates) {
+            val file = java.io.File(candidate)
+            if (file.exists() && file.length() > 0L) return candidate
+            for (ext in listOf(".gif", ".png", ".jpg", ".jpeg", ".webp", ".apng", ".bmp")) {
+                val withExt = java.io.File(candidate + ext)
+                if (withExt.exists() && withExt.length() > 0L) return withExt.absolutePath
+            }
+        }
+        // TIM 还没下载（新同步的收藏表情）→ 按 url 下载补齐
+        return downloadFavEmoji(data)
+    }
+
+    // ---------------------------------------------------------------------
+    // 收藏表情管理：移动到首位 / 删除（TIM FavEmoRoamingHandler + Favroaming DB）
+    // ---------------------------------------------------------------------
+
+    private fun favDataFieldString(data: Any, name: String): String? = runCatching {
+        data.javaClass.getField(name).get(data) as? String
+    }.getOrNull()
+
+    private fun favDataFieldInt(data: Any, name: String): Int? = runCatching {
+        val field = data.javaClass.getField(name)
+        if (field.type == Int::class.javaPrimitiveType) field.getInt(data)
+        else (field.get(data) as? Number)?.toInt()
+    }.getOrNull()
+
+    /** 与 toCustomEmoji 的 id 生成逻辑一致：resid → md5 → emoId。 */
+    private fun favoriteDataId(data: Any): String? {
+        val resid = favDataFieldString(data, "resid")?.takeIf { it.isNotBlank() }
+        val md5 = favDataFieldString(data, "md5")?.takeIf { it.isNotBlank() }
+        val emoId = favDataFieldInt(data, "emoId")
+        return resid ?: md5 ?: emoId?.toString()
+    }
+
+    private fun favoriteDataByEmojiId(emojiId: String): Any? {
+        if (emojiId.isBlank()) return null
+        val svc = favroamingService() ?: return null
+        val list = runCatching {
+            svc.javaClass.getMethod("getEmoticonDataList").invoke(svc) as? List<*>
+        }.getOrNull().orEmpty()
+        return list.firstOrNull { it != null && favoriteDataId(it) == emojiId }
+    }
+
+    /** TIM 收藏漫游 handler（FavEmoRoamingHandler，业务 handler key = 类名）。 */
+    private fun favEmoRoamingHandler(): Any? = runCatching {
+        val runtime = appRuntime() ?: return@runCatching null
+        runtime.javaClass
+            .getMethod("getBusinessHandler", String::class.java)
+            .invoke(runtime, "com.tencent.mobileqq.app.FavEmoRoamingHandler")
+    }.getOrNull()
+
+    /**
+     * 本地 DB 顺序调整（TIM FavEmosmViewPage.s() 原逻辑）：delete 旧数据 + clone 后把 emoId 设为
+     * max(emoId)+1 再 insert；loadFavoriteEmojis 会 asReversed，因此该表情显示在收藏列表最前。
+     */
+    private fun moveFavoriteDataToLastEmoId(data: Any): Boolean = runCatching {
+        val svc = favroamingService() ?: return@runCatching false
+        @Suppress("UNCHECKED_CAST")
+        val list = svc.javaClass.getMethod("getEmoticonDataList").invoke(svc) as? List<Any?>
+            ?: emptyList()
+        var maxEmoId = 0
+        for (item in list) {
+            item ?: continue
+            maxEmoId = maxOf(maxEmoId, favDataFieldInt(item, "emoId") ?: 0)
+        }
+        val delete = svc.javaClass.methods.firstOrNull {
+            it.name == "deleteCustomEmotion" && it.parameterCount == 1
+        } ?: return@runCatching false
+        delete.invoke(svc, data)
+        val clone = runCatching {
+            data.javaClass.getMethod("cloneEmotionData", data.javaClass).invoke(data, data)
+        }.getOrNull() ?: data
+        val setOk = runCatching {
+            data.javaClass.getField("emoId").setInt(clone, maxEmoId + 1)
+        }.isSuccess
+        if (!setOk) return@runCatching false
+        val insert = svc.javaClass.methods.firstOrNull {
+            it.name == "insertCustomEmotion" && it.parameterCount == 1
+        } ?: return@runCatching false
+        insert.invoke(svc, clone)
+        runCatching { svc.javaClass.getMethod("trimCache").invoke(svc) }
+        Log.i(
+            TAG,
+            "emoji: moveTop db reorder id=${favoriteDataId(data)} oldMax=$maxEmoId " +
+                "newEmoId=${maxEmoId + 1}",
+        )
+        true
+    }.getOrDefault(false)
+
+    /**
+     * 收藏表情移动到首位：用 TIM 原逻辑——服务端 `FavEmoRoamingHandler.N1(residList)`
+     * （OIDB CMD_FAV_MOVE，str_req_filename=resid 列表）+ 本地 DB emoId 重插排到最后，
+     * loadFavoriteEmojis 反向展示即到最前。阻塞，IO 线程。
+     */
+    fun moveFavoriteEmojiToTop(emojiId: String): Boolean {
+        if (!isHost) return false
+        val started = perfUptime()
+        val data = favoriteDataByEmojiId(emojiId) ?: run {
+            Log.w(TAG, "emoji: moveTop id=$emojiId failed (favorite data not found)")
+            return false
+        }
+        val resid = favDataFieldString(data, "resid")?.takeIf { it.isNotBlank() }
+        var handlerSent = false
+        if (resid != null) {
+            val handler = favEmoRoamingHandler()
+            handlerSent = runCatching {
+                val method = handler?.javaClass?.methods?.firstOrNull {
+                    it.name == "N1" && it.parameterCount == 1
+                } ?: return@runCatching false
+                method.invoke(handler, arrayListOf(resid))
+                true
+            }.getOrElse { t ->
+                Log.w(
+                    TAG,
+                    "emoji: moveTop handler N1 failed id=$emojiId: " +
+                        "${t.javaClass.simpleName} ${t.message}",
+                )
+                false
+            }
+        } else {
+            Log.w(TAG, "emoji: moveTop id=$emojiId no resid (server sync unavailable, db only)")
+        }
+        val dbOk = moveFavoriteDataToLastEmoId(data)
+        val firstId = runCatching { loadFavoriteEmojis()?.firstOrNull()?.id }.getOrNull()
+        val verified = firstId == emojiId
+        val ok = dbOk || handlerSent
+        Log.i(
+            TAG,
+            "emoji: moveTop id=$emojiId resid=$resid ok=$ok handler=$handlerSent db=$dbOk " +
+                "verified=$verified first=$firstId ms=${perfUptime() - started}",
+        )
+        return ok
+    }
+
+    /** 删除收藏表情：标记 needDel → 服务端 delUserEmoRoamingReq → 轮询 DB 删除；兜底本地 deleteCustomEmotion。 */
+    fun deleteFavoriteEmoji(emojiId: String): Boolean {
+        if (!isHost) return false
+        val started = perfUptime()
+        val data = favoriteDataByEmojiId(emojiId) ?: run {
+            Log.w(TAG, "emoji: delete id=$emojiId failed (favorite data not found)")
+            return false
+        }
+        val resid = favDataFieldString(data, "resid")?.takeIf { it.isNotBlank() }
+        var method = "db"
+        if (resid != null) {
+            // 与 TIM FavRoamingStrategy 删除流程一致：先标 needDel 并更新 DB（失败可下次 syncLocalDel 重试）
+            runCatching {
+                data.javaClass.getField("RomaingType").set(data, "needDel")
+                val svc = favroamingService()
+                svc?.javaClass?.methods?.firstOrNull {
+                    it.name == "updateCustomEmotion" && it.parameterCount == 1
+                }?.invoke(svc, data)
+            }
+            val handler = favEmoRoamingHandler()
+            val sent = runCatching {
+                val m = handler?.javaClass?.methods?.firstOrNull {
+                    it.name == "delUserEmoRoamingReq" && it.parameterCount == 2
+                } ?: return@runCatching false
+                m.invoke(handler, arrayListOf(resid), false)
+                true
+            }.getOrElse { t ->
+                Log.w(
+                    TAG,
+                    "emoji: delete handler failed id=$emojiId: " +
+                        "${t.javaClass.simpleName} ${t.message}",
+                )
+                false
+            }
+            if (sent) {
+                method = "handler"
+                val deadline = perfUptime() + 3_000L
+                while (perfUptime() < deadline) {
+                    if (favoriteDataByEmojiId(emojiId) == null) {
+                        cleanupFavoriteCache(emojiId)
+                        Log.i(
+                            TAG,
+                            "emoji: delete id=$emojiId resid=$resid ok=true method=handler " +
+                                "ms=${perfUptime() - started}",
+                        )
+                        return true
+                    }
+                    Thread.sleep(150L)
+                }
+                method = "handler-timeout"
+            }
+        }
+        val dbOk = runCatching {
+            val svc = favroamingService() ?: return@runCatching false
+            val delete = svc.javaClass.methods.firstOrNull {
+                it.name == "deleteCustomEmotion" && it.parameterCount == 1
+            } ?: return@runCatching false
+            delete.invoke(svc, data)
+            true
+        }.getOrDefault(false)
+        val verified = runCatching {
+            loadFavoriteEmojis()?.none { it.id == emojiId } != false
+        }.getOrDefault(false)
+        cleanupFavoriteCache(emojiId)
+        val ok = dbOk || verified
+        Log.i(
+            TAG,
+            "emoji: delete id=$emojiId resid=$resid ok=$ok method=$method db=$dbOk " +
+                "verified=$verified ms=${perfUptime() - started}",
+        )
+        return ok
+    }
+
+    /** 删除收藏后清理我们下载到 cacheDir/fav_emoji 的图片缓存。 */
+    private fun cleanupFavoriteCache(emojiId: String) {
+        if (emojiId.isBlank()) return
+        runCatching {
+            val context = appContext() ?: hostContext() ?: return
+            val dir = java.io.File(context.cacheDir, "fav_emoji")
+            dir.listFiles()?.forEach { file ->
+                if (file.name.startsWith(emojiId)) file.delete()
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 收藏表情刷新 / 添加到表情 / 表情包（TIM Favroaming + IAIOEmotionAddApi）
+    // ---------------------------------------------------------------------
+
+    private const val FAV_EMOJI_REFRESH_THROTTLE_MS = 30_000L
+
+    /** 上次触发收藏表情漫游同步的时间（uptimeMillis；30s 节流）。 */
+    @Volatile
+    private var lastFavEmojiRefreshAt = 0L
+
+    private fun timRuntimeService(className: String, process: String = ""): Any? = runCatching {
+        val cl = hostClassLoader() ?: return@runCatching null
+        val mobileQQClass = Class.forName("mqq.app.MobileQQ", false, cl)
+        val mobileQQ = mobileQQClass.getField("sMobileQQ").get(null) ?: return@runCatching null
+        val runtime = mobileQQClass.getMethod("peekAppRuntime").invoke(mobileQQ) ?: return@runCatching null
+        val iface = Class.forName(className, false, cl)
+        runtime.javaClass
+            .getMethod("getRuntimeService", Class::class.java, String::class.java)
+            .invoke(runtime, iface, process)
+    }.getOrNull()
+
+    /** 收藏表情同步管理器（IFavroamingManagerService；TIM 用 process="all" 取）。 */
+    private fun favroamingManagerService(): Any? =
+        timRuntimeService("com.tencent.mobileqq.emosm.api.IFavroamingManagerService", "all")
+            ?: timRuntimeService("com.tencent.mobileqq.emosm.api.IFavroamingManagerService", "")
+
+    /** 表情包管理器（IEmoticonManagerService，impl 有同步的 syncGetTabEmoticonPackages 方法）。 */
+    private fun emoticonManagerService(): Any? =
+        timRuntimeService("com.tencent.mobileqq.emosm.api.IEmoticonManagerService", "")
+
+    private fun favoritesChanged(before: Set<String>): Boolean {
+        val after = runCatching { loadFavoriteEmojis()?.map { it.id }?.toSet() }.getOrNull()
+            ?: return false
+        return after != before
+    }
+
+    /** 轮询收藏列表直到变化或超时（TIM 收藏是异步上传，最多等 2.5s）。 */
+    private fun awaitFavoritesChanged(before: Set<String>, timeoutMs: Long): Boolean {
+        val deadline = perfUptime() + timeoutMs
+        while (perfUptime() < deadline) {
+            if (favoritesChanged(before)) return true
+            Thread.sleep(250L)
+        }
+        return false
+    }
+
+    /**
+     * 收藏表情自动刷新：触发 TIM 漫游收藏同步（IFavroamingManagerService.syncRoaming，30s 节流），
+     * 等待同步/数据变化最多 3s 后返回最新列表。阻塞，IO 线程。
+     */
+    fun refreshFavoriteEmojis(): List<CustomEmoji>? {
+        if (!isHost) return null
+        val started = perfUptime()
+        val manager = favroamingManagerService()
+        val now = android.os.SystemClock.uptimeMillis()
+        val triggered = manager != null && now - lastFavEmojiRefreshAt >= FAV_EMOJI_REFRESH_THROTTLE_MS
+        var syncing = false
+        var waitMs = 0L
+        if (triggered) {
+            lastFavEmojiRefreshAt = now
+            syncing = runCatching {
+                manager!!.javaClass.getMethod("isInSyncing").invoke(manager) as? Boolean
+            }.getOrNull() ?: false
+            if (!syncing) {
+                runCatching { manager!!.javaClass.getMethod("syncRoaming").invoke(manager) }
+                    .onFailure {
+                        Log.w(
+                            TAG,
+                            "emoji: refresh favorites syncRoaming failed: " +
+                                "${it.javaClass.simpleName} ${it.message}",
+                        )
+                    }
+                Log.i(TAG, "emoji: refresh favorites syncRoaming triggered")
+            }
+            val before = runCatching { loadFavoriteEmojis()?.map { it.id }?.toSet().orEmpty() }
+                .getOrDefault(emptySet())
+            val deadline = perfUptime() + 3_000L
+            while (perfUptime() < deadline) {
+                Thread.sleep(250L)
+                syncing = runCatching {
+                    manager!!.javaClass.getMethod("isInSyncing").invoke(manager) as? Boolean
+                }.getOrNull() ?: false
+                if (favoritesChanged(before) || (!syncing && perfUptime() - started > 800L)) break
+            }
+            waitMs = perfUptime() - started
+        } else if (manager == null) {
+            Log.w(TAG, "emoji: refresh favorites manager unavailable")
+        }
+        val list = loadFavoriteEmojis()
+        Log.i(
+            TAG,
+            "emoji: refresh favorites triggered=$triggered syncing=$syncing waitMs=$waitMs " +
+                "count=${list?.size ?: -1} throttleMs=$FAV_EMOJI_REFRESH_THROTTLE_MS",
+        )
+        return list
+    }
+
+    /** IAIOEmotionAddApi.addEmotion(Context, path, jumpId)：TIM 长按「添加到表情」的官方入口（异步）。 */
+    private fun addLocalPathToFavorites(context: Context, path: String, jumpId: Int?): Boolean {
+        if (!pathUsable(path)) return false
+        val (api, apiClass) = qrouteApiClass(
+            "com.tencent.qqnt.aio.adapter.api.IAIOEmotionAddApi",
+        ) ?: run {
+            Log.w(TAG, "emoji: addToFavorite IAIOEmotionAddApi unavailable")
+            return false
+        }
+        val method = apiClass.methods.firstOrNull {
+            it.name == "addEmotion" && it.parameterCount == 3 &&
+                it.parameterTypes[0] == Context::class.java &&
+                it.parameterTypes[1] == String::class.java &&
+                !it.parameterTypes[2].isPrimitive
+        } ?: run {
+            Log.w(TAG, "emoji: addToFavorite addEmotion(Context,String,Integer) not found")
+            return false
+        }
+        return runCatching {
+            method.invoke(api, context, path, jumpId)
+            Log.i(TAG, "emoji: addToFavorite invoked path=${path.take(120)} jumpId=$jumpId")
+            true
+        }.getOrElse { t ->
+            Log.w(
+                TAG,
+                "emoji: addToFavorite invoke failed: ${t.javaClass.simpleName} ${t.message}",
+            )
+            false
+        }
+    }
+
+    /**
+     * MarketFace（贴纸/商城表情）收藏：优先本地 static/dynamic path；
+     * 没有本地文件时调 TIM 自带 guild/emotion `IMarketFaceApi.addToFavEmo(Context, MarketFaceElement, Continuation)`
+     * （suspend，内部负责下载 + 收藏）。
+     */
+    private fun addMarketFaceToFavorites(context: Context, marketFace: Any): Boolean {
+        val cl = hostClassLoader() ?: return false
+        val api = qrouteApiClass("com.tencent.guild.api.marketface.IMarketFaceApi")
+            ?: qrouteApiClass("com.tencent.qqnt.emotion.adapter.api.IMarketFaceApi")
+            ?: run {
+                Log.w(TAG, "emoji: addToFavorite marketFace api unavailable")
+                return false
+            }
+        val method = api.second.methods.firstOrNull {
+            it.name == "addToFavEmo" && it.parameterCount == 3
+        } ?: run {
+            Log.w(TAG, "emoji: addToFavorite marketFace addToFavEmo not found")
+            return false
+        }
+        val continuationClass = runCatching {
+            Class.forName("kotlin.coroutines.Continuation", false, cl)
+        }.getOrNull() ?: return false
+        val emptyContext = runCatching {
+            Class.forName("kotlin.coroutines.EmptyCoroutineContext", false, cl)
+                .getField("INSTANCE").get(null)
+        }.getOrNull()
+        val latch = CountDownLatch(1)
+        val continuation = Proxy.newProxyInstance(cl, arrayOf(continuationClass)) { _, m, _ ->
+            when (m.name) {
+                "resumeWith" -> {
+                    latch.countDown()
+                    null
+                }
+                "getContext" -> emptyContext
+                else -> defaultValueFor(m.returnType)
+            }
+        }
+        val invoked = runCatching {
+            method.invoke(api.first, context, marketFace, continuation)
+            Log.i(TAG, "emoji: addToFavorite marketFace addToFavEmo invoked")
+            true
+        }.getOrElse { t ->
+            Log.w(
+                TAG,
+                "emoji: addToFavorite marketFace invoke failed: " +
+                    "${t.javaClass.simpleName} ${t.message}",
+            )
+            false
+        }
+        if (!invoked) return false
+        val finished = latch.await(8, TimeUnit.SECONDS)
+        Log.i(TAG, "emoji: addToFavorite marketFace suspend finished=$finished")
+        return true
+    }
+
+    /**
+     * 长按图片/表情消息「添加到表情」：按 elementId 找 PicElement / MarketFaceElement；
+     * 图片优先原图（loadChatImageOriginal 会触发下载），贴纸优先本地 static/dynamicFacePath。
+     */
+    fun addMessageToFavorites(chatId: String, msgId: Long, elementId: Long): Boolean {
+        if (!isHost) return false
+        if (!ensureServices()) return false
+        val context = appContext() ?: hostContext() ?: run {
+            Log.w(TAG, "emoji: addToFavorite chat=$chatId failed (no context)")
+            return false
+        }
+        val record = fetchRawMsgRecord(chatId, msgId) ?: run {
+            Log.w(TAG, "emoji: addToFavorite chat=$chatId msg=$msgId failed (record unavailable)")
+            return false
+        }
+        @Suppress("UNCHECKED_CAST")
+        val elements = invokeGetter(record, "getElements") as? List<Any?> ?: emptyList()
+        var chosenElement: Any? = null
+        var pic: Any? = null
+        var marketFace: Any? = null
+        var chosenId = 0L
+        for (element in elements) {
+            element ?: continue
+            val eid = (invokeGetter(element, "getElementId") as? Number)?.toLong() ?: 0L
+            if (elementId != 0L && eid != elementId) continue
+            val p = invokeGetter(element, "getPicElement")
+            val mf = invokeGetter(element, "getMarketFaceElement")
+            if (p != null || mf != null) {
+                chosenElement = element
+                pic = p
+                marketFace = mf
+                chosenId = eid
+                break
+            }
+        }
+        if (chosenElement == null) {
+            Log.w(
+                TAG,
+                "emoji: addToFavorite chat=$chatId msg=$msgId elem=$elementId failed " +
+                    "(no pic/marketFace element)",
+            )
+            return false
+        }
+        val before = runCatching { loadFavoriteEmojis()?.map { it.id }?.toSet().orEmpty() }
+            .getOrDefault(emptySet())
+        if (pic != null) {
+            val sourcePath = (invokeGetter(pic, "getSourcePath") as? String)
+                ?.takeIf { pathUsable(it) }
+            val thumbs = (invokeGetter(pic, "getThumbPath") as? Map<*, *>)
+            val thumbPath = thumbs.orEmpty().values
+                .mapNotNull { it as? String }
+                .firstOrNull { pathUsable(it) }
+            val path = sourcePath
+                ?: runCatching { loadChatImageOriginal(chatId, msgId, chosenId) }.getOrNull()
+                ?: thumbPath
+            val ok = path != null && addLocalPathToFavorites(context, path, null)
+            val verified = ok && awaitFavoritesChanged(before, 2_500L)
+            Log.i(
+                TAG,
+                "emoji: addToFavorite kind=pic chat=$chatId msg=$msgId elem=$chosenId " +
+                    "path=${path?.take(100)} invoked=$ok verified=$verified",
+            )
+            return ok
+        }
+        val mfElement = marketFace ?: run {
+            Log.w(TAG, "emoji: addToFavorite marketFace element missing chat=$chatId msg=$msgId")
+            return false
+        }
+        val staticPath = (invokeGetter(mfElement, "getStaticFacePath") as? String)
+            ?.takeIf { pathUsable(it) }
+        val dynamicPath = (invokeGetter(mfElement, "getDynamicFacePath") as? String)
+            ?.takeIf { pathUsable(it) }
+        val local = staticPath ?: dynamicPath
+        val ok = if (local != null) {
+            addLocalPathToFavorites(context, local, null)
+        } else {
+            addMarketFaceToFavorites(context, mfElement)
+        }
+        val verified = ok && awaitFavoritesChanged(before, 2_500L)
+        Log.i(
+            TAG,
+            "emoji: addToFavorite kind=marketFace chat=$chatId msg=$msgId elem=$chosenId " +
+                "local=${local?.take(100)} invoked=$ok verified=$verified " +
+                "emojiPkg=${runCatching { (invokeGetter(mfElement, "getEmojiPackageId") as? Number)?.toInt() }.getOrNull()} " +
+                "emojiId=${runCatching { invokeGetter(mfElement, "getEmojiId") as? String }.getOrNull()}",
+        )
+        return ok
+    }
+
+    /** 真实表情包列表：IEmoticonManagerService.syncGetTabEmoticonPackages(0)（已安装 tab 表情包）。 */
+    fun loadStickerPacks(): List<StickerPack>? {
+        if (!isHost) return null
+        val service = emoticonManagerService() ?: run {
+            Log.w(TAG, "emoji: stickerPacks IEmoticonManagerService unavailable")
+            return null
+        }
+        val method = service.javaClass.methods.firstOrNull {
+            it.name == "syncGetTabEmoticonPackages" && it.parameterCount == 1 &&
+                it.parameterTypes[0] == Int::class.javaPrimitiveType
+        } ?: run {
+            Log.w(TAG, "emoji: stickerPacks syncGetTabEmoticonPackages not found")
+            return null
+        }
+        return runCatching {
+            @Suppress("UNCHECKED_CAST")
+            val packages = method.invoke(service, 0) as? List<Any?> ?: emptyList()
+            val coverDeadline = perfUptime() + 8_000L
+            val packs = packages.mapNotNull { pkg ->
+                pkg ?: return@mapNotNull null
+                val epId = invokeGetter(pkg, "getEpId") as? String
+                    ?: runCatching { pkg.javaClass.getField("epId").get(pkg) as? String }.getOrNull()
+                    ?: return@mapNotNull null
+                val name = invokeGetter(pkg, "getName") as? String
+                    ?: runCatching { pkg.javaClass.getField("name").get(pkg) as? String }.getOrNull()
+                    ?: epId
+                val coverUrl = invokeGetter(pkg, "getImageUrl") as? String
+                    ?: runCatching { pkg.javaClass.getField("imageUrl").get(pkg) as? String }.getOrNull()
+                    ?: ""
+                val firstEmotionId = invokeGetter(pkg, "getFirstEmotionId") as? String
+                    ?: runCatching { pkg.javaClass.getField("firstEmotionId").get(pkg) as? String }
+                        .getOrNull()
+                    ?: ""
+                val coverPath = resolvePackCoverPath(epId, coverDeadline)
+                StickerPack(
+                    id = epId,
+                    name = name,
+                    previewEmoji = firstEmotionId,
+                    coverUrl = coverUrl,
+                    coverPath = coverPath,
+                    downloaded = true,
+                )
+            }
+            Log.i(
+                TAG,
+                "emoji: stickerPacks count=${packs.size} raw=${packages.size} " +
+                    "withCover=${packs.count { it.coverPath != null }} " +
+                    "first=${packs.take(3).map { it.name }}",
+            )
+            packs
+        }.getOrElse { t ->
+            Log.w(
+                TAG,
+                "emoji: stickerPacks failed: ${t.javaClass.simpleName} ${t.message}",
+            )
+            null
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 表情包内表情 / 封面 / MarketFace 发送（TIM EmoticonManager + MarketFace）
+    // ---------------------------------------------------------------------
+
+    private data class CachedPackEmojis(val list: List<CustomEmoji>, val at: Long)
+
+    /** 包内表情内存缓存（同一包重复点不重复拉；仅有本地图片的结果缓存，失败下轮重试）。 */
+    private val stickerPackEmojiCache = ConcurrentHashMap<String, CachedPackEmojis>()
+
+    private const val STICKER_PACK_EMOJI_TTL_MS = 5 * 60_000L
+
+    @Volatile
+    private var stickerBaseLogged = false
+
+    @Volatile
+    private var stickerCandidateLogs = 0
+
+    /** TIM 表情包本地目录基址（AppConstants.SDCARD_EMOTICON_SAVE，VFS 私有路径）。 */
+    private fun emoticonSaveBaseDir(): String? = runCatching {
+        val cl = hostClassLoader() ?: return@runCatching null
+        Class.forName("com.tencent.mobileqq.app.AppConstants", false, cl)
+            .getField("SDCARD_EMOTICON_SAVE").get(null) as? String
+    }.getOrNull()?.takeIf { it.isNotBlank() }?.also { base ->
+        if (!stickerBaseLogged) {
+            stickerBaseLogged = true
+            Log.i(TAG, "stickerPack: base=$base exists=${java.io.File(base).isDirectory}")
+        }
+    }
+
+    private fun stickerPackCacheDir(): java.io.File? {
+        val context = appContext() ?: hostContext() ?: return null
+        return java.io.File(context.cacheDir, "sticker_pack").apply { mkdirs() }
+    }
+
+    /** 文件是否真的是一张可解码图片（TIM 大表情 <eId> 是加密数据，不能当图片用）。 */
+    private fun isImageContentFile(path: String?): Boolean {
+        if (path.isNullOrBlank()) return false
+        val file = java.io.File(path)
+        if (!file.isFile || file.length() <= 0L) return false
+        return runCatching {
+            file.inputStream().use { input ->
+                val head = ByteArray(12)
+                val n = input.read(head)
+                if (n < 4) return@use false
+                val png = head[0] == 0x89.toByte() && head[1] == 'P'.code.toByte() &&
+                    head[2] == 'N'.code.toByte() && head[3] == 'G'.code.toByte()
+                val gif = head[0] == 'G'.code.toByte() && head[1] == 'I'.code.toByte() &&
+                    head[2] == 'F'.code.toByte()
+                val jpg = head[0] == 0xFF.toByte() && head[1] == 0xD8.toByte()
+                val webp = n >= 12 && head[0] == 'R'.code.toByte() &&
+                    head[1] == 'I'.code.toByte() && head[2] == 'F'.code.toByte() &&
+                    head[3] == 'F'.code.toByte() && head[8] == 'W'.code.toByte() &&
+                    head[9] == 'E'.code.toByte() && head[10] == 'B'.code.toByte() &&
+                    head[11] == 'P'.code.toByte()
+                png || gif || jpg || webp
+            }
+        }.getOrDefault(false)
+    }
+
+    private fun eIdSub(eId: String): String = if (eId.length >= 2) eId.substring(0, 2) else eId
+
+    /** TIM 表情 CDN 的 mod 目录（epId % 10，和 com.tencent.mobileqq.v.a.a.m 一致）。 */
+    private fun epMod(epId: String): Int {
+        val mod = ((epId.toLongOrNull() ?: epId.hashCode().toLong()) % 10).toInt()
+        return if (mod < 0) mod + 10 else mod
+    }
+
+    /**
+     * 查找 TIM 已下载的包内表情本地图片（MarketFaceConstants 约定）：
+     * `<SDCARD_EMOTICON_SAVE><epId>/` 下优先明文预览 `<eId>_thu.png`/`<eId>_aio.png`，
+     * 其次 `<eId>.png/.gif/.webp`；`<eId>`/`<eId>_apng` 可能是加密数据/zip，仅当内容确是图片才用。
+     */
+    private fun findLocalPackEmojiPath(packId: String, eId: String): String? {
+        if (packId.isBlank() || eId.isBlank()) return null
+        val base = emoticonSaveBaseDir() ?: return null
+        val dir = java.io.File(base, packId)
+        if (!dir.isDirectory) {
+            if (stickerCandidateLogs < 8) {
+                stickerCandidateLogs++
+                Log.i(TAG, "stickerPack: candidates pack=$packId dir=$dir exists=false")
+            }
+            return null
+        }
+        val names = listOf(
+            "${eId}_thu.png",
+            "${eId}_aio.png",
+            "$eId.png",
+            "$eId.gif",
+            "$eId.webp",
+            "${eId}_apng",
+            eId,
+        )
+        for (name in names) {
+            val file = java.io.File(dir, name)
+            if (file.isFile && file.length() > 0L && isImageContentFile(file.absolutePath)) {
+                Log.i(
+                    TAG,
+                    "stickerPack: local hit pack=$packId eId=$eId name=$name " +
+                        "size=${file.length()}",
+                )
+                return file.absolutePath
+            }
+        }
+        val fallback = dir.listFiles()
+            ?.filter { it.isFile && it.name.startsWith(eId) && it.length() > 0L }
+            ?.firstOrNull { isImageContentFile(it.absolutePath) }
+            ?.absolutePath
+        if (fallback != null) {
+            Log.i(TAG, "stickerPack: local hit(prefix) pack=$packId eId=$eId path=$fallback")
+            return fallback
+        }
+        if (stickerCandidateLogs < 8) {
+            stickerCandidateLogs++
+            val existing = names.map { java.io.File(dir, it) }
+                .filter { it.isFile }
+                .map { "${it.name}:${it.length()}:${isImageContentFile(it.absolutePath)}" }
+            Log.i(
+                TAG,
+                "stickerPack: candidates pack=$packId eId=$eId dir=${dir.absolutePath} " +
+                    "files=${existing.take(6)}",
+            )
+        }
+        return null
+    }
+
+    /** TIM 包封面本地文件：`<base><epId>/color.png` / `list.png` / `gray.png`（emosm.i.n 约定）。 */
+    private fun findLocalPackCoverPath(packId: String): String? {
+        val base = emoticonSaveBaseDir() ?: return null
+        val dir = java.io.File(base, packId)
+        if (!dir.isDirectory) return null
+        return listOf("color.png", "list.png", "gray.png", "200x200.png", "cover.png")
+            .map { java.io.File(dir, it) }
+            .firstOrNull { it.isFile && it.length() > 0L && isImageContentFile(it.absolutePath) }
+            ?.absolutePath
+    }
+
+    /** TIM 表情包图片下载：IEmojiManagerService.downloadAIOEmoticon(Emoticon, taskType=14)（异步）。 */
+    private fun requestTimPackEmojiDownload(eId: String, emoticon: Any): Boolean {
+        if (!isHost) return false
+        val service = timRuntimeService("com.tencent.mobileqq.emoticon.api.IEmojiManagerService", "")
+            ?: run {
+                Log.w(TAG, "stickerPack: IEmojiManagerService unavailable eId=$eId")
+                return false
+            }
+        val method = service.javaClass.methods.firstOrNull {
+            it.name == "downloadAIOEmoticon" && it.parameterCount == 2 &&
+                it.parameterTypes[0].isInstance(emoticon)
+        } ?: run {
+            Log.w(TAG, "stickerPack: downloadAIOEmoticon not found eId=$eId")
+            return false
+        }
+        val ret = runCatching {
+            val result = method.invoke(service, emoticon, 14)
+            result as? Boolean ?: true
+        }.getOrElse { t ->
+            Log.w(
+                TAG,
+                "stickerPack: downloadAIOEmoticon failed eId=$eId: " +
+                    "${t.javaClass.simpleName} ${t.message}",
+            )
+            false
+        }
+        Log.i(TAG, "stickerPack: download ret=$ret eId=$eId")
+        return ret
+    }
+
+    /**
+     * HTTP 下载到目标文件（带 status/bytes 日志），成功后校验确实是图片。
+     */
+    private fun httpFetchImage(url: String, target: java.io.File, label: String): Boolean {
+        val ok = runCatching {
+            val connection = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+            connection.connectTimeout = 2_500
+            connection.readTimeout = 4_000
+            connection.instanceFollowRedirects = true
+            connection.setRequestProperty(
+                "User-Agent",
+                "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 (KHTML, like Gecko) " +
+                    "Version/4.0 Chrome/126.0 Mobile Safari/537.36",
+            )
+            val status = connection.responseCode
+            if (status !in 200..299) {
+                Log.i(TAG, "stickerPack: http $label url=$url status=$status bytes=0")
+                connection.disconnect()
+                return@runCatching false
+            }
+            val tmp = java.io.File(target.parentFile, target.name + ".tmp")
+            var bytes = 0L
+            connection.inputStream.use { input ->
+                tmp.outputStream().use { output -> bytes = input.copyTo(output) }
+            }
+            connection.disconnect()
+            Log.i(TAG, "stickerPack: http $label url=$url status=$status bytes=$bytes")
+            if (bytes > 0L && tmp.isFile) {
+                if (target.exists()) target.delete()
+                tmp.renameTo(target)
+            } else {
+                tmp.delete()
+            }
+            target.isFile && target.length() > 0L && isImageContentFile(target.absolutePath)
+        }.getOrElse { t ->
+            Log.w(
+                TAG,
+                "stickerPack: http $label failed url=$url: " +
+                    "${t.javaClass.simpleName} ${t.message}",
+            )
+            false
+        }
+        return ok
+    }
+
+    /**
+     * HTTP 兜底下载包内表情（TIM 4.1 真实 CDN 规则）：
+     * - 大表情预览：`https://i.gtimg.cn/club/item/parcel/item/<eId[0:2]>/<eId>/126x126.png`
+     *   （AIO 明文预览：`.../<eId>/<w>x<h>.png`，EmotionPanelConstans.emoticonAIOPreviewExtensionUrl）
+     * - 小表情：`https://i.gtimg.cn/qqshow/admindata/comdata/vipSmallEmoji_item_<epId>/<eId>.gif`
+     *   / `<eId>.png` / `<eId>_apng.png`
+     * 存 `cacheDir/sticker_pack/<packId>_<eId>_<kind>.<ext>`。
+     */
+    private fun downloadPackEmojiByHttp(packId: String, eId: String, width: Int, height: Int): String? {
+        val dir = stickerPackCacheDir() ?: return null
+        val sub = eIdSub(eId)
+        val candidates = ArrayList<Triple<String, String, String>>() // url, suffix, ext
+        candidates.add(
+            Triple(
+                "https://i.gtimg.cn/club/item/parcel/item/$sub/$eId/126x126.png",
+                "preview",
+                "png",
+            ),
+        )
+        if (width > 0 && height > 0) {
+            candidates.add(
+                Triple(
+                    "https://i.gtimg.cn/club/item/parcel/item/$sub/$eId/${width}x${height}.png",
+                    "aio",
+                    "png",
+                ),
+            )
+        }
+        candidates.add(
+            Triple(
+                "https://i.gtimg.cn/qqshow/admindata/comdata/vipSmallEmoji_item_$packId/$eId.gif",
+                "smallgif",
+                "gif",
+            ),
+        )
+        candidates.add(
+            Triple(
+                "https://i.gtimg.cn/qqshow/admindata/comdata/vipSmallEmoji_item_$packId/$eId.png",
+                "smallpng",
+                "png",
+            ),
+        )
+        for ((url, suffix, ext) in candidates) {
+            val target = java.io.File(dir, "${packId}_${eId}_$suffix.$ext")
+            if (target.isFile && target.length() > 0L && isImageContentFile(target.absolutePath)) {
+                return target.absolutePath
+            }
+            if (httpFetchImage(url, target, "emoji")) {
+                Log.i(TAG, "stickerPack: emoji image ok pack=$packId eId=$eId path=${target.absolutePath}")
+                return target.absolutePath
+            }
+        }
+        return null
+    }
+
+    /**
+     * 表情包封面：本地 TIM 包目录 color/list/gray.png → 包内首个可显示表情 → CDN 封面下载。
+     * 大表情封面 `https://i.gtimg.cn/club/item/parcel/img/parcel/<epId%10>/<epId>/126x126.png`，
+     * 小表情封面 `https://i.gtimg.cn/qqshow/admindata/comdata/vipSmallEmoji_item_<epId>/color.png`。
+     */
+    private fun resolvePackCoverPath(packId: String, deadline: Long): String? {
+        findLocalPackCoverPath(packId)?.let { path ->
+            Log.i(TAG, "stickerPack: cover pack=$packId path=$path source=local")
+            return path
+        }
+        stickerPackEmojiCache[packId]?.list?.firstOrNull { it.imagePath != null }?.imagePath?.let { path ->
+            Log.i(TAG, "stickerPack: cover pack=$packId path=$path source=emoji")
+            return path
+        }
+        val dir = stickerPackCacheDir() ?: return null
+        val mod = epMod(packId)
+        val candidates = listOf(
+            "https://i.gtimg.cn/club/item/parcel/img/parcel/$mod/$packId/126x126.png" to "big",
+            "https://i.gtimg.cn/qqshow/admindata/comdata/vipSmallEmoji_item_$packId/color.png" to "small",
+            "https://i.gtimg.cn/qqshow/admindata/comdata/vipSmallEmoji_item_$packId/200x200.png" to "small200",
+        )
+        for ((url, suffix) in candidates) {
+            if (perfUptime() > deadline) {
+                Log.i(TAG, "stickerPack: cover pack=$packId timeout")
+                break
+            }
+            val target = java.io.File(dir, "cover_${packId}_$suffix.png")
+            if (target.isFile && target.length() > 0L && isImageContentFile(target.absolutePath)) {
+                Log.i(TAG, "stickerPack: cover pack=$packId path=${target.absolutePath} source=cache")
+                return target.absolutePath
+            }
+            if (httpFetchImage(url, target, "cover")) {
+                Log.i(TAG, "stickerPack: cover pack=$packId path=${target.absolutePath} source=http")
+                return target.absolutePath
+            }
+        }
+        Log.i(TAG, "stickerPack: cover pack=$packId path=null")
+        return null
+    }
+
+    /** 从宿主对象取字段（兼容字段/简单 getter）。 */
+    private fun hostFieldInt(target: Any, name: String): Int? = runCatching {
+        val field = target.javaClass.getField(name)
+        if (field.type == Int::class.javaPrimitiveType) field.getInt(target)
+        else (field.get(target) as? Number)?.toInt()
+    }.getOrNull()
+
+    private fun hostFieldBool(target: Any, name: String): Boolean? = runCatching {
+        val field = target.javaClass.getField(name)
+        if (field.type == Boolean::class.javaPrimitiveType) field.getBoolean(target)
+        else field.get(target) as? Boolean
+    }.getOrNull()
+
+    private fun hostFieldString(target: Any, name: String): String? = runCatching {
+        target.javaClass.getField(name).get(target) as? String
+    }.getOrNull()
+
+    /**
+     * 包内表情列表（阻塞 IO）：IEmoticonManagerService.syncGetSubEmoticonsByPackageId(epId)
+     * → List<Emoticon>；本地明文预览优先，缺失时批量触发 TIM downloadAIOEmoticon 轮询 ≤5s，
+     * 仍缺失再按 TIM 真实 CDN 规则 HTTP 下载明文预览/动图。同包内存缓存 5 分钟。
+     */
+    fun loadStickerPackEmojis(packId: String): List<CustomEmoji>? {
+        if (!isHost) return null
+        if (packId.isBlank()) return null
+        val now = perfUptime()
+        stickerPackEmojiCache[packId]?.takeIf { now - it.at < STICKER_PACK_EMOJI_TTL_MS }?.let {
+            Log.i(TAG, "stickerPack: emojis pack=$packId cache=${it.list.size}")
+            return it.list
+        }
+        stickerCandidateLogs = 0
+        val started = perfUptime()
+        val base = emoticonSaveBaseDir()
+        Log.i(TAG, "stickerPack: load pack=$packId base=$base")
+        val service = emoticonManagerService() ?: run {
+            Log.w(TAG, "stickerPack: IEmoticonManagerService unavailable pack=$packId")
+            return null
+        }
+        val method = service.javaClass.methods.firstOrNull {
+            it.name == "syncGetSubEmoticonsByPackageId" && it.parameterCount == 1
+        } ?: run {
+            Log.w(TAG, "stickerPack: syncGetSubEmoticonsByPackageId not found")
+            return null
+        }
+        return runCatching {
+            @Suppress("UNCHECKED_CAST")
+            val raw = method.invoke(service, packId) as? List<Any?> ?: emptyList()
+            fun emojiId(e: Any): String =
+                hostFieldString(e, "eId")?.takeIf { it.isNotBlank() } ?: ""
+            fun emojiPackId(e: Any): String =
+                hostFieldString(e, "epId")?.takeIf { it.isNotBlank() } ?: packId
+            fun emojiName(e: Any): String =
+                hostFieldString(e, "name")?.takeIf { it.isNotBlank() }
+                    ?: hostFieldString(e, "keyword")?.takeIf { it.isNotBlank() }
+                    ?: ""
+            val paths = ConcurrentHashMap<String, String>()
+            val missing = ArrayList<Any>()
+            for (rawEmoticon in raw) {
+                rawEmoticon ?: continue
+                val eId = emojiId(rawEmoticon)
+                if (eId.isBlank()) continue
+                val local = findLocalPackEmojiPath(emojiPackId(rawEmoticon), eId)
+                if (local != null) paths[eId] = local else missing.add(rawEmoticon)
+            }
+            if (missing.isNotEmpty()) {
+                var trigger = 0
+                for (rawEmoticon in missing) {
+                    val eId = emojiId(rawEmoticon)
+                    if (requestTimPackEmojiDownload(eId, rawEmoticon)) trigger++
+                }
+                Log.i(
+                    TAG,
+                    "stickerPack: download batch pack=$packId missing=${missing.size} triggered=$trigger",
+                )
+                val deadline = perfUptime() + 5_000L
+                while (perfUptime() < deadline && paths.size < raw.count { it != null }) {
+                    Thread.sleep(300L)
+                    for (rawEmoticon in missing) {
+                        val eId = emojiId(rawEmoticon)
+                        if (eId.isBlank() || paths.containsKey(eId)) continue
+                        findLocalPackEmojiPath(emojiPackId(rawEmoticon), eId)?.let { paths[eId] = it }
+                    }
+                }
+            }
+            // TIM 下载后仍缺失的：HTTP 明文预览兜底（总预算 10s）
+            val httpDeadline = perfUptime() + 10_000L
+            val list = raw.mapNotNull { rawEmoticon ->
+                rawEmoticon ?: return@mapNotNull null
+                val eId = emojiId(rawEmoticon)
+                if (eId.isBlank()) return@mapNotNull null
+                val packIdOfEmoji = emojiPackId(rawEmoticon)
+                val width = hostFieldInt(rawEmoticon, "width") ?: 0
+                val height = hostFieldInt(rawEmoticon, "height") ?: 0
+                val local = paths[eId] ?: findLocalPackEmojiPath(packIdOfEmoji, eId)
+                val imagePath = local ?: if (perfUptime() < httpDeadline) {
+                    downloadPackEmojiByHttp(packIdOfEmoji, eId, width, height)
+                } else {
+                    null
+                }
+                CustomEmoji(
+                    id = eId,
+                    imagePath = imagePath,
+                    desc = emojiName(rawEmoticon),
+                    isMarkFace = true,
+                )
+            }
+            val withPath = list.count { it.imagePath != null }
+            Log.i(
+                TAG,
+                "stickerPack: emojis pack=$packId raw=${raw.size} withPath=$withPath " +
+                    "ms=${perfUptime() - started}",
+            )
+            if (list.isNotEmpty() && withPath > 0) {
+                stickerPackEmojiCache[packId] = CachedPackEmojis(list, perfUptime())
+                if (stickerPackEmojiCache.size > 50) {
+                    stickerPackEmojiCache.clear()
+                    stickerPackEmojiCache[packId] = CachedPackEmojis(list, perfUptime())
+                }
+            }
+            list
+        }.getOrElse { t ->
+            Log.w(
+                TAG,
+                "stickerPack: load emojis failed pack=$packId: ${t.javaClass.simpleName} ${t.message}",
+            )
+            null
+        }
+    }
+
+    /** 宿主对象引用的 Emoticon/EmoticonPackage 查询。 */
+    private fun findEmoticonOfPack(packId: String, eId: String): Pair<Any, Any?>? {
+        val service = emoticonManagerService() ?: return null
+        val emoticonsMethod = service.javaClass.methods.firstOrNull {
+            it.name == "syncGetSubEmoticonsByPackageId" && it.parameterCount == 1
+        } ?: return null
+        val pkgMethod = service.javaClass.methods.firstOrNull {
+            it.name == "syncFindEmoticonPackageById" && it.parameterCount == 1 &&
+                it.parameterTypes[0] == String::class.java
+        }
+        val emoticons = runCatching {
+            @Suppress("UNCHECKED_CAST")
+            val raw = emoticonsMethod.invoke(service, packId) as? List<Any?> ?: emptyList()
+            raw.firstOrNull { it != null && hostFieldString(it, "eId") == eId }
+        }.getOrNull() ?: return null
+        val pkg = runCatching {
+            pkgMethod?.invoke(service, packId)
+        }.getOrNull()
+        return emoticons to pkg
+    }
+
+    /** TIM sbufID 规则：com.tencent.mobileqq.emosm.i.i(eId, jobType)（0/2/4 hex 解、1 raw）。 */
+    private fun packSbufId(eId: String, jobType: Int): ByteArray {
+        runCatching {
+            val cl = hostClassLoader() ?: return@runCatching null
+            val cls = Class.forName("com.tencent.mobileqq.emosm.i", false, cl)
+            val method = cls.getMethod(
+                "i",
+                String::class.java,
+                Int::class.javaPrimitiveType,
+            )
+            method.invoke(null, eId, jobType) as? ByteArray
+        }.getOrNull()?.let { return it }
+        return if (jobType == 0 || jobType == 2 || jobType == 4) {
+            runCatching {
+                ByteArray(eId.length / 2) { index ->
+                    eId.substring(index * 2, index * 2 + 2).toInt(16).toByte()
+                }
+            }.getOrDefault(eId.toByteArray())
+        } else {
+            eId.toByteArray()
+        }
+    }
+
+    /**
+     * 构造 TIM MarkFaceMessage（ChatActivityFacade.g0 同款字段）并转成内核 MarketFaceElement。
+     */
+    private fun buildMarketFaceElement(epId: String, eId: String, emoticon: Any, pkg: Any?): Any? {
+        val cl = hostClassLoader() ?: return null
+        val jobType = hostFieldInt(emoticon, "jobType") ?: 0
+        val encryptKey = hostFieldString(emoticon, "encryptKey").orEmpty()
+        val isSound = hostFieldBool(emoticon, "isSound") ?: false
+        val packageType = pkg?.let { hostFieldInt(it, "type") } ?: 0
+        val packageIsApng = (pkg?.let { hostFieldInt(it, "isAPNG") } ?: 0) == 2
+        return runCatching {
+            val mfClass = Class.forName("com.tencent.mobileqq.data.MarkFaceMessage", false, cl)
+            val mf = mfClass.getConstructor().newInstance()
+            fun set(name: String, value: Any?) {
+                runCatching {
+                    val field = mfClass.getField(name)
+                    when {
+                        field.type == Int::class.javaPrimitiveType ->
+                            field.setInt(mf, (value as? Number)?.toInt() ?: 0)
+                        field.type == Boolean::class.javaPrimitiveType ->
+                            field.setBoolean(mf, value as? Boolean ?: false)
+                        field.type == Long::class.javaPrimitiveType ->
+                            field.setLong(mf, (value as? Number)?.toLong() ?: 0L)
+                        else -> field.set(mf, value)
+                    }
+                }.onFailure { t ->
+                    Log.w(TAG, "stickerPack: set MarkFaceMessage.$name failed: ${t.message}")
+                }
+            }
+            set("dwTabID", epId.toIntOrNull() ?: 0)
+            set("sbufID", packSbufId(eId, jobType))
+            set("sbfKey", encryptKey.toByteArray(Charsets.UTF_8))
+            set("imageWidth", hostFieldInt(emoticon, "width") ?: 0)
+            set("imageHeight", hostFieldInt(emoticon, "height") ?: 0)
+            set("faceName", hostFieldString(emoticon, "name").orEmpty())
+            set("isAPNG", packageIsApng || (hostFieldBool(emoticon, "isAPNG") ?: false))
+            set("cSubType", if (packageType == 1 || packageType == 4) 3 else packageType)
+            set(
+                "mediaType",
+                when {
+                    isSound -> 1
+                    jobType == 1 -> 2
+                    jobType == 4 -> 3
+                    else -> 0
+                },
+            )
+            set("mobileparam", (hostFieldString(emoticon, "magicValue") ?: "").toByteArray())
+            set("voicePrintItems", runCatching {
+                val method = emoticon.javaClass.getMethod("parseSoundPrintString")
+                method.invoke(emoticon)
+            }.getOrNull())
+            // supportSize 是 JSON 字符串：能解析就填，不能解析留空（不影响静态表情渲染）
+            set("supportSize", runCatching {
+                val sizeStr = pkg?.let { hostFieldString(it, "supportSize") }.orEmpty()
+                if (sizeStr.isBlank()) {
+                    null
+                } else {
+                    val parser = Class.forName("com.tencent.qqnt.emotion.l.a", false, cl)
+                    parser.getMethod("e", String::class.java).invoke(null, sizeStr)
+                }
+            }.getOrNull())
+            val (api, apiClass) = qrouteApiClass(
+                "com.tencent.qqnt.emotion.adapter.api.IMarketFaceApi",
+            ) ?: run {
+                Log.w(TAG, "stickerPack: IMarketFaceApi unavailable")
+                return@runCatching null
+            }
+            val create = apiClass.methods.firstOrNull {
+                it.name == "createMarketFaceElement" && it.parameterCount == 1
+            } ?: run {
+                Log.w(TAG, "stickerPack: createMarketFaceElement not found")
+                return@runCatching null
+            }
+            create.invoke(api, mf)
+        }.getOrElse { t ->
+            Log.w(
+                TAG,
+                "stickerPack: build marketFace failed ep=$epId eId=$eId: " +
+                    "${t.javaClass.simpleName} ${t.message}",
+            )
+            null
+        }
+    }
+
+    /**
+     * 发送包内表情：MarketFace 元素（对方显示贴纸）优先；失败回退为图片表情发送。
+     * 阻塞，IO 线程；返回是否成功。
+     */
+    fun sendStickerPackEmoji(chatId: String, epId: String, eId: String): Boolean {
+        if (!isHost || chatId.isBlank() || epId.isBlank() || eId.isBlank()) return false
+        if (!ensureServices()) return false
+        val cl = hostClassLoader() ?: return false
+        val started = perfUptime()
+        val pair = findEmoticonOfPack(epId, eId)
+        val emoticon = pair?.first
+        val pkg = pair?.second
+        // 1) MarketFace 贴纸发送
+        if (emoticon != null) {
+            val marketFaceElement = buildMarketFaceElement(epId, eId, emoticon, pkg)
+            if (marketFaceElement != null) {
+                val ok = runCatching {
+                    val (element, msgElementClass) = newMsgElement(cl, ELEMENT_TYPE_MARKET_FACE)
+                    msgElementClass
+                        .getMethod("setMarketFaceElement", marketFaceElement.javaClass)
+                        .invoke(element, marketFaceElement)
+                    val (sent, code) = sendElementsResult(
+                        chatId,
+                        ArrayList<Any>().apply { add(element) },
+                    )
+                    Log.i(
+                        TAG,
+                        "stickerPack: send kind=marketFace chat=$chatId ep=$epId eId=$eId " +
+                            "ok=$sent code=$code ms=${perfUptime() - started}",
+                    )
+                    sent
+                }.getOrElse { t ->
+                    Log.w(
+                        TAG,
+                        "stickerPack: send marketFace failed ep=$epId eId=$eId: " +
+                            "${t.javaClass.simpleName} ${t.message}",
+                    )
+                    false
+                }
+                if (ok) return true
+            }
+        }
+        // 2) 回退：用真实可显示图片走 createPicElement(picSubType=1)
+        val width = emoticon?.let { hostFieldInt(it, "width") } ?: 0
+        val height = emoticon?.let { hostFieldInt(it, "height") } ?: 0
+        val path = findLocalPackEmojiPath(epId, eId)
+            ?: downloadPackEmojiByHttp(epId, eId, width, height)
+        val ok = path != null && sendCustomEmojiMessage(chatId, path)
+        Log.i(
+            TAG,
+            "stickerPack: send kind=pic chat=$chatId ep=$epId eId=$eId path=${path?.take(100)} " +
+                "ok=$ok ms=${perfUptime() - started}",
+        )
+        return ok
+    }
+
+    /** 懒加载各子服务（TIM 启动早期这些 getter 可能返回 null，这里每次重试）。 */
+    private fun ensureServices(): Boolean {
+        if (!initKernel()) return false
+        val kernel = kernelService ?: return false
+        if (recentContactService == null) {
+            recentContactService = runCatching {
+                kernel.javaClass.getMethod("getRecentContactService").invoke(kernel)
+            }.getOrNull()
+        }
+        if (msgService == null) {
+            msgService = runCatching {
+                kernel.javaClass.getMethod("getMsgService").invoke(kernel)
+            }.getOrNull()
+        }
+        if (buddyService == null) {
+            buddyService = runCatching {
+                kernel.javaClass.getMethod("getBuddyService").invoke(kernel)
+            }.getOrNull()
+        }
+        if (profileService == null) {
+            profileService = runCatching {
+                kernel.javaClass.getMethod("getProfileService").invoke(kernel)
+            }.getOrNull()
+        }
+        if (avatarService == null) {
+            avatarService = runCatching {
+                kernel.javaClass.getMethod("getAvatarService").invoke(kernel)
+            }.getOrNull()
+            if (avatarService != null) {
+                nativeAvatarService = runCatching {
+                    avatarService!!.javaClass.getMethod("getService").invoke(avatarService)
+                }.getOrNull()
+            }
+        }
+        registerMsgListenerIfReady()
+        if (myUid == null || myUin == null) {
+            runCatching {
+                val cl = hostClassLoader() ?: return@runCatching
+                val mobileQQClass = Class.forName("mqq.app.MobileQQ", false, cl)
+                val mobileQQ = mobileQQClass.getField("sMobileQQ").get(null) ?: return@runCatching
+                val runtime = mobileQQClass.getMethod("peekAppRuntime").invoke(mobileQQ)
+                    ?: return@runCatching
+                if (myUid == null) {
+                    myUid = runCatching {
+                        runtime.javaClass.getMethod("getCurrentUid").invoke(runtime) as? String
+                    }.getOrNull()?.takeIf { it.isNotBlank() }
+                }
+                if (myUin == null) {
+                    myUin = runCatching {
+                        runtime.javaClass.getMethod("getCurrentUin").invoke(runtime) as? String
+                    }.getOrNull()?.takeIf { it.isNotBlank() }
+                }
+            }
+        }
+        return true
+    }
+
+    // ---------------------------------------------------------------------
+    // 头像
+    // ---------------------------------------------------------------------
+
+
+    private fun avatarPath(uid: String?, big: Boolean): String? {
+        if (uid.isNullOrBlank() || avatarService == null) return null
+        val size = (if (big) avatarSizeBig else avatarSizeSmall) ?: return null
+        return runCatching {
+            avatarService!!.javaClass
+                .getMethod("getAvatarPath", String::class.java, avatarSizeClass!!)
+                .invoke(avatarService, uid, size) as? String
+        }.getOrNull()?.takeIf { it.isNotBlank() }
+    }
+
+    private fun groupAvatarPath(groupUin: Long, big: Boolean): String? {
+        if (groupUin == 0L || avatarService == null) return null
+        val size = (if (big) avatarSizeBig else avatarSizeSmall) ?: return null
+        return runCatching {
+            avatarService!!.javaClass
+                .getMethod(
+                    "getGroupAvatarPath",
+                    Long::class.javaPrimitiveType,
+                    avatarSizeClass!!,
+                )
+                .invoke(avatarService, groupUin, size) as? String
+        }.getOrNull()?.takeIf { it.isNotBlank() }
+    }
+
+    /** TIM legacy 头像路径助手：com.tencent.mobileqq.avatar.api.impl.a.a(type, uin)。 */
+    @Volatile
+    private var legacyAvatarMethod: java.lang.reflect.Method? = null
+
+    private fun legacyAvatarPath(type: Int, uin: Long): String? {
+        if (uin == 0L) return null
+        val cl = hostClassLoader() ?: return null
+        val method = legacyAvatarMethod ?: runCatching {
+            Class.forName("com.tencent.mobileqq.avatar.api.impl.a", false, cl)
+                .methods
+                .firstOrNull {
+                    it.name == "a" && it.parameterCount == 2 &&
+                        it.parameterTypes[0] == Int::class.javaPrimitiveType &&
+                        it.parameterTypes[1] == String::class.java
+                }
+        }.getOrNull()?.also { legacyAvatarMethod = it }
+        if (method == null) return null
+        return runCatching {
+            method.invoke(null, type, uin.toString()) as? String
+        }.getOrNull()?.takeIf { it.isNotBlank() }
+    }
+
+    /** 内核头像服务按 uin 查头像路径（proavatar 缓存，uid 查不到时兜底）。 */
+    private fun kernelAvatarPathByUin(uin: Long): String? {
+        if (uin == 0L) return null
+        val service = nativeAvatarService ?: return null
+        val size = avatarSizeSmall ?: return null
+        return runCatching {
+            service.javaClass
+                .getMethod("getAvatarPathByUin", Long::class.javaPrimitiveType, size.javaClass)
+                .invoke(service, uin, size) as? String
+        }.getOrNull()?.takeIf { pathUsable(it) }
+    }
+
+    /**
+     * TIM 经典头像下载器：FaceDecoder.requestDecodeFace 会走 TIM 自己的头像下载/解码管线，
+     * 下载完成后头像落到 proavatar / legacy head 缓存，我们下一次查路径就能拿到。
+     */
+    private fun legacyFaceDecoder(): Any? {
+        faceDecoder?.let { return it }
+        val cl = hostClassLoader() ?: return null
+        val app = appRuntime ?: runCatching {
+            val mobileQQClass = Class.forName("mqq.app.MobileQQ", false, cl)
+            val mobileQQ = mobileQQClass.getField("sMobileQQ").get(null)
+            mobileQQClass.getMethod("peekAppRuntime").invoke(mobileQQ)
+        }.getOrNull() ?: return null
+        return runCatching {
+            val decoderClass = Class.forName("com.tencent.mobileqq.app.face.FaceDecoder", false, cl)
+            val appInterfaceClass = Class.forName("com.tencent.common.app.AppInterface", false, cl)
+            decoderClass.getConstructor(appInterfaceClass)
+                .newInstance(app)
+                .also {
+                    faceDecoder = it
+                }
+        }.onFailure {
+            Log.w(TAG, "legacy face decoder init failed: ${it.javaClass.simpleName} ${it.message}")
+        }.getOrNull()
+    }
+
+    /**
+     * 主动触发内核下载缺失的用户头像（群成员尚未缓存时经典场景）。
+     * 原生接口没在 java 层暴露：先通过 BaseService.getService() 拿到 native IKernelAvatarService，
+     * 再调 forceDownloadAvatar(uid) / forceDownloadAvatarByUin(uin)。
+     */
+    private fun requestAvatarDownload(uid: String?, uin: Long) {
+        val key = uid?.takeIf { it.isNotBlank() } ?: if (uin != 0L) "uin:$uin" else return
+        if (!avatarDownloadRequested.add(key)) return
+        val service = nativeAvatarService ?: return
+        val size = avatarSizeSmall ?: return
+        val cl = hostClassLoader() ?: return
+        val callbackClass = runCatching {
+            Class.forName("com.tencent.qqnt.kernel.nativeinterface.IOperateCallback", false, cl)
+        }.getOrNull() ?: return
+        val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, method, args ->
+            if (method.name == "onResult") {
+                // 头像批量下载完成：并入统一 LiveChats 去抖刷新，避免每个头像一个 Thread+刷新。
+                scheduleLiveChatsRefresh()
+            }
+            defaultValueFor(method.returnType)
+        }
+        mainHandler.post {
+            runCatching {
+                if (!uid.isNullOrBlank()) {
+                    service.javaClass
+                        .getMethod("forceDownloadAvatar", String::class.java, size.javaClass, callbackClass)
+                        .invoke(service, uid, size, callback)
+                } else {
+                    service.javaClass
+                        .getMethod(
+                            "forceDownloadAvatarByUin",
+                            Long::class.javaPrimitiveType,
+                            size.javaClass,
+                            callbackClass,
+                        )
+                        .invoke(service, uin, size, callback)
+                }
+            }.onFailure {
+                Log.w(TAG, "forceDownloadAvatar failed: ${it.javaClass.simpleName} ${it.message}")
+            }
+            if (uin != 0L) {
+                legacyFaceDecoder()?.let { decoder ->
+                    runCatching {
+                        decoder.javaClass
+                            .getMethod(
+                                "requestDecodeFace",
+                                String::class.java,
+                                Int::class.javaPrimitiveType,
+                                Boolean::class.javaPrimitiveType,
+                            )
+                            .invoke(decoder, uin.toString(), 1, false)
+                    }.onFailure {
+                        Log.w(TAG, "requestDecodeFace failed: ${it.javaClass.simpleName} ${it.message}")
+                    }
+                }
+            }
+        }
+    }
+
+    /** 通过 ProfileService 把 uid 映射成 uin（legacy 头像缓存按 uin 索引）。 */
+    private fun uinForUid(uid: String): Long {
+        if (uid.isBlank()) return 0L
+        uidToUin[uid]?.let { return it }
+        val service = profileService ?: return 0L
+        return runCatching {
+            val list = ArrayList<String>().apply { add(uid) }
+            @Suppress("UNCHECKED_CAST")
+            val map = service.javaClass
+                .getMethod("getUinByUid", String::class.java, ArrayList::class.java)
+                .invoke(service, "", list) as? Map<*, *>
+            val uin = (map?.get(uid) as? Number)?.toLong() ?: 0L
+            if (uin != 0L) uidToUin[uid] = uin
+            uin
+        }.getOrDefault(0L)
+    }
+
+    /** TIM legacy 头像磁盘缓存：Tencent/Tim/head/_hd/<md5(md5(md5(uin)+uin)+uin)>.jpg_ */
+    private fun legacyHashHeadPath(uin: Long, isGroup: Boolean): String? {
+        if (uin == 0L) return null
+        if (legacyHeadPathCache.containsKey(uin)) {
+            return legacyHeadPathCache[uin]?.takeIf { it.isNotEmpty() }
+        }
+        val name = md5Triple(uin.toString()) + ".jpg_"
+        val dirs = buildList {
+            val ext = runCatching { android.os.Environment.getExternalStorageDirectory() }.getOrNull()
+            if (ext != null) {
+                add(java.io.File(ext, "Android/data/com.tencent.tim/Tencent/Tim/head/_hd"))
+            }
+            add(java.io.File("/storage/emulated/0/Android/data/com.tencent.tim/Tencent/Tim/head/_hd"))
+            add(java.io.File("/data/data/com.tencent.tim/files/head/_hd"))
+        }
+        val prefix = if (isGroup) "troop_" else ""
+        val path = dirs.asSequence()
+            .map { java.io.File(it, prefix + name) }
+            .firstOrNull { it.isFile }
+            ?.absolutePath
+        legacyHeadPathCache[uin] = path ?: ""
+        return path
+    }
+
+    private fun md5Triple(input: String): String {
+        fun md5(value: String): String = java.security.MessageDigest.getInstance("MD5")
+            .digest(value.toByteArray())
+            .joinToString("") { "%02X".format(it) }
+        var hash = md5(input)
+        hash = md5(hash + input)
+        hash = md5(hash + input)
+        return hash
+    }
+
+    private fun userAvatarPath(uid: String, uin: Long): String? {
+        val realUin = if (uin != 0L) uin else uinForUid(uid)
+        val path = avatarPath(uid, false)
+            ?: kernelAvatarPathByUin(realUin)
+            ?: legacyAvatarPath(1, realUin)
+            ?: legacyAvatarPath(1, uinForUid(uid))
+            ?: legacyHashHeadPath(realUin, false)
+            ?: legacyHashHeadPath(uinForUid(uid), false)
+        if (path == null) requestAvatarDownload(uid, realUin)
+        return path
+    }
+
+    /** 头像解析：Kernel 头像服务 → TIM legacy 头像缓存（proavatar PNG）。 */
+    private fun chatAvatarPath(meta: ChatMeta, big: Boolean = false): String? =
+        if (meta.isGroup) {
+            groupAvatarPath(meta.groupCode, big)
+                ?: legacyAvatarPath(4, meta.groupCode)
+                ?: legacyAvatarPath(113, meta.groupCode)
+                ?: legacyHashHeadPath(meta.groupCode, true)
+                ?: avatarPath(meta.peerUid, big)
+        } else {
+            avatarPath(meta.peerUid, big)
+                ?: kernelAvatarPathByUin(meta.peerUin)
+                ?: legacyAvatarPath(1, meta.peerUin)
+                ?: legacyAvatarPath(1, uinForUid(meta.peerUid))
+                ?: legacyHashHeadPath(
+                    if (meta.peerUin != 0L) meta.peerUin else uinForUid(meta.peerUid),
+                    false,
+                )
+                ?: run {
+                    requestAvatarDownload(meta.peerUid, meta.peerUin)
+                    null
+                }
+        }
+
+    private fun selfAvatarPath(big: Boolean = false): String? =
+        selfAvatarPathCache ?: avatarPath(myUid, big)
+            ?.also { selfAvatarPathCache = it }
+            ?: legacyAvatarPath(1, myUin?.toLongOrNull() ?: 0L)?.also { selfAvatarPathCache = it }
+            ?: legacyHashHeadPath(myUin?.toLongOrNull() ?: 0L, false)?.also { selfAvatarPathCache = it }
+
+    /** 群成员/好友头像：Kernel(uid) → legacy(uin) → uid 映射 uin。 */
+    private fun memberAvatarPath(uid: String?, uin: Long): String? {
+        if (uid.isNullOrBlank() && uin == 0L) return null
+        val realUin = if (uin != 0L) uin else uinForUid(uid.orEmpty())
+        val path = avatarPath(uid, false)
+            ?: kernelAvatarPathByUin(realUin)
+            ?: legacyAvatarPath(1, realUin)
+            ?: legacyAvatarPath(1, uinForUid(uid.orEmpty()))
+            ?: legacyHashHeadPath(realUin, false)
+            ?: legacyHashHeadPath(uinForUid(uid.orEmpty()), false)
+        if (path == null) requestAvatarDownload(uid, realUin)
+        return path
+    }
+
+    /**
+     * 注册内核消息监听（IKernelMsgListener）：
+     * - 实时消息推送：onRecvMsg/onRecvMsgResp/onMsgInfoListUpdate/onMsgUpdate/onMsgDelete/onMsgRecall
+     *   → [LiveEvents.emitMessageEvent] + 去抖刷新 [LiveChats]
+     * - 图片下载完成：onRichMediaDownloadComplete → 本地路径映射回气泡
+     *
+     * 注册成功后才置 [msgListenerRegistered]；失败保留重试（[MSG_LISTENER_RETRY_MS] 防抖）。
+     */
+    private fun registerMsgListenerIfReady() {
+        if (msgListenerRegistered) return
+        val service = msgService ?: return
+        val cl = hostClassLoader() ?: return
+        val listenerClass = runCatching {
+            Class.forName("com.tencent.qqnt.kernel.nativeinterface.IKernelMsgListener", false, cl)
+        }.getOrNull()
+        if (listenerClass == null) {
+            if (loggedListenerCallbacks.add("missing:IKernelMsgListener")) {
+                Log.w(TAG, "push: IKernelMsgListener not found; realtime push disabled")
+            }
+            return
+        }
+        if (!msgListenerMethodsLogged) {
+            msgListenerMethodsLogged = true
+            val methods = listenerClass.methods.joinToString(", ") { method ->
+                method.name + "(" + method.parameterTypes.joinToString(",") { it.simpleName } + ")"
+            }
+            Log.i(TAG, "push: IKernelMsgListener methods(${listenerClass.methods.size}): $methods")
+        }
+        synchronized(msgListenerLock) {
+            if (msgListenerRegistered) return
+            val now = android.os.SystemClock.uptimeMillis()
+            if (msgListenerRegisterAttemptAt != 0L && now - msgListenerRegisterAttemptAt < MSG_LISTENER_RETRY_MS) {
+                return
+            }
+            msgListenerRegisterAttemptAt = now
+            val proxy = Proxy.newProxyInstance(cl, arrayOf(listenerClass)) { _, method, args ->
+                // 回调异常绝不能抛回内核线程；反射失败一律降级为“只打日志”。
+                runCatching { handleKernelListenerCallback(method.name, args) }
+                    .onFailure {
+                        Log.w(
+                            TAG,
+                            "push: listener callback failed ${method.name}: " +
+                                "${it.javaClass.simpleName} ${it.message}",
+                        )
+                    }
+                // 监听接口里可能有返回基本类型的方法（内核同步调用），不能返回 null。
+                defaultValueFor(method.returnType)
+            }
+            mainHandler.post {
+                runCatching {
+                    service.javaClass
+                        .getMethod("addMsgListener", listenerClass)
+                        .invoke(service, proxy)
+                    msgListenerRegistered = true
+                    Log.i(TAG, "push: kernel msg listener registered")
+                }.onFailure {
+                    val cause = (it as? java.lang.reflect.InvocationTargetException)?.targetException
+                    Log.w(
+                        TAG,
+                        "push: register msg listener failed, retry in ${MSG_LISTENER_RETRY_MS}ms: " +
+                            "${it.javaClass.simpleName} cause=$cause",
+                    )
+                }
+            }
+        }
+    }
+
+    /** IKernelMsgListener 回调分发：图片下载完成 + 实时消息推送；未知回调每个只记一次日志。 */
+    private fun handleKernelListenerCallback(methodName: String, args: Array<out Any?>?) {
+        // Proxy 也会收到 Object 的 hashCode/equals/toString（框架内部调用，不是内核回调），直接忽略。
+        if (methodName == "hashCode" || methodName == "equals" || methodName == "toString") return
+        if (methodName == "onRichMediaDownloadComplete") {
+            val info = args?.firstOrNull()
+            // 群文件下载完成/失败也走 richmedia 传输回调（fileId/fileModelId 匹配 pending）。
+            runCatching { handleGroupFileTransfer(info, complete = true) }
+            handleRichMediaDownloadComplete(info)
+            return
+        }
+        // 群文件列表异步结果（getGroupFileList 返回 reqId，结果从这里按 reqId 匹配 pending）。
+        if (methodName == "onGroupFileInfoUpdate") {
+            runCatching { handleGroupFileListUpdate(args?.firstOrNull()) }
+                .onFailure { Log.w(TAG, "groupFile: list update handler failed: ${it.javaClass.simpleName}") }
+            return
+        }
+        // 群文件新增（上传完成/他人上传）：只打日志，列表页重新拉取即可。
+        if (methodName == "onGroupFileInfoAdd") {
+            val item = args?.firstOrNull()
+            if (item != null) {
+                val folderInfo = invokeGetter(item, "getFolderInfo")
+                val fileInfo = invokeGetter(item, "getFileInfo")
+                Log.i(
+                    TAG,
+                    "groupFile: info add name=" +
+                        (((folderInfo?.let { invokeGetter(it, "getFolderName") } as? String)
+                            ?: (fileInfo?.let { invokeGetter(it, "getFileName") } as? String)).orEmpty()) +
+                        " fileId=" + ((fileInfo?.let { invokeGetter(it, "getFileId") } as? String).orEmpty()) +
+                        " folderId=" + ((folderInfo?.let { invokeGetter(it, "getFolderId") } as? String).orEmpty()),
+                )
+            }
+            return
+        }
+        // 自发视频回显：sendMsg 回调 result 语义不可靠，用内核真正插入的消息判定发送成功。
+        if (methodName == "onAddSendMsg" || methodName.startsWith("onMsgInfoListUpdate") ||
+            methodName.startsWith("onMsgInfoUpdate") || methodName.startsWith("onMsgUpdate")
+        ) {
+            runCatching { handleVideoSendEcho(methodName, args) }
+                .onFailure {
+                    Log.w(TAG, "sendVideo: echo handler failed: ${it.javaClass.simpleName}")
+                }
+        }
+        // 内核 richmedia 传输进度（注意内核方法名拼写为 Progerss 双 r）。
+        if (methodName == "onRichMediaProgerssUpdate") {
+            val info = args?.firstOrNull()
+            runCatching { handleGroupFileTransfer(info, complete = false) }
+            handleRichMediaProgress(info)
+            return
+        }
+        // onMsgRecall(int chatType, String peerUid, long msgId)：参数没有 MsgRecord，单独轻量解析。
+        // 解析失败（例如是 MsgRecord 版本的重载）时退回下面的通用逻辑（chatId=null 事件 + 刷新）。
+        if (methodName.startsWith("onMsgRecall") && handleFlatMsgRecall(methodName, args)) {
+            return
+        }
+        val kind = kindForKernelCallback(methodName)
+        if (kind == null) {
+            if (loggedListenerCallbacks.add("callback:$methodName")) {
+                Log.i(TAG, "push: unhandled listener callback $methodName")
+            }
+            return
+        }
+        handleKernelMsgPush(methodName, args, kind)
+    }
+
+    /** 回调名 → 事件类型；兼容 TIM 小版本的方法名差异（前缀匹配），不匹配返回 null。 */
+    private fun kindForKernelCallback(methodName: String): MessageEvent.Kind? = when {
+        methodName.startsWith("onRecvMsg") -> MessageEvent.Kind.NEW
+        // 真机日志确认的批量新增 / 自己发送：用精确匹配，注意不能被下面的 Update 分支吞掉。
+        methodName == "onMsgInfoListAdd" -> MessageEvent.Kind.NEW
+        methodName == "onAddSendMsg" -> MessageEvent.Kind.NEW
+        methodName == "onMsgInfoListUpdate" || methodName == "onMsgUpdate" ||
+            methodName == "onMsgInfoUpdate" -> MessageEvent.Kind.UPDATE
+        // 未读数变化（含其他端已读）：参数里没有 MsgRecord，走通用路径会 emit chatId=null + 刷新列表/角标。
+        methodName == "onContactUnreadCntUpdate" -> MessageEvent.Kind.UPDATE
+        methodName.startsWith("onMsgDelete") -> MessageEvent.Kind.DELETE
+        methodName.startsWith("onMsgRecall") -> MessageEvent.Kind.RECALL
+        // 消息盒子变化：只用于触发刷新。
+        methodName == "onMsgBoxChanged" -> MessageEvent.Kind.UNKNOWN
+        else -> null
+    }
+
+    /** 从内核回调参数里收集 MsgRecord（兼容 List / 数组 / 单条 / 嵌套容器）。 */
+    private fun collectMsgRecords(args: Array<out Any?>?): List<Any> {
+        val records = ArrayList<Any>()
+        fun visit(value: Any?, depth: Int) {
+            if (value == null || depth > 3 || records.size >= MAX_PUSH_MSG_IDS) return
+            when (value) {
+                is List<*> -> value.forEach { visit(it, depth + 1) }
+                is Array<*> -> value.forEach { visit(it, depth + 1) }
+                is Iterable<*> -> value.forEach { visit(it, depth + 1) }
+                is Map<*, *> -> value.values.forEach { visit(it, depth + 1) }
+                else -> if (isMsgRecord(value)) records.add(value)
+            }
+        }
+        args?.forEach { visit(it, 0) }
+        return records
+    }
+
+    /** 是否像 MsgRecord（有 getMsgId() 且返回 Number）；只用于轻量形状判断，不持有对象。 */
+    private fun isMsgRecord(value: Any): Boolean = runCatching {
+        value.javaClass.getMethod("getMsgId").invoke(value) is Number
+    }.getOrDefault(false)
+
+    /** chatId 构造规则与会话列表完全一致（见 mapRecentContact 的 tim_<chatType>_<peer>）。 */
+    private fun chatIdForMsgRecord(record: Any): String? {
+        val chatType = (invokeGetter(record, "getChatType") as? Number)?.toInt() ?: 0
+        val peerUid = (invokeGetter(record, "getPeerUid") as? String).orEmpty()
+        val peerUin = (invokeGetter(record, "getPeerUin") as? Number)?.toLong() ?: 0L
+        return buildChatId(chatType, peerUid, peerUin)
+    }
+
+    /** 统一的 chatId 规则：`tim_<chatType>_<peerUid 优先，否则 peerUin>`；参数非法返回 null。 */
+    private fun buildChatId(chatType: Int, peerUid: String, peerUin: Long): String? {
+        if (chatType <= 0 || (peerUid.isBlank() && peerUin == 0L)) return null
+        return "tim_${chatType}_${if (peerUid.isNotBlank()) peerUid else peerUin.toString()}"
+    }
+
+    /**
+     * 轻量解析扁平参数版的撤回回调 `onMsgRecall(int chatType, String peerUid, long msgId)`：
+     * 参数里没有 MsgRecord。解析成功则 emit 带 chatId/msgId 的 RECALL 事件 + 去抖刷新；
+     * 解析失败返回 false，交给通用逻辑（chatId=null 事件 + 刷新）。
+     */
+    private fun handleFlatMsgRecall(methodName: String, args: Array<out Any?>?): Boolean {
+        if (args == null || args.size < 3) return false
+        val chatType = (args[0] as? Number)?.toInt() ?: return false
+        val peerUid = args[1] as? String
+        if (chatType <= 0 || peerUid.isNullOrBlank()) return false
+        val chatId = buildChatId(chatType, peerUid, 0L) ?: return false
+        val msgId = (args[2] as? Number)?.toLong() ?: 0L
+        val msgIds = if (msgId != 0L) listOf(msgId) else emptyList<Long>()
+        LiveEvents.emitMessageEvent(
+            MessageEvent(chatId = chatId, msgIds = msgIds, kind = MessageEvent.Kind.RECALL),
+        )
+        if (shouldLogPush(methodName)) {
+            Log.i(TAG, "push: $methodName chat=$chatId n=${msgIds.size} ids=$msgIds (flat args)")
+        }
+        scheduleLiveChatsRefresh()
+        return true
+    }
+
+    /**
+     * 内核消息 → [LiveEvents] + 去抖刷新会话列表。
+     * 运行在内核回调线程：只做轻量解析、tryEmit 与投递任务，绝不阻塞。
+     */
+    private fun handleKernelMsgPush(
+        methodName: String,
+        args: Array<out Any?>?,
+        kind: MessageEvent.Kind,
+    ) {
+        val records = collectMsgRecords(args)
+        // 同一回调可能跨多个会话（例如消息列表批量更新）：按 chatId 分组上报。
+        val grouped = LinkedHashMap<String?, MutableList<Long>>()
+        records.forEach { record ->
+            val msgId = (invokeGetter(record, "getMsgId") as? Number)?.toLong() ?: 0L
+            val chatId = runCatching { chatIdForMsgRecord(record) }.getOrNull()
+            if (msgId == 0L && chatId == null) return@forEach
+            val ids = grouped.getOrPut(chatId) { ArrayList() }
+            if (msgId != 0L && !ids.contains(msgId)) ids.add(msgId)
+        }
+        // 新消息 → 系统通知（后台/其它会话才提醒；只入队，不阻塞内核回调线程）。
+        if (kind == MessageEvent.Kind.NEW) {
+            records.forEach { record ->
+                val chatId = runCatching { chatIdForMsgRecord(record) }.getOrNull()
+                if (chatId != null) enqueueMessageNotification(chatId, record)
+            }
+        }
+        if (grouped.isEmpty()) {
+            // 拿不到记录（例如回调只带状态码）：也上报一个 chatId=null 的事件，让 UI 自行决定是否刷新。
+            LiveEvents.emitMessageEvent(MessageEvent(chatId = null, msgIds = emptyList(), kind = kind))
+            if (shouldLogPush(methodName)) {
+                Log.i(TAG, "push: $methodName chat=- n=0 (no MsgRecord in args)")
+            }
+        } else {
+            var emitted = 0
+            grouped.entries.take(MAX_PUSH_CHATS_PER_CALLBACK).forEach { (chatId, ids) ->
+                LiveEvents.emitMessageEvent(
+                    MessageEvent(chatId = chatId, msgIds = ids.toList(), kind = kind),
+                )
+                emitted++
+            }
+            if (shouldLogPush(methodName)) {
+                val first = grouped.entries.first()
+                Log.i(
+                    TAG,
+                    "push: $methodName chat=${first.key ?: "-"} n=${first.value.size} " +
+                        "ids=${first.value.take(5)} groups=${grouped.size} emitted=$emitted " +
+                        "total=${records.size}",
+                )
+            }
+        }
+        scheduleLiveChatsRefresh()
+    }
+
+    /** 同一回调节点最多每 [PUSH_LOG_INTERVAL_MS] 打一条详情日志，避免消息风暴刷屏。 */
+    private fun shouldLogPush(methodName: String): Boolean {
+        val now = android.os.SystemClock.uptimeMillis()
+        val last = pushLogAt[methodName]
+        if (last != null && now - last < PUSH_LOG_INTERVAL_MS) return false
+        pushLogAt[methodName] = now
+        return true
+    }
+
+    /**
+     * 合并去抖后，在后台单线程刷新会话列表（ChatViewModel 订阅 LiveChats.liveFlow）。
+     * trailing debounce：刷新期间的新事件不会立即再排，而是等本轮结束再完整等一个 debounce。
+     */
+    private fun scheduleLiveChatsRefresh() {
+        synchronized(liveRefreshLock) {
+            liveRefreshScheduledCount++
+            if (liveRefreshInFlight) return
+            liveRefreshInFlight = true
+        }
+        runCatching {
+            liveRefreshExecutor.execute { liveRefreshLoop() }
+        }.onFailure {
+            synchronized(liveRefreshLock) { liveRefreshInFlight = false }
+            Log.w(TAG, "push: schedule live refresh failed: ${it.javaClass.simpleName} ${it.message}")
+        }
+    }
+
+    private fun liveRefreshLoop() {
+        try {
+            while (true) {
+                Thread.sleep(LIVE_REFRESH_DEBOUNCE_MS)
+                val coalesced = synchronized(liveRefreshLock) {
+                    val n = liveRefreshScheduledCount
+                    liveRefreshScheduledCount = 0
+                    n
+                }
+                val started = perfUptime()
+                val chats = runCatching { LiveChats.refresh() }.getOrNull()
+                Log.i(
+                    TAG,
+                    "push: live chats refreshed n=${chats?.size ?: -1} " +
+                        "refreshMs=${perfUptime() - started} coalesced n=$coalesced " +
+                        "debounceMs=$LIVE_REFRESH_DEBOUNCE_MS",
+                )
+                val again = synchronized(liveRefreshLock) { liveRefreshScheduledCount > 0 }
+                if (!again) break
+            }
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "push: live chats refresh failed: ${t.javaClass.simpleName} ${t.message}",
+            )
+        } finally {
+            val needAgain = synchronized(liveRefreshLock) {
+                liveRefreshInFlight = false
+                liveRefreshScheduledCount > 0
+            }
+            // 结束瞬间到达的新事件：重新排一次（仍走完整 debounce）。
+            if (needAgain) scheduleLiveChatsRefresh()
+        }
+    }
+
+    private fun handleRichMediaDownloadComplete(info: Any?) {
+        if (info == null) return
+        val msgId = (invokeGetter(info, "getMsgId") as? Number)?.toLong() ?: 0L
+        if (msgId == 0L) return
+        val errCode = (invokeGetter(info, "getFileErrCode") as? Number)?.toLong() ?: 0L
+        val downType = (invokeGetter(info, "getFileDownType") as? Number)?.toInt() ?: 0
+        val elementId = (invokeGetter(info, "getMsgElementId") as? Number)?.toLong() ?: 0L
+        val rawPath = invokeGetter(info, "getFilePath") as? String
+        Log.i(
+            TAG,
+            "richmedia complete: msg=$msgId elem=$elementId err=$errCode downType=$downType path=${rawPath?.take(80)}",
+        )
+        if (errCode == 0L && !rawPath.isNullOrBlank() && pathUsable(rawPath) && elementId != 0L) {
+            downloadedMediaByElement[elementId] = rawPath
+        }
+        if (errCode == 0L) {
+            // 完成：进度表写 100（UI 可立即显示完成），后续以 downloadedMediaByElement 为准。
+            if (elementId != 0L) richMediaProgressByElement[elementId] = 100
+            if (msgId != 0L) richMediaProgressByMsgId[msgId] = 100
+        } else {
+            // 失败/取消：清掉旧进度，避免下一次下载读到上次的残留值。
+            if (elementId != 0L) richMediaProgressByElement.remove(elementId)
+            if (msgId != 0L) richMediaProgressByMsgId.remove(msgId)
+        }
+        if (errCode != 0L) return
+        val path = rawPath ?: return
+        if (!pathUsable(path)) return
+        when (downType) {
+            2 -> downloadedImageThumbs[msgId] = path
+            1 -> downloadedImageOrig[msgId] = path
+            else -> if (!downloadedImageThumbs.containsKey(msgId)) {
+                downloadedImageOrig.putIfAbsent(msgId, path)
+            }
+        }
+    }
+
+    /**
+     * 内核 richmedia 真实传输进度回调 `IKernelMsgListener.onRichMediaProgerssUpdate(FileTransNotifyInfo)`
+     * （内核方法名拼写就是 Progerss）。字段/getter：getMsgId/getMsgElementId/getFileProgress(long)/
+     * getTotalSize(long)/getTrasferStatus/getFilePath/getFileDownType。
+     * FileElement.progress 真机一直 0，所以文件下载进度以这里的回调为准。
+     */
+    private fun handleRichMediaProgress(info: Any?) {
+        if (info == null) return
+        val msgId = (invokeGetter(info, "getMsgId") as? Number)?.toLong() ?: 0L
+        val elementId = (invokeGetter(info, "getMsgElementId") as? Number)?.toLong() ?: 0L
+        if (msgId == 0L && elementId == 0L) return
+        val progress = (invokeGetter(info, "getFileProgress") as? Number)?.toLong() ?: 0L
+        val totalSize = (invokeGetter(info, "getTotalSize") as? Number)?.toLong() ?: 0L
+        val status = (invokeGetter(info, "getTrasferStatus") as? Number)?.toInt() ?: 0
+        val filePath = invokeGetter(info, "getFilePath") as? String
+        val pct = if (totalSize > 0L) {
+            (progress * 100L / totalSize).toInt().coerceIn(0, 100)
+        } else {
+            progress.toInt().coerceIn(0, 100)
+        }
+        val old = if (elementId != 0L) {
+            richMediaProgressByElement.put(elementId, pct)
+        } else if (msgId != 0L) {
+            richMediaProgressByMsgId.put(msgId, pct)
+        } else {
+            null
+        }
+        if (elementId != 0L && msgId != 0L) richMediaProgressByMsgId[msgId] = pct
+        if (old != pct) {
+            Log.i(
+                TAG,
+                "richMedia progress: msg=$msgId elem=$elementId pct=$pct status=$status " +
+                    "progress=$progress total=$totalSize path=${filePath?.take(80)}",
+            )
+        }
+    }
+
+    /** 用 TIM 自己的 AIOPicDownloader.m(msgElement, PicSize) 算本地缓存路径（聊天记录图片常已缓存）。 */
+    private fun timCachedImagePath(element: Any?): String? {
+        if (element == null) return null
+        val cl = hostClassLoader() ?: return null
+        val downloaderClass = runCatching {
+            Class.forName("com.tencent.mobileqq.aio.msglist.holder.base.AIOPicDownloader", false, cl)
+        }.getOrNull() ?: return null
+        val instance = runCatching {
+            downloaderClass.declaredFields.firstOrNull { field ->
+                java.lang.reflect.Modifier.isStatic(field.modifiers) &&
+                    downloaderClass.isAssignableFrom(field.type)
+            }?.apply { isAccessible = true }?.get(null)
+        }.getOrNull() ?: return null
+        val method = downloaderClass.methods.firstOrNull {
+            it.name == "m" && it.parameterCount == 2
+        } ?: return null
+        val picSizeClass = runCatching {
+            Class.forName("com.tencent.mobileqq.aio.msglist.holder.base.PicSize", false, cl)
+        }.getOrNull() ?: return null
+        // 优先原图/大图/高清缩略图，最后才是 198 小缩略图（否则聊天记录里的图片会非常糊）。
+        val priority = listOf(
+            "PIC_DOWNLOAD_ORI",
+            "PIC_DOWNLOAD_BIG_THUMB",
+            "PIC_LOCAL_HD_THUMB",
+            "PIC_DOWNLOAD_THUMB",
+        )
+        val sizes = picSizeClass.enumConstants.orEmpty()
+            .sortedBy { size -> priority.indexOf((size as? Enum<*>)?.name.orEmpty()).let { if (it < 0) priority.size else it } }
+        for (size in sizes) {
+            val path = runCatching { method.invoke(instance, element, size) as? String }
+                .getOrNull()
+            if (!path.isNullOrBlank() && java.io.File(path).isFile) {
+                val name = (size as? Enum<*>)?.name.orEmpty()
+                val elementKey = (invokeGetter(element, "getElementId") as? Number)?.toLong() ?: 0L
+                if (loggedTimCachedImages.add(elementKey)) {
+                    Log.i(
+                        TAG,
+                        "tim cached image: elem=$elementKey size=$name " +
+                            "bytes=${java.io.File(path).length()} path=${path.take(90)}",
+                    )
+                }
+                return path
+            }
+        }
+        return null
+    }
+
+    private fun downloadedImagePath(msgId: Long): String? =
+        downloadedImageThumbs[msgId]?.takeIf { pathUsable(it) }
+            ?: downloadedImageOrig[msgId]?.takeIf { pathUsable(it) }
+
+    // ---------------------------------------------------------------------
+    // 图片查看器原图（loadChatImageOriginal）：PicElement.sourcePath → 内核原图下载 → HTTP 兜底
+    // ---------------------------------------------------------------------
+
+    /** 原图缓存目录：cacheDir/m3tim_origin（与气泡缩略图缓存 m3tim_richmedia 分开）。 */
+    private fun originImageCacheDir(context: android.content.Context): java.io.File =
+        java.io.File(context.cacheDir, "m3tim_origin").apply { mkdirs() }
+
+    private fun originImageCacheFile(msgId: Long, elementId: Long): String? {
+        val context = appContext() ?: return null
+        val prefix = "${msgId}_${elementId}."
+        return originImageCacheDir(context).listFiles()
+            ?.firstOrNull { it.isFile && it.length() > 0L && it.name.startsWith(prefix) }
+            ?.absolutePath
+    }
+
+    /** 按 URL 同步下载原图到 cacheDir/m3tim_origin（HTTP 兜底，流式写文件）。 */
+    private fun downloadOriginImageByUrl(msgId: Long, elementId: Long, url: String): String? {
+        val context = appContext() ?: return null
+        val target = java.io.File(
+            originImageCacheDir(context),
+            "${msgId}_${elementId}.${extForUrl(url)}",
+        )
+        if (target.isFile && target.length() > 0L) return target.absolutePath
+        Log.i(
+            TAG,
+            "imageOriginal: http download msg=$msgId elem=$elementId url=${url.take(90)}",
+        )
+        return runCatching {
+            val connection = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+            connection.connectTimeout = 10_000
+            connection.readTimeout = 25_000
+            connection.instanceFollowRedirects = true
+            connection.setRequestProperty(
+                "User-Agent",
+                "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 (KHTML, like Gecko) " +
+                    "Version/4.0 Chrome/126.0 Mobile Safari/537.36",
+            )
+            connection.inputStream.use { input ->
+                target.outputStream().use { output -> input.copyTo(output) }
+            }
+            connection.disconnect()
+            target.takeIf { it.isFile && it.length() > 0L }?.absolutePath
+        }.onFailure {
+            Log.w(
+                TAG,
+                "imageOriginal: http download failed msg=$msgId elem=$elementId " +
+                    "${it.javaClass.simpleName} ${it.message}",
+            )
+        }.getOrNull()
+    }
+
+    /**
+     * 触发内核**原图**下载（TIM AIOPicDownloader 原图参数，反编译确认）：
+     * RichMediaElementGetReq{msgId, peerUid, chatType, elementId,
+     *   downloadType=1(原图), thumbSize=0, downSourceType=1, triggerType=1}
+     * → IKernelMsgService.getRichMediaElement(req)；完成回调 onRichMediaDownloadComplete
+     *   （fileDownType=1）会写入 downloadedImageOrig[msgId]。
+     */
+    private fun requestOriginalImageDownload(chatId: String, msgId: Long, elementId: Long): Boolean {
+        if (!isHost || msgId == 0L || elementId == 0L) return false
+        val meta = chatMeta[chatId] ?: ensureChatContext(chatId) ?: return false
+        if (meta.peerUid.isBlank()) return false
+        if (!ensureServices()) return false
+        val service = waitForService(timeoutMs = 1_500L) { msgService } ?: return false
+        val cl = hostClassLoader() ?: return false
+        return runCatching {
+            val reqClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.RichMediaElementGetReq", false, cl,
+            )
+            val req = reqClass.getConstructor().newInstance()
+            reqClass.getField("msgId").setLong(req, msgId)
+            reqClass.getField("peerUid").set(req, meta.peerUid)
+            reqClass.getField("chatType").setInt(req, meta.chatType)
+            reqClass.getField("elementId").setLong(req, elementId)
+            reqClass.getField("downloadType").setInt(req, 1) // 1=原图（2=缩略图）
+            reqClass.getField("thumbSize").setInt(req, 0)
+            reqClass.getField("downSourceType").setInt(req, 1)
+            reqClass.getField("triggerType").setInt(req, 1)
+            val target = resolveKernelMethod(service, "getRichMediaElement", 1) ?: run {
+                Log.w(TAG, "imageOriginal: getRichMediaElement not found")
+                return false
+            }
+            target.second.invoke(target.first, req)
+            true
+        }.getOrElse { t ->
+            Log.w(
+                TAG,
+                "imageOriginal: request original failed msg=$msgId elem=$elementId " +
+                    "${t.javaClass.simpleName} ${t.message}",
+            )
+            false
+        }
+    }
+
+    private fun picElementFromRecord(
+        record: Any?,
+        elementId: Long,
+    ): Pair<Any?, Any?> { // (MsgElement, PicElement)
+        val elements = record?.let { invokeGetter(it, "getElements") } as? List<*> ?: return null to null
+        for (element in elements) {
+            element ?: continue
+            val pic = invokeGetter(element, "getPicElement") ?: continue
+            val eid = (invokeGetter(element, "getElementId") as? Number)?.toLong() ?: 0L
+            if (elementId != 0L && eid != elementId) continue
+            return element to pic
+        }
+        return null to null
+    }
+
+    private fun logImageOriginal(
+        chatId: String,
+        msgId: Long,
+        elementId: Long,
+        path: String?,
+        downloadType: Int,
+    ) {
+        val size = path?.let { java.io.File(it).takeIf { f -> f.isFile }?.length() } ?: -1L
+        Log.i(
+            TAG,
+            "imageOriginal: chat=$chatId msg=$msgId elem=$elementId path=${path?.take(120)} " +
+                "size=$size downloadType=$downloadType",
+        )
+    }
+
+    /**
+     * 图片查看器原图（阻塞，IO 线程调用）：a) PicElement.sourcePath（已缓存原图）
+     * b) 内核原图下载 downloadType=1（≤8s 轮询）c) originImageUrl HTTP 下载。
+     * 返回前校验文件可读且 size>0；失败返回 null（日志 `imageOriginal: ... failed`）。
+     */
+    fun loadChatImageOriginal(chatId: String, msgId: Long, elementId: Long): String? {
+        if (!isHost) return null
+        if (!ensureServices()) return null
+        // 贴纸消息没有 PicElement：直接复用 MarketFace 解析/下载（本地已下载则秒回）。
+        val mfRecord = runCatching { fetchRawMsgRecord(chatId, msgId) }.getOrNull()
+        if (mfRecord != null) {
+            @Suppress("UNCHECKED_CAST")
+            val mfElements = invokeGetter(mfRecord, "getElements") as? List<Any?> ?: emptyList()
+            val mfElement = mfElements.firstOrNull { el ->
+                if (el == null) return@firstOrNull false
+                val eid = (invokeGetter(el, "getElementId") as? Number)?.toLong() ?: 0L
+                (elementId == 0L || eid == elementId) && invokeGetter(el, "getMarketFaceElement") != null
+            }
+            if (mfElement != null) {
+                val image = resolveMarketFaceImage(mfElement, msgId)
+                if (image.path != null) {
+                    logImageOriginal(chatId, msgId, elementId, image.path, 0)
+                }
+                return image.path
+            }
+        }
+        val started = perfUptime()
+        // 0) 已经拿到的原图缓存（内核回调 / 我们自己的 HTTP 缓存）
+        downloadedImageOrig[msgId]?.takeIf { pathUsable(it) }?.let {
+            logImageOriginal(chatId, msgId, elementId, it, 0)
+            return it
+        }
+        originImageCacheFile(msgId, elementId)?.let {
+            logImageOriginal(chatId, msgId, elementId, it, 0)
+            return it
+        }
+        pendingRichMediaPaths["$msgId:$elementId"]?.takeIf { pathUsable(it) }?.let {
+            logImageOriginal(chatId, msgId, elementId, it, 0)
+            return it
+        }
+        // a) 已缓存原图 PicElement.sourcePath（对比缩略图大小，避免把 198 缩略图当原图返回）
+        var record = fetchRawMsgRecord(chatId, msgId)
+        var (element, pic) = picElementFromRecord(record, elementId)
+        val sourcePath = (pic?.let { invokeGetter(it, "getSourcePath") } as? String)
+            ?.takeIf { pathUsable(it) }
+        val thumbPaths = (pic?.let { invokeGetter(it, "getThumbPath") } as? Map<*, *>)
+            .orEmpty().values.mapNotNull { it as? String }.filter { pathUsable(it) }
+        val thumbMaxSize = thumbPaths.maxOfOrNull { java.io.File(it).length() } ?: 0L
+        if (sourcePath != null) {
+            val sourceSize = java.io.File(sourcePath).length()
+            Log.i(
+                TAG,
+                "imageOriginal: sourcePath candidate msg=$msgId elem=$elementId " +
+                    "sourceSize=$sourceSize thumbMax=$thumbMaxSize",
+            )
+            if (thumbMaxSize <= 0L || sourceSize >= thumbMaxSize) {
+                logImageOriginal(chatId, msgId, elementId, sourcePath, 0)
+                return sourcePath
+            }
+        }
+        // b) 内核原图下载（downloadType=1），等待 ≤8s
+        val requested = requestOriginalImageDownload(chatId, msgId, elementId)
+        Log.i(
+            TAG,
+            "imageOriginal: kernel original download msg=$msgId elem=$elementId requested=$requested " +
+                "downloadType=1 thumbSize=0",
+        )
+        if (requested) {
+            val deadline = perfUptime() + 2_500L
+            var lastPoll = 0L
+            while (perfUptime() < deadline) {
+                downloadedImageOrig[msgId]?.takeIf { pathUsable(it) }?.let {
+                    logImageOriginal(chatId, msgId, elementId, it, 1)
+                    return it
+                }
+                originImageCacheFile(msgId, elementId)?.let {
+                    logImageOriginal(chatId, msgId, elementId, it, 1)
+                    return it
+                }
+                // 内核可能把下载结果写回 PicElement.sourcePath（1s 重查一次，避免频繁 IPC）
+                if (perfUptime() - lastPoll >= 1_000L) {
+                    lastPoll = perfUptime()
+                    record = fetchRawMsgRecord(chatId, msgId)
+                    val refreshed = picElementFromRecord(record, elementId)
+                    element = refreshed.first
+                    pic = refreshed.second
+                    val refreshedSource = (pic?.let { invokeGetter(it, "getSourcePath") } as? String)
+                        ?.takeIf { pathUsable(it) }
+                    if (refreshedSource != null && java.io.File(refreshedSource).length() > 0L) {
+                        logImageOriginal(chatId, msgId, elementId, refreshedSource, 1)
+                        return refreshedSource
+                    }
+                }
+                Thread.sleep(150L)
+            }
+            Log.w(
+                TAG,
+                "imageOriginal: kernel download timeout msg=$msgId elem=$elementId " +
+                    "waited=${perfUptime() - started}ms",
+            )
+        }
+        // c) HTTP 兜底：PicElement.originImageUrl
+        val originUrl = (pic?.let { invokeGetter(it, "getOriginImageUrl") } as? String)
+            ?.takeIf { it.startsWith("http", ignoreCase = true) }
+        if (originUrl != null) {
+            downloadOriginImageByUrl(msgId, elementId, originUrl)?.let {
+                logImageOriginal(chatId, msgId, elementId, it, 2)
+                return it
+            }
+        }
+        // d) 最后再读一次 sourcePath（即使比缩略图小也优先于缩略图）
+        val finalSource = (pic?.let { invokeGetter(it, "getSourcePath") } as? String)
+            ?.takeIf { pathUsable(it) }
+        if (finalSource != null) {
+            logImageOriginal(chatId, msgId, elementId, finalSource, 0)
+            return finalSource
+        }
+        Log.w(
+            TAG,
+            "imageOriginal: failed chat=$chatId msg=$msgId elem=$elementId " +
+                "requested=$requested ms=${perfUptime() - started}",
+        )
+        return null
+    }
+
+    // ---------------------------------------------------------------------
+    // 会话列表
+    // ---------------------------------------------------------------------
+
+    /** 读取 TIM 最近会话（阻塞，需在 IO 线程调用）。失败返回 null。 */
+    fun loadRecentChats(): List<ChatItem>? {
+        if (!isHost) return null
+        if (!ensureServices()) return null
+        val recentStarted = perfUptime()
+        var service = recentContactService
+        if (service == null) {
+            // 用户首页加载：首次已 ensureServices，这里只做短等待（服务通常 <200ms 就绪）。
+            val serviceDeadline = android.os.SystemClock.uptimeMillis() + 1_200L
+            while (android.os.SystemClock.uptimeMillis() < serviceDeadline && service == null) {
+                Thread.sleep(120L)
+                ensureServices()
+                service = recentContactService
+            }
+        }
+        if (service == null) {
+            Log.w(TAG, "perf: loadRecentChats service null waitMs=${perfUptime() - recentStarted}")
+            return null
+        }
+        return try {
+            val method = service.javaClass.methods.firstOrNull { candidate ->
+                candidate.name == "a" &&
+                    candidate.parameterCount == 0 &&
+                    java.util.List::class.java.isAssignableFrom(candidate.returnType)
+            }
+            if (method == null) {
+                Log.w(TAG, "recent contact list method not found")
+                return null
+            }
+            // TIM 刚启动时最近会话可能还没加载完（a() 返回 null）：立即读一次，短间隔重试，
+            // 2s 内仍空则快速失败（LiveChats 后续刷新/UI 重试），避免用户等 8s。
+            var raw: List<Any?>? = null
+            val started = perfUptime()
+            val deadline = started + 2_000L
+            while (perfUptime() < deadline) {
+                val result = runCatching { method.invoke(service) }.getOrNull()
+                @Suppress("UNCHECKED_CAST")
+                val list = result as? List<Any?>
+                if (list != null) {
+                    raw = list
+                    break
+                }
+                Thread.sleep(120L)
+            }
+            if (raw == null) {
+                Log.w(TAG, "perf: loadRecentChats list null waitMs=${perfUptime() - started}")
+                return null
+            }
+            if (perfUptime() - started > 250L) {
+                Log.i(TAG, "perf: loadRecentChats ready waitMs=${perfUptime() - started}")
+            }
+
+            // 群免打扰来自内核群资料 cmdUinMsgMask（TIM 群设置同源）；单聊沿用 isMsgDisturb。
+            val groupCodes = raw.mapNotNull { info ->
+                info?.let {
+                    val infoChatType = (invokeGetter(it, "getChatType") as? Int) ?: 0
+                    val infoPeerUin = (invokeGetter(it, "getPeerUin") as? Number)?.toLong() ?: 0L
+                    if (infoChatType == 2 && infoPeerUin > 0L) infoPeerUin else null
+                }
+            }.distinct()
+            val groupMuteMasks = groupMuteMasksFor(groupCodes)
+            // wrapper a() 的 RecentContactInfo 是精简版（atType/listOfSpecific 为空），
+            // 用内核 recent 快照的完整对象补提醒标签字段；失败自动回退原对象。
+            val tagSources = recentContactSnapshotFullMap()
+            val chats = raw.mapNotNull { info ->
+                info?.let { mapRecentContact(it, groupMuteMasks, tagSources) }
+            }
+            val c2c = chats.filter { !it.isGroup }
+            val groups = chats.filter { it.isGroup }
+            Log.i(
+                TAG,
+                "loadRecentChats: ${chats.size} conversations, avatars=${chats.count { it.avatarPath != null }}, " +
+                    "c2cAvatars=${c2c.count { it.avatarPath != null }}/${c2c.size}, " +
+                    "groupAvatars=${groups.count { it.avatarPath != null }}/${groups.size}",
+            )
+            recentChatsCache = chats
+            chats
+        } catch (t: Throwable) {
+            Log.e(TAG, "loadRecentChats failed: ${t.javaClass.simpleName} ${t.message}", t)
+            null
+        }
+    }
+
+    /**
+     * 批量读取内核缓存的群资料 cmdUinMsgMask（与 TIM 群设置页同源），返回 groupCode -> 是否免打扰：
+     * RECEIVE（接收但不提醒）/ ASSISTANT（群助手不提醒）/ SHIELD（屏蔽）为免打扰；
+     * NOTIFY（接收并提醒）为正常；UNSPECIFIED 不返回（未知）。结果写入 [groupMuteCache]（TTL 60s）。
+     */
+    private fun batchQueryGroupMuteMasks(
+        groupCodes: List<Long>,
+        timeoutMs: Long = GROUP_MUTE_QUERY_TIMEOUT_MS,
+    ): Map<Long, Boolean> {
+        if (groupCodes.isEmpty()) return emptyMap()
+        val cl = hostClassLoader() ?: return emptyMap()
+        val service = kernelService?.let { invokeGetter(it, "getGroupService") } ?: return emptyMap()
+        return runCatching {
+            val reqClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.BatchQueryCachedGroupDetailInfoReq",
+                false, cl,
+            )
+            val request = reqClass.getConstructor().newInstance()
+            @Suppress("UNCHECKED_CAST")
+            val codes = reqClass.getField("groupCodes").get(request) as ArrayList<Long>
+            codes.addAll(groupCodes)
+            val method = service.javaClass.methods.firstOrNull {
+                it.name == "batchQueryCachedGroupDetailInfo" && it.parameterCount == 2
+            } ?: return emptyMap()
+            val args = awaitCallback(
+                cl,
+                "com.tencent.qqnt.kernel.nativeinterface.IBatchQueryCachedGroupDetailInfoCallback",
+                timeoutMs,
+            ) { proxy -> method.invoke(service, request, proxy) } ?: return emptyMap()
+            val details = (args.getOrNull(0) as? List<*>).orEmpty().filterNotNull()
+            val result = LinkedHashMap<Long, Boolean>(details.size)
+            val now = perfUptime()
+            for (detail in details) {
+                val code = (invokeGetter(detail, "getGroupCode") as? Number)?.toLong() ?: continue
+                val maskName = (invokeGetter(detail, "getCmdUinMsgMask") as? Enum<*>)?.name ?: continue
+                when (maskName) {
+                    "NOTIFY" -> {
+                        result[code] = false
+                        groupMuteCache[code] = CachedGroupMute(false, maskName, now)
+                    }
+                    "RECEIVE", "ASSISTANT", "SHIELD" -> {
+                        result[code] = true
+                        groupMuteCache[code] = CachedGroupMute(true, maskName, now)
+                    }
+                    else -> Unit
+                }
+            }
+            Log.i(
+                TAG,
+                "notify: groupMuteMasks requested=${groupCodes.size} got=${result.size} " +
+                    "muted=${result.count { it.value }} timeoutMs=$timeoutMs",
+            )
+            result
+        }.getOrElse { t ->
+            Log.w(TAG, "batchQueryGroupMuteMasks failed: ${t.javaClass.simpleName} ${t.message}")
+            emptyMap()
+        }
+    }
+
+    /** 带缓存批量查询：fresh 缓存直接返回，缺失的群才走内核（≤2s）。 */
+    private fun groupMuteMasksFor(groupCodes: List<Long>): Map<Long, Boolean> {
+        if (groupCodes.isEmpty()) return emptyMap()
+        val now = perfUptime()
+        val result = LinkedHashMap<Long, Boolean>(groupCodes.size)
+        val missing = ArrayList<Long>()
+        for (code in groupCodes.distinct()) {
+            val cached = groupMuteCache[code]
+            // 仅采用 maskName 已解析的权威缓存；空/未知 mask 的条目视为未缓存，交给内核重新查询。
+            if (cached != null && now - cached.at < GROUP_MUTE_CACHE_TTL_MS &&
+                cached.maskName in groupMuteMaskNames
+            ) {
+                result[code] = cached.muted
+            } else {
+                missing.add(code)
+            }
+        }
+        if (missing.isNotEmpty()) result.putAll(batchQueryGroupMuteMasks(missing))
+        return result
+    }
+
+    /** 仅这些 mask 名是权威解析结果，才允许用作免打扰判定缓存。 */
+    private val groupMuteMaskNames = setOf("NOTIFY", "RECEIVE", "ASSISTANT", "SHIELD")
+
+    /**
+     * 权威群免打扰缓存：仅 TTL 内且 mask 已解析成功（maskName 合法）的条目才返回；
+     * 旧代码/路径写入的 masked=false + 空 maskName 条目一律视为不可信（返回 null，强制走渠道查询）。
+     */
+    private fun cachedGroupMute(groupCode: Long): Boolean? {
+        val cached = groupMuteCache[groupCode] ?: return null
+        if (perfUptime() - cached.at >= GROUP_MUTE_CACHE_TTL_MS) return null
+        if (cached.maskName !in groupMuteMaskNames) return null
+        return cached.muted
+    }
+
+    /** 群消息设置原始 mask 名（NOTIFY/RECEIVE/ASSISTANT/SHIELD），缓存过期/未知返回 null。 */
+    private fun cachedGroupMaskName(groupCode: Long): String? {
+        val cached = groupMuteCache[groupCode] ?: return null
+        return cached.maskName.takeIf {
+            cached.maskName.isNotBlank() && perfUptime() - cached.at < GROUP_MUTE_CACHE_TTL_MS
+        }
+    }
+
+    /** TIM 本地 TroopInfo.troopmask（GroupMsgMask）原始 mask 名（仅明确值）。 */
+    private fun troopInfoGroupMaskName(groupCode: Long): String? {
+        val info = troopInfoFor(groupCode) ?: return null
+        val mask = troopInfoField(info, "troopmask") ?: return null
+        return when (val name = (mask as? Enum<*>)?.name) {
+            "NOTIFY", "RECEIVE", "ASSISTANT", "SHIELD" -> name
+            else -> null
+        }
+    }
+
+    /** TIM 本地 TroopInfo.troopmask（GroupMsgMask）兜底：仅当值明确时返回。 */
+    private fun troopInfoGroupMute(groupCode: Long): Boolean? =
+        when (troopInfoGroupMaskName(groupCode)) {
+            "NOTIFY" -> false
+            "RECEIVE", "ASSISTANT", "SHIELD" -> true
+            else -> null
+        }
+
+    private fun troopInfoField(info: Any?, field: String): Any? = runCatching {
+        info?.javaClass?.getField(field)?.get(info)
+    }.getOrNull()
+
+    // ---------------------------------------------------------------------
+    // 群助手（Troop Helper）：TIM 主列表伪会话 uin=9994/chatType=7；
+    // 收进群助手的群由内核「群助手专用最近会话列表」listType=2 提供。
+    // ---------------------------------------------------------------------
+
+    /** TIM AppConstants.TROOP_ASSISTANT_UIN（群助手伪联系人的 QQ 号）。 */
+    private val troopAssistantUin = 9994L
+
+    /** 群助手强制免打扰日志只打一次（避免会话列表每次刷新刷屏）。 */
+    private val assistantMutedLogged = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** 会话列表 groupMuteMasks 为空（批量查询超时/冷启动）警告只打一次。 */
+    private val recentGroupMuteWarnLogged = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private fun recentContactServiceWrapper(): Any? =
+        kernelService?.let { invokeGetter(it, "getRecentContactService") }
+
+    private fun recentContactsCached(listType: Int): List<Any> {
+        val wrapper = recentContactServiceWrapper() ?: return emptyList()
+        val method = wrapper.javaClass.methods.firstOrNull {
+            it.name == "x" && it.parameterCount == 1
+        } ?: return emptyList()
+        @Suppress("UNCHECKED_CAST")
+        return (runCatching { method.invoke(wrapper, listType) }.getOrNull() as? List<Any?>)
+            .orEmpty().filterNotNull()
+    }
+
+    /**
+     * 按 listType 取内核最近会话（TIM `PlatformRecentContactsDataSource` 同款）：
+     * 先读 wrapper 缓存 `x(listType)`；为空则 `o(AnchorPointContactInfo(), true, listType, count=200, cb)`
+     * 触发 `fetchAndSubscribeABatchOfRecentContact`，轮询缓存 ≤[timeoutMs]。
+     */
+    private fun recentContactsByListType(
+        listType: Int,
+        count: Int = 200,
+        timeoutMs: Long = 3_000L,
+    ): List<Any> {
+        recentContactsCached(listType).takeIf { it.isNotEmpty() }?.let {
+            Log.i(TAG, "groupAssistant: listType=$listType cache=${it.size}")
+            return it
+        }
+        val wrapper = recentContactServiceWrapper() ?: return emptyList()
+        val cl = hostClassLoader() ?: return emptyList()
+        val anchor = runCatching {
+            Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.AnchorPointContactInfo",
+                false,
+                cl,
+            ).getConstructor().newInstance()
+        }.getOrNull() ?: return emptyList()
+        val fetchMethod = wrapper.javaClass.methods.firstOrNull {
+            it.name == "o" && it.parameterCount == 5
+        }
+        if (fetchMethod == null) {
+            Log.w(TAG, "groupAssistant: fetchRecentContactInfo/o not found (listType=$listType)")
+            return emptyList()
+        }
+        val callbackClass = runCatching {
+            Class.forName("com.tencent.qqnt.kernel.nativeinterface.IOperateCallback", false, cl)
+        }.getOrNull() ?: return emptyList()
+        var callbackCode = -1
+        val latch = CountDownLatch(1)
+        val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, method, args ->
+            if (method.name == "onResult") {
+                callbackCode = (args?.getOrNull(0) as? Number)?.toInt() ?: -1
+                latch.countDown()
+            }
+            defaultValueFor(method.returnType)
+        }
+        val invoked = runCatching {
+            fetchMethod.invoke(wrapper, anchor, true, listType, count, callback)
+            true
+        }.getOrElse { t ->
+            Log.w(
+                TAG,
+                "groupAssistant: fetch listType=$listType failed: ${t.javaClass.simpleName} ${t.message}",
+            )
+            false
+        }
+        if (!invoked) return emptyList()
+        val started = perfUptime()
+        fun loaded(): List<Any>? = recentContactsCached(listType).takeIf { it.isNotEmpty() }
+        // 先立即读一次（内核可能同步/极快填充），再短等回调，最后 120ms 短轮询；
+        // 用户打开群助手页面最多等 2s（原来 latch 1.5s + poll 3s = 4.5s）。
+        loaded()?.let {
+            Log.i(TAG, "groupAssistant: listType=$listType fetched=${it.size} code=$callbackCode waitMs=0")
+            return it
+        }
+        latch.await(250L, TimeUnit.MILLISECONDS)
+        loaded()?.let {
+            Log.i(
+                TAG,
+                "groupAssistant: listType=$listType fetched=${it.size} code=$callbackCode " +
+                    "waitMs=${perfUptime() - started}",
+            )
+            return it
+        }
+        val effectiveTimeout = timeoutMs.coerceAtMost(2_000L)
+        val deadline = started + effectiveTimeout
+        while (perfUptime() < deadline) {
+            loaded()?.let {
+                Log.i(
+                    TAG,
+                    "groupAssistant: listType=$listType fetched=${it.size} code=$callbackCode " +
+                        "waitMs=${perfUptime() - started}",
+                )
+                return it
+            }
+            Thread.sleep(120L)
+        }
+        Log.w(
+            TAG,
+            "perf: groupAssistant listType=$listType empty waitMs=${perfUptime() - started} " +
+                "(callbackCode=$callbackCode)",
+        )
+        return emptyList()
+    }
+
+    /** 主最近会话里是否存在「群助手」伪会话（chatType=7 或 peerUin=9994）。 */
+    private fun isTroopAssistantRecentEntry(): Boolean {
+        val main = recentContactsCached(1)
+        if (main.isNotEmpty()) {
+            val hit = main.any { info ->
+                ((invokeGetter(info, "getChatType") as? Number)?.toInt() ?: 0) == 7 ||
+                    ((invokeGetter(info, "getPeerUin") as? Number)?.toLong() ?: 0L) == troopAssistantUin
+            }
+            if (hit) return true
+        }
+        return recentChatsCache.any { it.id == "tim_troop_assistant" }
+    }
+
+    /**
+     * 群助手群映射时同步登记 chatMeta/contacts：listType=2 独立列表不经过 loadRecentChats，
+     * 不登记会导致 ChatDetail 里 loadMessages/loadChatInfo 解析不到 peer（空页面）。
+     * 群聊 peerUid 缺失时用群号字符串兜底，保证 Contact 能构造。
+     */
+    private fun registerGroupAssistantChatMeta(
+        chatId: String,
+        chatType: Int,
+        peerUid: String,
+        peerUin: Long,
+        name: String,
+    ) {
+        val effectiveUid = peerUid.ifBlank {
+            if ((chatType == 2 || chatType == 7) && peerUin != 0L) peerUin.toString() else ""
+        }
+        val isGroup = chatType == 2
+        val meta = ChatMeta(
+            chatType = chatType,
+            peerUid = effectiveUid,
+            peerUin = peerUin,
+            name = name.ifBlank { if (isGroup) "群聊($peerUin)" else "群助手" },
+            isGroup = isGroup,
+        )
+        cacheContact(chatId, meta)
+        Log.i(
+            TAG,
+            "groupAssistant: chatMeta registered chatId=$chatId type=$chatType " +
+                "peerUid=${effectiveUid.take(20)} peerUin=$peerUin name=${meta.name.take(30)}",
+        )
+    }
+
+    /**
+     * 群助手二级页数据（阻塞，IO 线程调用）：
+     * 1) 内核群助手专用列表 listType=2（`fetchAndSubscribeABatchOfRecentContact`），逐条 mapRecentContact；
+     * 2) 空时兜底：主最近会话中 mask=ASSISTANT 的群（batchQueryCachedGroupDetailInfo cmdUinMsgMask）。
+     * isRecentEntry：主最近会话存在 chatType=7/uin=9994 伪会话，或存在群助手群。
+     * 失败返回 null。
+     */
+    fun loadGroupAssistant(): GroupAssistantData? {
+        if (!isHost) return null
+        if (!ensureServices()) return null
+        val started = perfUptime()
+        return try {
+            var source = "kernelListType2"
+            var groups: List<ChatItem> = emptyList()
+            val raw = recentContactsByListType(2, count = 200, timeoutMs = 3_000L)
+            if (raw.isNotEmpty()) {
+                val codes = raw.mapNotNull { info ->
+                    val type = (invokeGetter(info, "getChatType") as? Number)?.toInt() ?: 0
+                    val uin = (invokeGetter(info, "getPeerUin") as? Number)?.toLong() ?: 0L
+                    if (type == 2 && uin > 0L) uin else null
+                }
+                val masks = runCatching { groupMuteMasksFor(codes) }.getOrDefault(emptyMap())
+                val tagSources = recentContactSnapshotFullMap()
+                val mapped = ArrayList<ChatItem>(raw.size)
+                for (info in raw) {
+                    val chatType = (invokeGetter(info, "getChatType") as? Number)?.toInt() ?: 0
+                    val peerUin = (invokeGetter(info, "getPeerUin") as? Number)?.toLong() ?: 0L
+                    val peerUid = invokeGetter(info, "getPeerUid") as? String ?: ""
+                    val name = listOf(
+                        invokeGetter(info, "getPeerName") as? String,
+                        invokeGetter(info, "getMemberName") as? String,
+                        invokeGetter(info, "getRemark") as? String,
+                    ).firstOrNull { !it.isNullOrBlank() }.orEmpty()
+                    // 先用原始字段兜底登记（mapRecentContact 内部也会 cacheContact）
+                    val expectedId = "tim_${chatType}_${peerUid.ifBlank { peerUin.toString() }}"
+                    runCatching {
+                        registerGroupAssistantChatMeta(expectedId, chatType, peerUid, peerUin, name)
+                    }
+                    val item = runCatching { mapRecentContact(info, masks, tagSources) }.getOrNull()
+                        ?: continue
+                    // 以最终 ChatItem.id 再登记一次（字段与 mapRecentContact 完全一致）
+                    val meta = chatMeta[item.id]
+                    registerGroupAssistantChatMeta(
+                        chatId = item.id,
+                        chatType = meta?.chatType ?: chatType,
+                        peerUid = meta?.peerUid ?: peerUid,
+                        peerUin = meta?.peerUin ?: peerUin,
+                        name = meta?.name ?: item.name,
+                    )
+                    mapped.add(item)
+                }
+                groups = mapped.filter { it.isGroup }
+            }
+            if (groups.isEmpty()) {
+                source = "recent+mask"
+                val all = runCatching { loadRecentChats() }.getOrNull().orEmpty()
+                val candidates = all.filter { it.isGroup }
+                val codes = candidates.mapNotNull { item ->
+                    chatMeta[item.id]?.groupCode
+                        ?: item.id.split('_').getOrNull(2)?.toLongOrNull()
+                }.filter { it != 0L }
+                runCatching { groupMuteMasksFor(codes) }
+                groups = candidates.filter { item ->
+                    val code = chatMeta[item.id]?.groupCode
+                        ?: item.id.split('_').getOrNull(2)?.toLongOrNull()
+                        ?: 0L
+                    code != 0L && cachedGroupMaskName(code) == "ASSISTANT"
+                }.onEach { item ->
+                    // 兜底列表来自 loadRecentChats（chatMeta 已登记），这里再确认一次，防缓存被清。
+                    val meta = chatMeta[item.id]
+                    if (meta != null) {
+                        registerGroupAssistantChatMeta(
+                            chatId = item.id,
+                            chatType = meta.chatType,
+                            peerUid = meta.peerUid,
+                            peerUin = meta.peerUin,
+                            name = meta.name.ifBlank { item.name },
+                        )
+                    } else {
+                        val code = item.id.split('_').getOrNull(2)?.toLongOrNull() ?: 0L
+                        registerGroupAssistantChatMeta(item.id, 2, code.toString(), code, item.name)
+                    }
+                }
+            }
+            // 群助手页里的群始终按免打扰展示（mask=ASSISTANT 本身 muted，这里兜底强制，防缓存缺失）。
+            groups = groups.map { if (it.isMuted) it else it.copy(isMuted = true) }
+            Log.i(TAG, "assistant: force muted groups=${groups.size} source=$source")
+            val unread = groups.sumOf { it.unreadCount }
+            val recentEntry = isTroopAssistantRecentEntry() || groups.isNotEmpty()
+            Log.i(
+                TAG,
+                "groupAssistant: groups=${groups.size} unread=$unread source=$source " +
+                    "recentEntry=$recentEntry ms=${perfUptime() - started}",
+            )
+            GroupAssistantData(
+                isRecentEntry = recentEntry,
+                unreadCount = unread,
+                groups = groups,
+            )
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "groupAssistant: failed ${t.javaClass.simpleName} ${t.message}",
+            )
+            null
+        }
+    }
+
+    /**
+     * 聊天卡片提醒标签（只在 unread>0 时显示），优先级：
+     * 1) 群聊 @ 位掩码 atType（TIM NTTroopNotificationProcessor：`atType & 4` = [有人@我]，
+     *    `atType & 1` = [@全体成员]，两者同时出现时 @我 优先）；
+     * 2) `listOfSpecificEventTypeInfosInMsgBox` 取最新 msgSeq 的事件类型：
+     *    1002 ReplyMe / 1004 MyRedPacket / 1005 MyGift / 1007 QQRedPacket /
+     *    2001 NewFile / 2003 NewHomework / 2004,2005 GroupNotice；
+     * 3) `specialCareFlag != 0` -> SpecialCare；
+     * 4) 其它 null。反射失败一律 null，不崩。
+     */
+    private fun chatPreviewTag(
+        info: Any,
+        unread: Int,
+        isGroup: Boolean,
+        tagSource: Any?,
+        chatId: String,
+    ): ChatPreviewTag? {
+        if (unread <= 0) return null
+        return runCatching {
+            // wrapper a() 的精简 RecentContactInfo 里 atType/listOfSpecific/specialCareFlag 是空的，
+            // 优先用 recent 快照里的完整对象；快照字段缺失时再回退原对象。
+            val source = tagSource ?: info
+            val sourceLabel = if (tagSource != null) "snapshot" else "recent"
+            val atType = readTagInt(source, "getAtType")
+                .takeIf { it != 0 } ?: readTagInt(info, "getAtType")
+            val eventType = latestMsgBoxEventType(source)
+                .takeIf { it >= 0 } ?: latestMsgBoxEventType(info)
+            var tag: ChatPreviewTag? = null
+            if (isGroup) {
+                tag = when {
+                    atType and 4 != 0 -> ChatPreviewTag.AtMe
+                    atType and 1 != 0 -> ChatPreviewTag.AtAll
+                    else -> null
+                }
+            }
+            if (tag == null) {
+                tag = when (eventType) {
+                    1002 -> ChatPreviewTag.ReplyMe
+                    1004 -> ChatPreviewTag.MyRedPacket
+                    1005 -> ChatPreviewTag.MyGift
+                    1007 -> ChatPreviewTag.QQRedPacket
+                    2001 -> ChatPreviewTag.NewFile
+                    2003 -> ChatPreviewTag.NewHomework
+                    2004, 2005 -> ChatPreviewTag.GroupNotice
+                    else -> null
+                }
+            }
+            if (tag == null) {
+                val specialCare = readTagInt(source, "getSpecialCareFlag")
+                    .takeIf { it != 0 } ?: readTagInt(info, "getSpecialCareFlag")
+                if (specialCare != 0) tag = ChatPreviewTag.SpecialCare
+            }
+            if (tag != null && loggedChatTags.add("$chatId|$tag")) {
+                Log.i(
+                    TAG,
+                    "chatTag: chatId=$chatId atType=$atType event=$eventType " +
+                        "source=$sourceLabel -> $tag",
+                )
+            }
+            tag
+        }.getOrNull()
+    }
+
+    /** 读取标签相关 int 字段，失败返回 0（不抛异常）。 */
+    private fun readTagInt(target: Any, getter: String): Int =
+        runCatching { (invokeGetter(target, getter) as? Number)?.toInt() ?: 0 }.getOrDefault(0)
+
+    /**
+     * 内核 recent 快照（IKernelRecentContactService.getRecentContactListSnapShot(limit, cb)）：
+     * 返回完整版 RecentContactInfo（含 atType / specialCareFlag / listOfSpecificEventTypeInfosInMsgBox），
+     * 用于补全 wrapper a() 精简列表里丢失的提醒标签字段。
+     * 回调 onResult(int code, String msg, CompleteRecentContactInfo{changedList})；
+     * key = buildChatId(chatType, peerUid, peerUin)。失败/超时/空返回 emptyMap。
+     */
+    private fun recentContactSnapshotFullMap(): Map<String, Any> {
+        val now = android.os.SystemClock.uptimeMillis()
+        if (snapshotRetryAt != 0L && now < snapshotRetryAt) return emptyMap()
+        val cl = hostClassLoader() ?: return emptyMap()
+        val service = recentContactService ?: return emptyMap()
+        val target = resolveKernelMethod(service, "getRecentContactListSnapShot", 2)
+            ?: run {
+                if (!snapshotFailLogDone) {
+                    snapshotFailLogDone = true
+                    Log.w(TAG, "chatTag: snapshot method not found")
+                }
+                return emptyMap()
+            }
+        return runCatching {
+            val args = awaitCallback(
+                cl,
+                "com.tencent.qqnt.kernel.nativeinterface.IKernelRecentSnapShotCallback",
+                3_000L,
+            ) { proxy -> target.second.invoke(target.first, 200, proxy) }
+            if (args == null) {
+                snapshotRetryAt = android.os.SystemClock.uptimeMillis() + 60_000L
+                if (!snapshotFailLogDone) {
+                    snapshotFailLogDone = true
+                    Log.w(TAG, "chatTag: snapshot timeout, fallback to recent list")
+                }
+                return emptyMap()
+            }
+            val code = (args.getOrNull(0) as? Number)?.toInt() ?: -1
+            val complete = args.getOrNull(2)
+            @Suppress("UNCHECKED_CAST")
+            val changed = (complete?.let { invokeGetter(it, "getChangedList") } as? List<Any?>)
+                .orEmpty()
+            val map = LinkedHashMap<String, Any>(changed.size)
+            for (item in changed) {
+                item ?: continue
+                val chatType = (invokeGetter(item, "getChatType") as? Int) ?: 0
+                val peerUid = invokeGetter(item, "getPeerUid") as? String ?: ""
+                val peerUin = (invokeGetter(item, "getPeerUin") as? Number)?.toLong() ?: 0L
+                val chatId = buildChatId(chatType, peerUid, peerUin) ?: continue
+                map[chatId] = item
+            }
+            snapshotRetryAt = 0L
+            if (!snapshotLogDone) {
+                snapshotLogDone = true
+                Log.i(TAG, "chatTag: snapshot code=$code size=${map.size}")
+            }
+            map
+        }.getOrElse { t ->
+            snapshotRetryAt = android.os.SystemClock.uptimeMillis() + 60_000L
+            if (!snapshotFailLogDone) {
+                snapshotFailLogDone = true
+                Log.w(
+                    TAG,
+                    "chatTag: snapshot failed: ${t.javaClass.simpleName} ${t.message}, " +
+                        "fallback to recent list",
+                )
+            }
+            emptyMap()
+        }
+    }
+
+    /**
+     * 取 listOfSpecificEventTypeInfosInMsgBox 里最新的事件类型 eventTypeInMsgBox（无事件返回 -1）。
+     * 每项取 msgInfos.last() 的 msgSeq 比较；seq 相同按 TIM prefixMatcherList 的事件顺序 tie-break。
+     */
+    private fun latestMsgBoxEventType(info: Any): Int {
+        @Suppress("UNCHECKED_CAST")
+        val events = (invokeGetter(info, "getListOfSpecificEventTypeInfosInMsgBox") as? List<Any?>)
+            .orEmpty()
+        if (events.isEmpty()) return -1
+        // TIM NTTroopNotificationProcessor.prefixMatcherList 的事件顺序（seq 相同时优先级更高者在前）。
+        val typePriority = mapOf(
+            1004 to 0, 1007 to 1, 1002 to 2, 1005 to 3,
+            2004 to 4, 2005 to 5, 2003 to 6, 2001 to 7,
+        )
+        var bestSeq = -1L
+        var bestType = -1
+        var bestPriority = Int.MAX_VALUE
+        for (event in events) {
+            event ?: continue
+            val eventType = (invokeGetter(event, "getEventTypeInMsgBox") as? Number)?.toInt() ?: continue
+            @Suppress("UNCHECKED_CAST")
+            val msgInfos = (invokeGetter(event, "getMsgInfos") as? List<Any?>).orEmpty()
+            val lastSeq = (msgInfos.lastOrNull()?.let { invokeGetter(it, "getMsgSeq") } as? Number)
+                ?.toLong() ?: continue
+            val priority = typePriority[eventType] ?: Int.MAX_VALUE
+            if (lastSeq > bestSeq || (lastSeq == bestSeq && priority < bestPriority)) {
+                bestSeq = lastSeq
+                bestType = eventType
+                bestPriority = priority
+            }
+        }
+        return bestType
+    }
+
+    private fun mapRecentContact(
+        info: Any,
+        groupMuteMasks: Map<Long, Boolean> = emptyMap(),
+        tagSources: Map<String, Any> = emptyMap(),
+    ): ChatItem? = try {
+        val chatType = invokeGetter(info, "getChatType") as? Int ?: 0
+        val isGroup = chatType == 2
+        val peerUin = (invokeGetter(info, "getPeerUin") as? Number)?.toLong() ?: 0L
+        val peerUid = invokeGetter(info, "getPeerUid") as? String ?: ""
+        // TIM 群助手是主列表里的伪会话：chatType=7（RecentContactChatItem type 7）/ peerUin=9994。
+        val isTroopAssistant = chatType == 7 || peerUin == troopAssistantUin ||
+            peerUid == troopAssistantUin.toString()
+        val remark = invokeGetter(info, "getRemark") as? String
+        val peerName = invokeGetter(info, "getPeerName") as? String
+        val memberName = invokeGetter(info, "getMemberName") as? String
+        val sendMemberName = invokeGetter(info, "getSendMemberName") as? String
+        val sendNickName = invokeGetter(info, "getSendNickName") as? String
+
+        val title = when {
+            isTroopAssistant -> "群助手"
+            isGroup -> peerName?.takeIf { it.isNotBlank() }
+                ?: memberName?.takeIf { it.isNotBlank() }
+                ?: "群聊($peerUin)"
+            else -> remark?.takeIf { it.isNotBlank() }
+                ?: peerName?.takeIf { it.isNotBlank() }
+                ?: memberName?.takeIf { it.isNotBlank() }
+                ?: "QQ用户($peerUin)"
+        }
+
+        val abstract = invokeGetter(info, "getAbstractContent") as? List<*>
+        val lastContent = abstract.orEmpty().lastOrNull()?.let { element ->
+            (invokeGetter(element, "getContent") as? String)?.takeIf { it.isNotBlank() }
+        }
+        val senderName = sendRemarkSafe(info, sendMemberName, sendNickName)
+        val summaryPrefix = if (isGroup && !senderName.isNullOrBlank()) "$senderName: " else ""
+        val lastMessage = buildString {
+            append(summaryPrefix)
+            append(lastContent ?: "")
+        }.ifBlank { if (isTroopAssistant) "点击查看收进群助手的群消息" else "[无消息]" }
+
+        val draftFlag = (invokeGetter(info, "getDraftFlag") as? Number)?.toInt() ?: 0
+        val draftList = invokeGetter(info, "getDraft") as? List<*>
+        val draft = if (draftFlag != 0) {
+            draftList.orEmpty().lastOrNull()?.let { element ->
+                (invokeGetter(element, "getContent") as? String)?.takeIf { it.isNotBlank() }
+            }
+        } else {
+            null
+        }
+
+        val msgTime = (invokeGetter(info, "getMsgTime") as? Number)?.toLong() ?: 0L
+        val unreadRaw = (invokeGetter(info, "getUnreadCnt") as? Number)?.toLong() ?: 0L
+        val unreadChatRaw = (invokeGetter(info, "getUnreadChatCnt") as? Number)?.toLong() ?: 0L
+        val unread = (if (unreadChatRaw > 0) unreadChatRaw else unreadRaw).coerceIn(0L, 999L).toInt()
+        val topFlag = (invokeGetter(info, "getTopFlag") as? Number)?.toInt() ?: 0
+        val topTime = (invokeGetter(info, "getTopFlagTime") as? Number)?.toLong() ?: 0L
+        // 群聊用群资料 cmdUinMsgMask 判断（isMsgDisturb 对群恒为 false）；单聊用 isMsgDisturb。
+        // 群助手伪会话（chatType=7/peerUin=9994）始终免打扰，不受 isMsgDisturb 影响。
+        val muted = if (isTroopAssistant) {
+            if (assistantMutedLogged.compareAndSet(false, true)) {
+                Log.i(TAG, "assistant: force muted chat=tim_troop_assistant (recent contact)")
+            }
+            true
+        } else if (isGroup) {
+            // 群聊免打扰权威来源：批量 mask → TIM 本地 TroopInfo.troopmask；都没有才保守 false
+            //（getIsMsgDisturb 对群恒 false，不能作为兜底依据）。
+            val fromMask = groupMuteMasks[peerUin]
+            if (fromMask != null) {
+                fromMask
+            } else {
+                val fromTroopInfo = troopInfoGroupMute(peerUin)
+                if (fromTroopInfo == null && recentGroupMuteWarnLogged.compareAndSet(false, true)) {
+                    Log.w(
+                        TAG,
+                        "recent: groupMuteMasks missing chatType=$chatType group=$peerUin " +
+                            "(batch masks empty/timeout? fallback troopInfo=null, default=false)",
+                    )
+                }
+                if (fromTroopInfo != null) {
+                    // 回填权威缓存，保证后续通知判定与列表图标一致。
+                    groupMuteCache[peerUin] = CachedGroupMute(
+                        fromTroopInfo,
+                        troopInfoGroupMaskName(peerUin).orEmpty(),
+                        perfUptime(),
+                    )
+                }
+                fromTroopInfo ?: false
+            }
+        } else {
+            invokeGetter(info, "getIsMsgDisturb") as? Boolean ?: false
+        }
+        val online = invokeGetter(info, "getIsOnlineMsg") as? Boolean ?: false
+
+        val chatId = when {
+            isTroopAssistant -> "tim_troop_assistant"
+            else -> "tim_${chatType}_${if (peerUid.isNotBlank()) peerUid else peerUin.toString()}"
+        }
+        val previewTag = if (isTroopAssistant) {
+            null
+        } else {
+            chatPreviewTag(info, unread, isGroup, tagSources[chatId], chatId)
+        }
+        val meta = if (isTroopAssistant) {
+            ChatMeta(7, troopAssistantUin.toString(), troopAssistantUin, "群助手", false)
+        } else {
+            ChatMeta(chatType, peerUid, peerUin, title, isGroup)
+        }
+        cacheContact(chatId, meta)
+        // 群头像：缓存命中直接填；未命中则后台下载（loadRecentChats 不阻塞），完成后 refreshChatsSoon 回填。
+        val avatarPath = if (isTroopAssistant) {
+            null // 群助手用固定图标（UI 渲染）
+        } else if (isGroup) {
+            scheduleGroupAvatarDownload(meta, meta.groupCode)
+        } else {
+            chatAvatarPath(meta)
+        }
+        val seed = ((peerUin xor (peerUin ushr 32)).toInt() and 0x7fffffff)
+        ChatItem(
+            id = chatId,
+            name = title,
+            lastMessage = lastMessage,
+            timeLabel = formatChatTimeLabel(msgTime),
+            unreadCount = unread,
+            isPinned = topFlag != 0 || topTime > 0L,
+            isMuted = muted,
+            isGroup = isGroup,
+            avatarSeed = seed,
+            memberCount = 0,
+            isOnline = online,
+            draft = draft,
+            avatarPath = avatarPath,
+            previewTag = previewTag,
+        )
+    } catch (t: Throwable) {
+        Log.w(TAG, "mapRecentContact failed: ${t.javaClass.simpleName} ${t.message}")
+        null
+    }
+
+    private fun sendRemarkSafe(info: Any, memberName: String?, nickName: String?): String? {
+        val remark = invokeGetter(info, "getSendRemarkName") as? String
+        return remark?.takeIf { it.isNotBlank() }
+            ?: memberName?.takeIf { it.isNotBlank() }
+            ?: nickName?.takeIf { it.isNotBlank() }
+    }
+
+    // ---------------------------------------------------------------------
+    // 我的资料
+    // ---------------------------------------------------------------------
+
+    /** 读取当前登录账号资料（昵称 / QQ 号 / 头像）。阻塞，需在 IO 线程调用。 */
+    fun loadSelfProfile(): UserProfile? {
+        if (!isHost) return null
+        if (!ensureServices()) return null
+        if (avatarService == null || myUid == null) {
+            val deadline = android.os.SystemClock.uptimeMillis() + 1_200L
+            while (android.os.SystemClock.uptimeMillis() < deadline &&
+                (avatarService == null || myUid == null)
+            ) {
+                Thread.sleep(120L)
+                ensureServices()
+            }
+        }
+        return try {
+            val cl = hostClassLoader() ?: return null
+            val mobileQQClass = Class.forName("mqq.app.MobileQQ", false, cl)
+            val mobileQQ = mobileQQClass.getField("sMobileQQ").get(null) ?: return null
+            val runtime = mobileQQClass.getMethod("peekAppRuntime").invoke(mobileQQ) ?: return null
+            val nickname = runCatching {
+                runtime.javaClass.getMethod("getCurrentNickname").invoke(runtime) as? String
+            }.getOrNull()?.takeIf { it.isNotBlank() } ?: "TIM 用户"
+            val uin = myUin ?: ""
+            UserProfile(
+                name = nickname,
+                timId = uin,
+                signature = "这个人很懒，什么都没有留下",
+                avatarSeed = ((uin.toLongOrNull() ?: 0L).toInt() and 0x7fffffff),
+                avatarPath = selfAvatarPath(big = false),
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "loadSelfProfile failed: ${t.javaClass.simpleName} ${t.message}")
+            null
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 消息：拉取 / 发送
+    // ---------------------------------------------------------------------
+
+    private fun cacheContact(chatId: String, meta: ChatMeta) {
+        chatMeta[chatId] = meta
+        if (meta.peerUid.isBlank()) return
+        runCatching {
+            val cl = hostClassLoader() ?: return
+            val contactClass = Class.forName(
+                "com.tencent.qqnt.kernelpublic.nativeinterface.Contact",
+                false,
+                cl,
+            )
+            val contact = contactClass
+                .getConstructor(Int::class.javaPrimitiveType, String::class.java, String::class.java)
+                .newInstance(meta.chatType, meta.peerUid, "")
+            contacts[chatId] = contact
+        }
+    }
+
+    /** 读取某个会话最近 [count] 条消息；失败返回 null。阻塞，需在 IO 线程调用。 */
+    fun loadMessages(chatId: String, count: Int = 40): List<ChatMessage>? {
+        if (!isHost) return null
+        if (!ensureServices()) return null
+        val contact = contacts[chatId] ?: return null
+        val service = msgService ?: return null
+        val cl = hostClassLoader() ?: return null
+        return try {
+            val callbackClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.IGetAioFirstViewLatestMsgCallback",
+                false,
+                cl,
+            )
+            val latch = CountDownLatch(1)
+            var records: List<Any?> = emptyList()
+            var errCode = -1
+            val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, method, args ->
+                if (method.name == "onResult" && args != null && args.size >= 3) {
+                    errCode = (args[0] as? Number)?.toInt() ?: -1
+                    @Suppress("UNCHECKED_CAST")
+                    records = (args[2] as? List<Any?>) ?: emptyList()
+                    latch.countDown()
+                }
+                null
+            }
+            val method = service.javaClass.methods.firstOrNull {
+                it.name == "getAioFirstViewLatestMsgs" && it.parameterCount == 3
+            } ?: return null
+            method.invoke(service, contact, count, callback)
+            latch.await(2_500L, TimeUnit.MILLISECONDS)
+            if (errCode != 0) {
+                Log.w(TAG, "loadMessages($chatId) err=$errCode")
+                if (records.isEmpty()) return null
+            }
+            triggerMissingImageDownloads(chatId, records)
+            val mapped = records.mapNotNull { record -> mapMsgRecord(chatId, record) }
+                .sortedWith(compareBy({ it.sortTime }))
+            var previousTime = 0L
+            val messages = mapped.map { item ->
+                val timeMillis = item.timeMillis
+                val needSeparator = previousTime == 0L || timeMillis - previousTime >= 5 * 60 * 1000L
+                previousTime = timeMillis
+                if (needSeparator) {
+                    item.message.copy(timeSeparator = formatSeparator(timeMillis))
+                } else {
+                    item.message
+                }
+            }
+            // 初始化「加载更早消息」的游标：本页最早一条的 seq（已存在则不动，避免轮询把游标冲掉）。
+            if (olderStates[chatId] == null) {
+                val minSeq = mapped.mapNotNull { it.sortTime.takeIf { seq -> seq > 0L } }.minOrNull() ?: 0L
+                olderStates[chatId] = OlderState(nextSeq = minSeq)
+            }
+            Log.i(TAG, "loadMessages($chatId): ${messages.size} msgs")
+            resolveReplyPreviews(chatId, messages)
+        } catch (t: Throwable) {
+            Log.e(TAG, "loadMessages failed: ${t.javaClass.simpleName} ${t.message}", t)
+            null
+        }
+    }
+
+    /**
+     * 按 seq 直接取目标消息附近的一段历史（点击引用跳转到很早的消息时用，避免逐页翻）。
+     * 返回升序消息列表；同时把该段并入 olderStates 缓存，方便后续继续向上加载。
+     */
+    fun loadHistoryAround(chatId: String, seq: Long, count: Int = 60): List<ChatMessage>? {
+        if (!isHost || seq <= 0L) return null
+        if (!ensureServices()) return null
+        val contact = contacts[chatId] ?: return null
+        val service = msgService ?: return null
+        val cl = hostClassLoader() ?: return null
+        return try {
+            val callbackClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.IMsgOperateCallback", false, cl,
+            )
+            val latch = CountDownLatch(1)
+            var records: List<Any?> = emptyList()
+            var errCode = -1
+            val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, method, args ->
+                if (method.name == "onResult" && args != null && args.size >= 3) {
+                    errCode = (args[0] as? Number)?.toInt() ?: -1
+                    @Suppress("UNCHECKED_CAST")
+                    records = (args[2] as? List<Any?>) ?: emptyList()
+                    latch.countDown()
+                }
+                null
+            }
+            val method = service.javaClass.methods.firstOrNull {
+                it.name == "getMsgsBySeqAndCount" && it.parameterCount == 5
+            } ?: return null
+            method.invoke(service, contact, seq + 1, count, true, callback)
+            latch.await(2_500L, TimeUnit.MILLISECONDS)
+            if (records.isEmpty()) {
+                Log.i(TAG, "loadHistoryAround($chatId, $seq): err=$errCode count=0")
+                return null
+            }
+            // 2004000 之类的 err 在 TIM 上可能只是「没有更早/更晚的消息」，但 callback 仍带回了一批记录，
+            // 用于「查找聊天记录跳转」时不能直接当失败（否则定位不到目标消息）。
+            if (errCode != 0) {
+                Log.i(TAG, "loadHistoryAround($chatId, $seq): err=$errCode but got ${records.size} records")
+            }
+            val mapped = records.mapNotNull { record ->
+                record ?: return@mapNotNull null
+                val recordSeq = (invokeGetter(record, "getMsgSeq") as? Number)?.toLong() ?: 0L
+                if (recordSeq <= 0L || recordSeq > seq) null else mapMsgRecord(chatId, record)
+            }.sortedWith(compareBy { it.sortTime })
+            if (mapped.isEmpty()) return null
+            val existing = olderStates[chatId]
+            if (existing != null) {
+                val known = existing.cached.mapTo(HashSet()) { it.id }
+                val extra = mapped.map { it.message.copy(timeSeparator = null) }
+                    .filterNot { it.id in known }
+                existing.cached.addAll(0, extra)
+                val minSeq = mapped.minOf { it.sortTime }
+                if (existing.nextSeq <= 0L || existing.nextSeq > minSeq) {
+                    existing.nextSeq = minSeq
+                }
+            }
+            Log.i(TAG, "loadHistoryAround($chatId, $seq): ${mapped.size} msgs")
+            mapped.map { it.message.copy(timeSeparator = null) }
+        } catch (t: Throwable) {
+            Log.w(TAG, "loadHistoryAround failed: ${t.javaClass.simpleName} ${t.message}")
+            null
+        }
+    }
+
+    /**
+     * 加载更早一页消息（向上翻历史）。用 getMsgsBySeqAndCount 以本页最早消息的 seq 为游标，
+     * 返回「累计已加载的更早消息（升序）」；返回空列表表示没有更早的消息了。
+     * 阻塞，需在 IO 线程调用。
+     */
+    fun loadOlderMessages(chatId: String, count: Int = 40): List<ChatMessage>? {
+        if (!isHost) return null
+        if (!ensureServices()) return null
+        val contact = contacts[chatId] ?: return null
+        val service = msgService ?: return null
+        val cl = hostClassLoader() ?: return null
+        val state = olderStates[chatId] ?: return null
+        if (state.nextSeq <= 0L) return state.cached.toList()
+        return try {
+            val callbackClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.IMsgOperateCallback",
+                false,
+                cl,
+            )
+            val latch = CountDownLatch(1)
+            var records: List<Any?> = emptyList()
+            var errCode = -1
+            val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, method, args ->
+                if (method.name == "onResult" && args != null && args.size >= 3) {
+                    errCode = (args[0] as? Number)?.toInt() ?: -1
+                    @Suppress("UNCHECKED_CAST")
+                    records = (args[2] as? List<Any?>) ?: emptyList()
+                    latch.countDown()
+                }
+                null
+            }
+            val method = service.javaClass.methods.firstOrNull {
+                it.name == "getMsgsBySeqAndCount" && it.parameterCount == 5
+            } ?: return null
+            method.invoke(service, contact, state.nextSeq, count, true, callback)
+            latch.await(2_500L, TimeUnit.MILLISECONDS)
+            if (errCode != 0) {
+                Log.w(TAG, "loadOlderMessages($chatId) err=$errCode")
+                if (records.isEmpty()) return state.cached.toList()
+            }
+            val cursor = state.nextSeq
+            val older = records
+                .mapNotNull { record ->
+                    record ?: return@mapNotNull null
+                    val seq = (invokeGetter(record, "getMsgSeq") as? Number)?.toLong() ?: 0L
+                    if (seq <= 0L || seq >= cursor) null else mapMsgRecord(chatId, record)
+                }
+                .sortedWith(compareBy { it.sortTime })
+            if (older.isEmpty()) {
+                state.nextSeq = 0L
+                Log.i(TAG, "loadOlderMessages($chatId): no more, total=${state.cached.size}")
+                return state.cached.toList()
+            }
+            triggerMissingImageDownloads(chatId, records)
+            val mappedMessages = older.map { it.message.copy(timeSeparator = null) }
+            state.cached.addAll(0, mappedMessages)
+            state.nextSeq = older.minOf { it.sortTime }
+            Log.i(
+                TAG,
+                "loadOlderMessages($chatId): +${mappedMessages.size}, total=${state.cached.size}, " +
+                    "nextSeq=${state.nextSeq}",
+            )
+            state.cached.toList()
+        } catch (t: Throwable) {
+            Log.e(TAG, "loadOlderMessages failed: ${t.javaClass.simpleName} ${t.message}", t)
+            null
+        }
+    }
+
+    /** 发送一组消息元素。阻塞，需在 IO 线程调用。 */
+    private fun sendElements(chatId: String, elements: ArrayList<Any>): Boolean {
+        if (!isHost) return false
+        if (!ensureServices()) return false
+        val contact = contacts[chatId] ?: return false
+        val service = msgService ?: return false
+        val cl = hostClassLoader() ?: return false
+        return try {
+            val callbackClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.IOperateCallback",
+                false,
+                cl,
+            )
+            val latch = CountDownLatch(1)
+            var resultCode = -1
+            var resultMessage = ""
+            val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, method, args ->
+                if (method.name == "onResult" && args != null && args.isNotEmpty()) {
+                    resultCode = (args[0] as? Number)?.toInt() ?: -1
+                    resultMessage = args.getOrNull(1) as? String ?: ""
+                    latch.countDown()
+                }
+                null
+            }
+            val method = service.javaClass.methods.firstOrNull {
+                it.name == "sendMsg" && it.parameterCount == 5
+            } ?: return false
+            method.invoke(service, 0L, contact, elements, HashMap<Int, Any>(), callback)
+            latch.await(10, TimeUnit.SECONDS)
+            Log.i(TAG, "sendElements($chatId) result=$resultCode msg=$resultMessage")
+            resultCode == 0
+        } catch (t: Throwable) {
+            Log.e(TAG, "sendElements failed: ${t.javaClass.simpleName} ${t.message}", t)
+            false
+        }
+    }
+
+    /** TIM 的 QRoute（IMsgUtilApi）：createPicElement/createFileElement 会做图片落盘、
+     *  压缩、缩略图等内部处理，直接 hand-build PicElement 内核会报 "UploadPic File Not Exit"。 */
+    private fun qrouteMsgUtilApi(): Pair<Any, Class<*>>? {
+        val cl = hostClassLoader() ?: return null
+        return runCatching {
+            val apiClass = Class.forName("com.tencent.qqnt.msg.api.IMsgUtilApi", false, cl)
+            val qroute = Class.forName("com.tencent.mobileqq.qroute.QRoute", false, cl)
+            val api = qroute.getMethod("api", Class::class.java).invoke(null, apiClass)
+            if (api == null) null else api to apiClass
+        }.getOrNull()
+    }
+
+    /** 通用 QRoute.api(interfaceClass)；接口不可用时返回 null。 */
+    private fun qrouteApiClass(interfaceName: String): Pair<Any, Class<*>>? {
+        val cl = hostClassLoader() ?: return null
+        return runCatching {
+            val apiClass = Class.forName(interfaceName, false, cl)
+            val qroute = Class.forName("com.tencent.mobileqq.qroute.QRoute", false, cl)
+            val api = qroute.getMethod("api", Class::class.java).invoke(null, apiClass)
+            if (api == null) null else api to apiClass
+        }.getOrNull()
+    }
+
+    private fun newMsgElement(cl: ClassLoader, elementType: Int): Pair<Any, Class<*>> {
+        val clazz = Class.forName("com.tencent.qqnt.kernel.nativeinterface.MsgElement", false, cl)
+        val element = clazz.getConstructor().newInstance()
+        clazz.getMethod("setElementType", Int::class.javaPrimitiveType).invoke(element, elementType)
+        return element to clazz
+    }
+
+    /** 发送文本消息。阻塞，需在 IO 线程调用。 */
+    fun sendTextMessage(chatId: String, text: String): Boolean {
+        if (!isHost) return false
+        val cl = hostClassLoader() ?: return false
+        return try {
+            val textElementClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.TextElement", false, cl,
+            )
+            val textElement = textElementClass.getConstructor().newInstance()
+            textElementClass.getMethod("setContent", String::class.java).invoke(textElement, text)
+            val (element, msgElementClass) = newMsgElement(cl, ELEMENT_TYPE_TEXT)
+            msgElementClass.getMethod("setTextElement", textElementClass)
+                .invoke(element, textElement)
+            sendElements(chatId, ArrayList<Any>().apply { add(element) })
+        } catch (t: Throwable) {
+            Log.e(TAG, "sendTextMessage failed: ${t.javaClass.simpleName} ${t.message}", t)
+            false
+        }
+    }
+
+    /** 转发消息到若干会话（内核 forwardMsg）。阻塞，需在 IO 线程调用。 */
+    fun forwardMessages(srcChatId: String, msgIds: List<Long>, dstChatIds: List<String>): Boolean {
+        if (!isHost || msgIds.isEmpty() || dstChatIds.isEmpty()) return false
+        if (!ensureServices()) return false
+        val srcContact = contacts[srcChatId] ?: return false
+        val dstContacts = dstChatIds.mapNotNull { contacts[it] }
+        if (dstContacts.isEmpty()) return false
+        val service = msgService ?: return false
+        val cl = hostClassLoader() ?: return false
+        return try {
+            val callbackClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.IForwardOperateCallback", false, cl,
+            )
+            val latch = CountDownLatch(1)
+            var code = -1
+            var message = ""
+            val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, method, args ->
+                if (method.name == "onResult" && args != null) {
+                    code = (args.getOrNull(0) as? Number)?.toInt() ?: -1
+                    message = args.getOrNull(1) as? String ?: ""
+                    latch.countDown()
+                }
+                defaultValueFor(method.returnType)
+            }
+            // TIM 4.1.0 的 forwardMsg 第 4 参是「MsgAttributeInfo 列表」而不是旧版的 HashMap：
+            //   forwardMsg(ArrayList<Long> msgIds, Contact from, ArrayList<Contact> to,
+            //              ArrayList<MsgAttributeInfo> attrs, IForwardOperateCallback cb)
+            // 普通转发不携带额外属性，传空列表即可（群荣誉/机器人等属性场景目前用不到）。
+            val attrs = ArrayList<Any>()
+            val method = service.javaClass.methods.firstOrNull {
+                it.name == "forwardMsg" && it.parameterCount == 5
+            } ?: return false
+            method.invoke(
+                service,
+                ArrayList(msgIds),
+                srcContact,
+                ArrayList(dstContacts),
+                attrs,
+                callback,
+            )
+            latch.await(10, TimeUnit.SECONDS)
+            Log.i(TAG, "forwardMessages: msgs=${msgIds.size} dst=${dstChatIds.size} code=$code msg=$message")
+            code == 0
+        } catch (t: Throwable) {
+            Log.w(TAG, "forwardMessages failed: ${t.javaClass.simpleName} ${t.message}")
+            false
+        }
+    }
+
+    /** 删除一条消息（内核 deleteMsg）。阻塞，需在 IO 线程调用。 */
+    fun deleteMessage(chatId: String, msgId: Long): Boolean {
+        if (!isHost) return false
+        val contact = contacts[chatId] ?: return false
+        val service = msgService ?: return false
+        val cl = hostClassLoader() ?: return false
+        return try {
+            val callbackClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.IOperateCallback", false, cl,
+            )
+            val latch = CountDownLatch(1)
+            var code = -1
+            var message = ""
+            val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, method, args ->
+                if (method.name == "onResult" && args != null) {
+                    code = (args.getOrNull(0) as? Number)?.toInt() ?: -1
+                    message = args.getOrNull(1) as? String ?: ""
+                    latch.countDown()
+                }
+                defaultValueFor(method.returnType)
+            }
+            val method = service.javaClass.methods.firstOrNull {
+                it.name == "deleteMsg" && it.parameterCount == 3
+            } ?: return false
+            method.invoke(service, contact, arrayListOf(msgId), callback)
+            latch.await(6, TimeUnit.SECONDS)
+            Log.i(TAG, "deleteMessage($msgId): code=$code msg=$message")
+            code == 0
+        } catch (t: Throwable) {
+            Log.w(TAG, "deleteMessage failed: ${t.javaClass.simpleName} ${t.message}")
+            false
+        }
+    }
+
+    /**
+     * 撤回一条消息（仅自己的消息、时限内）：
+     * 1) wrapper `IKernelMsgService.recallMsg(Contact, long, IOperateCallback)`（TIM 4.1 wrapper 接口 u，
+     *    内部把 long 转 ArrayList<Long> 再调 native）；
+     * 2) wrapper 不可用/调用失败时退回 native `IKernelMsgService.recallMsg(Contact, ArrayList<Long>, cb)`，
+     *    参数要传 `arrayListOf(msgId)`。
+     * 阻塞，需在 IO 线程调用；code==0 成功，成功后 refreshChatsSoon()。
+     */
+    fun recallMessage(chatId: String, msgId: Long): Boolean {
+        if (!isHost) return false
+        if (!ensureServices()) return false
+        val contact = contacts[chatId] ?: run {
+            // 会话未 loadMessages 时 contacts 缓存可能缺失：用 chatMeta/ensureChatContext 兜底构造。
+            val meta = chatMeta[chatId] ?: ensureChatContext(chatId)
+            meta?.let { ensureKernelContact(chatId, it) }
+        } ?: run {
+            Log.w(TAG, "chatSetting: recallMessage($chatId, $msgId) contact unavailable")
+            return false
+        }
+        val service = waitForService(timeoutMs = 1_500L) { msgService } ?: run {
+            Log.w(TAG, "chatSetting: recallMessage($chatId, $msgId) msg service unavailable")
+            return false
+        }
+        val label = "recallMessage($chatId, $msgId)"
+        // 1) wrapper 版本：recallMsg(Contact, long, IOperateCallback)。
+        var code = invokeOperateApi(label, service, "recallMsg", listOf(contact, msgId))
+        var impl = "wrapper"
+        if (code == -1) {
+            // 2) 兜底 native 版本：recallMsg(Contact, ArrayList<Long>, IOperateCallback)。
+            val native = nativeServiceOf(service)
+            if (native != null) {
+                code = invokeOperateApi(
+                    label,
+                    native,
+                    "recallMsg",
+                    listOf(contact, arrayListOf(msgId)),
+                )
+                impl = "native"
+            }
+        }
+        val ok = code == 0
+        Log.i(TAG, "chatSetting: $label ok=$ok code=$code impl=$impl")
+        if (ok) refreshChatsSoon()
+        return ok
+    }
+
+    // ---------------------------------------------------------------------
+    // 语音播放（TIM CommonAudioPlayer：silk/amr 自动识别）
+    // ---------------------------------------------------------------------
+
+    /**
+     * 懒创建 TIM 语音播放器 `com.tencent.mobileqq.qqaudio.audioplayer.CommonAudioPlayer(Context,
+     * AudioPlayerBase$b)`：
+     * - Context 用 `mqq.app.MobileQQ.sMobileQQ`（宿主 Application），失败回退 AppEnvironment.context；
+     * - listener = Proxy(AudioPlayerBase$b)：回调方法全返回 defaultValueFor，c3(播放完成)/j3(错误) 清状态；
+     * - 创建后调 `L()` 初始化音频设备服务（TIM 原生播放器初始化路径）；R(CommonAudioPlayer$a) 为可选 UI
+     *   设备状态回调，这里不设置（不影响播放）；
+     * - 播放器基类 ctor 里有 `new Handler()`（无 Looper 参数），所以必须在主线程创建；从 IO 线程调用时
+     *   投递到 mainHandler 创建并最多等 3s。
+     */
+    private fun voicePlayer(): Any? {
+        voicePlayer?.let { return it }
+        synchronized(voicePlayerLock) {
+            voicePlayer?.let { return it }
+            val cl = hostClassLoader() ?: return null
+            val context: Context = (runCatching {
+                Class.forName("mqq.app.MobileQQ", false, cl)
+                    .getField("sMobileQQ").get(null)
+            }.getOrNull() as? Context)
+                ?: runCatching { AppEnvironment.context }.getOrNull()
+                ?: run {
+                    Log.w(TAG, "voicePlay: no host context")
+                    return null
+                }
+            fun create(): Any? = runCatching {
+                val listenerClass = Class.forName(
+                    "com.tencent.mobileqq.qqaudio.audioplayer.AudioPlayerBase\$b", false, cl,
+                )
+                val listener = Proxy.newProxyInstance(cl, arrayOf(listenerClass)) { _, method, _ ->
+                    when (method.name) {
+                        "c3" -> {
+                            voicePlayingFlag = false // 播放完成
+                            voicePausedFlag = false
+                            voicePausedPositionMs = 0
+                            voicePausedPath = null
+                        }
+                        "j3" -> {
+                            voicePlayingFlag = false // 播放错误
+                            voicePausedFlag = false
+                            voicePausedPositionMs = 0
+                            voicePausedPath = null
+                            Log.w(TAG, "voicePlay: player error callback")
+                        }
+                    }
+                    defaultValueFor(method.returnType)
+                }
+                val playerClass = Class.forName(
+                    "com.tencent.mobileqq.qqaudio.audioplayer.CommonAudioPlayer", false, cl,
+                )
+                val player = playerClass
+                    .getConstructor(Context::class.java, listenerClass)
+                    .newInstance(context, listener)
+                runCatching { playerClass.getMethod("L").invoke(player) }
+                    .onFailure {
+                        Log.w(
+                            TAG,
+                            "voicePlay: CommonAudioPlayer.L() failed: " +
+                                "${it.javaClass.simpleName} ${it.message}",
+                        )
+                    }
+                player
+            }.onFailure {
+                Log.w(
+                    TAG,
+                    "voicePlay: create CommonAudioPlayer failed: " +
+                        "${it.javaClass.simpleName} ${it.message}",
+                )
+            }.getOrNull()
+
+            val player: Any? = if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+                create()
+            } else {
+                var created: Any? = null
+                val latch = CountDownLatch(1)
+                mainHandler.post {
+                    created = create()
+                    latch.countDown()
+                }
+                latch.await(3, TimeUnit.SECONDS)
+                created
+            }
+            if (player != null) {
+                voicePlayer = player
+                Log.i(TAG, "voicePlay: CommonAudioPlayer ready (TIM)")
+            }
+            return player
+        }
+    }
+
+    private fun voiceAudioManager(): android.media.AudioManager? = runCatching {
+        val context = appContext() ?: hostContext() ?: return@runCatching null
+        context.getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+    }.getOrNull()
+
+    /** TIM 播放器内部设备 helper（CommonAudioPlayer.y，类型 qqaudio.audioplayer.e）。 */
+    private fun timVoiceDeviceHelper(player: Any?): Any? {
+        player ?: return null
+        var cls: Class<*>? = player.javaClass
+        while (cls != null) {
+            for (field in cls.declaredFields) {
+                if (field.type.name == "com.tencent.mobileqq.qqaudio.audioplayer.e") {
+                    field.isAccessible = true
+                    return runCatching { field.get(player) }.getOrNull()
+                }
+            }
+            cls = cls.superclass
+        }
+        return null
+    }
+
+    /**
+     * 用 TIM 播放器自带设备 helper 改路由（优先，播放开始时 AudioPlayerBase.f() 会读它）：
+     * `e.m(2,false)` 清 near-ear；`e.m(1, speaker)`：speaker=true → 默认路由 0（MODE_NORMAL+speakerphone），
+     * false → 路由 1（MODE_IN_COMMUNICATION+听筒）。
+     */
+    private fun setTimVoiceRoute(player: Any?, speaker: Boolean): Boolean {
+        val helper = timVoiceDeviceHelper(player) ?: return false
+        val method = helper.javaClass.methods.firstOrNull {
+            it.name == "m" && it.parameterCount == 2 &&
+                it.parameterTypes[0] == Int::class.javaPrimitiveType &&
+                it.parameterTypes[1] == Boolean::class.javaPrimitiveType
+        } ?: return false
+        return runCatching {
+            method.invoke(helper, 2, false)
+            method.invoke(helper, 1, speaker)
+            true
+        }.getOrDefault(false)
+    }
+
+    /** 直接设置 AudioManager 路由（兜底）：扬声器=MODE_NORMAL+speakerOn；听筒=MODE_IN_COMMUNICATION+speakerOff。 */
+    private fun applyVoiceAudioRoute(phase: String, timApplied: Boolean): Boolean {
+        val audioManager = voiceAudioManager() ?: run {
+            Log.w(TAG, "voiceRoute: phase=$phase speaker=$voiceSpeakerEnabled timHelper=$timApplied applied=false (no AudioManager)")
+            return false
+        }
+        return runCatching {
+            audioManager.mode = if (voiceSpeakerEnabled) {
+                android.media.AudioManager.MODE_NORMAL
+            } else {
+                android.media.AudioManager.MODE_IN_COMMUNICATION
+            }
+            audioManager.isSpeakerphoneOn = voiceSpeakerEnabled
+            Log.i(
+                TAG,
+                "voiceRoute: phase=$phase speaker=$voiceSpeakerEnabled timHelper=$timApplied " +
+                    "mode=${audioManager.mode} speakerphone=${audioManager.isSpeakerphoneOn} applied=true",
+            )
+            true
+        }.getOrElse { t ->
+            Log.w(
+                TAG,
+                "voiceRoute: phase=$phase speaker=$voiceSpeakerEnabled timHelper=$timApplied " +
+                    "applied=false err=${t.javaClass.simpleName} ${t.message}",
+            )
+            false
+        }
+    }
+
+    /** 应用当前语音路由（播放前/播放后再次确保/切换按钮）。 */
+    private fun applyVoiceRoute(phase: String): Boolean {
+        val timApplied = runCatching { setTimVoiceRoute(voicePlayer, voiceSpeakerEnabled) }
+            .getOrDefault(false)
+        return applyVoiceAudioRoute(phase, timApplied)
+    }
+
+    /** 停止播放后恢复系统音频状态，避免影响其它音频（MODE_NORMAL + speakerphone=false）。 */
+    private fun restoreVoiceAudioRoute() {
+        val audioManager = voiceAudioManager() ?: return
+        runCatching {
+            audioManager.mode = android.media.AudioManager.MODE_NORMAL
+            audioManager.isSpeakerphoneOn = false
+            Log.i(
+                TAG,
+                "voiceRoute: phase=restore speaker=$voiceSpeakerEnabled mode=${audioManager.mode} " +
+                    "speakerphone=${audioManager.isSpeakerphoneOn} applied=true",
+            )
+        }.onFailure {
+            Log.w(TAG, "voiceRoute: phase=restore applied=false err=${it.javaClass.simpleName} ${it.message}")
+        }
+    }
+
+    /** 当前语音是否走扬声器（默认 false=听筒）。 */
+    fun isSpeakerEnabled(): Boolean = voiceSpeakerEnabled
+
+    /** 切换语音扬声器/听筒：保存偏好；正在播放时立即切换。 */
+    fun setSpeakerEnabled(enabled: Boolean): Boolean {
+        val changed = voiceSpeakerEnabled != enabled
+        voiceSpeakerEnabled = enabled
+        Log.i(
+            TAG,
+            "voiceRoute: toggle enabled=$enabled changed=$changed playing=${isVoicePlaying()}",
+        )
+        if (!isHost) return false
+        return if (changed && isVoicePlaying()) {
+            applyVoiceRoute("toggle")
+        } else {
+            true
+        }
+    }
+
+    /**
+     * 用 TIM 原生播放器播放语音文件（silk/amr 由 QQAudioUtils.f 检测文件头自动选择 SilkPlayer/AmrPlayer）。
+     * 先停掉当前播放；[offsetMs] 为起点偏移；阻塞，需在 IO 线程调用。
+     * @return 是否成功开始播放（AudioPlayerBase.A(String,int) 返回 true）。
+     */
+    fun playVoice(path: String, offsetMs: Int = 0): Boolean {
+        if (!isHost) return false
+        val file = java.io.File(path)
+        if (!file.isFile || file.length() <= 0L) {
+            Log.w(TAG, "voicePlay: file missing/empty path=${path.take(120)}")
+            return false
+        }
+        val player = voicePlayer() ?: return false
+        stopVoice()
+        // 启动前应用路由（听筒/扬声器），并让 TIM 设备 helper 在其 f() 读取时已是目标值。
+        applyVoiceRoute("beforePlay")
+        return runCatching {
+            // 播放速度 1.0（AudioPlayerBase.F(float) = setPlaySpeed）。
+            player.javaClass.methods.firstOrNull {
+                it.name == "F" && it.parameterCount == 1 &&
+                    it.parameterTypes[0] == Float::class.javaPrimitiveType
+            }?.invoke(player, 1.0f)
+            val method = player.javaClass.methods.firstOrNull {
+                it.name == "A" && it.parameterCount == 2 &&
+                    it.parameterTypes[0] == String::class.java
+            } ?: run {
+                Log.w(TAG, "voicePlay: play method A(String,int) not found")
+                return false
+            }
+            val ok = method.invoke(player, path, offsetMs.coerceAtLeast(0)) as? Boolean ?: false
+            if (ok) {
+                voicePlayingFlag = true
+                lastVoicePath = path
+                // 新播放从 0/offset 开始：清暂停状态与缓存时长。
+                voicePausedFlag = false
+                voicePausedPositionMs = 0
+                voicePausedPath = null
+                lastVoiceDurationMs = 0
+            }
+            Log.i(TAG, "voicePlay: path=${path.take(120)} offsetMs=$offsetMs ok=$ok")
+            if (ok) {
+                // TIM 播放器启动时会自行 setMode/setSpeakerphoneOn，150ms 后再确保一次。
+                mainHandler.postDelayed({ applyVoiceRoute("afterStart") }, 150L)
+            }
+            ok
+        }.getOrElse { t ->
+            Log.w(TAG, "voicePlay failed: ${t.javaClass.simpleName} ${t.message}")
+            false
+        }
+    }
+
+    /** 停止语音播放（保留播放器实例以便下次复用；stop() 内部会释放当前解码器）。 */
+    fun stopVoice() {
+        val player = voicePlayer ?: run {
+            voicePlayingFlag = false
+            voicePausedFlag = false
+            voicePausedPositionMs = 0
+            voicePausedPath = null
+            return
+        }
+        runCatching {
+            player.javaClass.methods.firstOrNull { it.name == "stop" && it.parameterCount == 0 }
+                ?.invoke(player)
+        }.onFailure {
+            Log.w(TAG, "voicePlay: stop failed: ${it.javaClass.simpleName} ${it.message}")
+        }
+        voicePlayingFlag = false
+        voicePausedFlag = false
+        voicePausedPositionMs = 0
+        voicePausedPath = null
+        // 停止后恢复系统模式，避免影响其它音频（TIM AudioPlayerBase.run() 同款：MODE_NORMAL + 恢复 speaker）
+        restoreVoiceAudioRoute()
+    }
+
+    /** 是否正在播放语音（AudioPlayerBase.r()；不可用时用 listener 维护的兜底状态）。 */
+    fun isVoicePlaying(): Boolean {
+        // 暂停后必须返回 false（UI 用「是否播放中」切换播放/暂停图标）。
+        if (voicePausedFlag) return false
+        val player = voicePlayer ?: return false
+        return runCatching {
+            (player.javaClass.methods.firstOrNull { it.name == "r" && it.parameterCount == 0 }
+                ?.invoke(player) as? Boolean) ?: voicePlayingFlag
+        }.getOrDefault(voicePlayingFlag)
+    }
+
+    /** 语音播放器 int 返回值方法调用（AudioPlayerBase.m()/n() 等）；异常/无播放器返回 0。 */
+    private fun voicePlayerInt(methodName: String): Int {
+        val player = voicePlayer ?: return 0
+        return runCatching {
+            (player.javaClass.methods.firstOrNull {
+                it.name == methodName && it.parameterCount == 0
+            }?.invoke(player) as? Number)?.toInt() ?: 0
+        }.getOrDefault(0)
+    }
+
+    /**
+     * 当前语音播放位置（毫秒）：暂停时返回暂停位置；否则 AudioPlayerBase.m()（解码器 getCurrentPosition）；
+     * 未播放 0。
+     */
+    fun voicePlaybackPositionMs(): Int {
+        if (voicePausedFlag) return voicePausedPositionMs
+        return voicePlayerInt("m")
+    }
+
+    /**
+     * 当前语音总时长（毫秒，AudioPlayerBase.n() = 解码器 getDuration）；解码器被 stop 后返回最近缓存值，
+     * 未播放且无缓存 0。
+     */
+    fun voicePlaybackDurationMs(): Int {
+        val duration = voicePlayerInt("n")
+        if (duration > 0) {
+            lastVoiceDurationMs = duration
+            return duration
+        }
+        return lastVoiceDurationMs
+    }
+
+    /** 取 TIM 播放器的解码器（AudioPlayerBase.f118293g，类型接口 h）：播放中非空，支持 pause()/start()。 */
+    private fun voiceDecoder(): Any? {
+        val player = voicePlayer ?: return null
+        val cl = hostClassLoader() ?: return null
+        val decoderClass = runCatching {
+            Class.forName("com.tencent.mobileqq.qqaudio.audioplayer.h", false, cl)
+        }.getOrNull() ?: return null
+        return runCatching {
+            var cls: Class<*>? = player.javaClass
+            while (cls != null) {
+                for (field in cls.declaredFields) {
+                    if (field.type == decoderClass) {
+                        field.isAccessible = true
+                        return@runCatching field.get(player)
+                    }
+                }
+                cls = cls.superclass
+            }
+            null
+        }.getOrNull()
+    }
+
+    /** 调解码器接口 h 的无参方法（pause/start 等）；成功返回 true。 */
+    private fun voiceDecoderCall(decoder: Any?, methodName: String): Boolean {
+        if (decoder == null) return false
+        return runCatching {
+            val method = decoder.javaClass.methods.firstOrNull {
+                it.name == methodName && it.parameterCount == 0
+            } ?: return@runCatching false
+            method.invoke(decoder)
+            true
+        }.getOrDefault(false)
+    }
+
+    /**
+     * 暂停当前语音（保留位置）：解码器可用则调 h.pause()；没有解码器/pause 失败时调 stop() 兜底
+     * （位置已记录，resumeVoice 会用 A(path, position) 重播）。
+     * 暂停后 isVoicePlaying() 返回 false、voicePlaybackPositionMs() 返回暂停位置。
+     */
+    fun pauseVoice(): Boolean {
+        if (!isHost) return false
+        val player = voicePlayer ?: return false
+        if (!isVoicePlaying() && !voicePlayingFlag) {
+            Log.w(TAG, "voicePause: not playing")
+            return false
+        }
+        val path = lastVoicePath
+        val positionMs = voicePlayerInt("m").coerceAtLeast(0)
+        val decoder = voiceDecoder()
+        val pausedByDecoder = voiceDecoderCall(decoder, "pause")
+        if (!pausedByDecoder) {
+            // 兜底：没有解码器/pause 失败 → stop（位置已记录，resume 用 A(path,pos) 重播）。
+            runCatching {
+                player.javaClass.methods.firstOrNull { it.name == "stop" && it.parameterCount == 0 }
+                    ?.invoke(player)
+            }.onFailure {
+                Log.w(TAG, "voicePause: stop fallback failed: ${it.javaClass.simpleName} ${it.message}")
+            }
+        }
+        voicePausedFlag = true
+        voicePausedPositionMs = positionMs
+        voicePausedPath = path
+        voicePlayingFlag = false
+        Log.i(
+            TAG,
+            "voicePause: path=${path?.take(120)} positionMs=$positionMs " +
+                "decoder=$pausedByDecoder ok=true",
+        )
+        return true
+    }
+
+    /**
+     * 从暂停位置继续：解码器仍在则 h.start() 直接继续；否则 F(1.0f) + A(path, pausedPosition) 重播。
+     * 无暂停状态返回 false；resume 失败保持暂停状态（可重试）。
+     */
+    fun resumeVoice(): Boolean {
+        if (!isHost) return false
+        if (!voicePausedFlag) {
+            Log.w(TAG, "voiceResume: not paused")
+            return false
+        }
+        val player = voicePlayer ?: run {
+            Log.w(TAG, "voiceResume: no voice player")
+            return false
+        }
+        val path = voicePausedPath?.takeIf { it.isNotBlank() }
+            ?: lastVoicePath?.takeIf { it.isNotBlank() }
+        val positionMs = voicePausedPositionMs.coerceAtLeast(0)
+        var ok = false
+        // 1) 解码器还在：h.start() 从暂停位置继续。
+        if (voiceDecoderCall(voiceDecoder(), "start")) {
+            ok = true
+        } else if (path != null) {
+            // 2) 兜底：F(1.0f) + A(path, position) 重播。
+            ok = runCatching {
+                player.javaClass.methods.firstOrNull {
+                    it.name == "F" && it.parameterCount == 1 &&
+                        it.parameterTypes[0] == Float::class.javaPrimitiveType
+                }?.invoke(player, 1.0f)
+                val method = player.javaClass.methods.firstOrNull {
+                    it.name == "A" && it.parameterCount == 2 &&
+                        it.parameterTypes[0] == String::class.java
+                } ?: return@runCatching false
+                method.invoke(player, path, positionMs) as? Boolean ?: false
+            }.getOrElse { t ->
+                Log.w(TAG, "voiceResume A() failed: ${t.javaClass.simpleName} ${t.message}")
+                false
+            }
+        }
+        if (ok) {
+            voicePlayingFlag = true
+            voicePausedFlag = false
+            voicePausedPositionMs = 0
+            voicePausedPath = null
+            if (path != null) lastVoicePath = path
+        }
+        Log.i(
+            TAG,
+            "voiceResume: path=${path?.take(120)} positionMs=$positionMs ok=$ok",
+        )
+        return ok
+    }
+
+    /**
+     * 从指定毫秒位置重新播放当前语音（TIM AIOPttAudioPlayerManager.s 同款：F(speed) + A(path, offset)）：
+     * A(path, offset) 会重建解码器并 seek 到 offset，m()/n() 仍可继续用。
+     * 未在播放/无播放器/无当前路径/异常返回 false。
+     */
+    fun seekVoice(positionMs: Int): Boolean {
+        if (!isHost) return false
+        val player = voicePlayer ?: return false
+        if (!isVoicePlaying() && !voicePlayingFlag) {
+            Log.w(TAG, "voiceSeek: not playing")
+            return false
+        }
+        val path = lastVoicePath?.takeIf { it.isNotBlank() } ?: run {
+            Log.w(TAG, "voiceSeek: no current voice path")
+            return false
+        }
+        val offset = positionMs.coerceAtLeast(0)
+        return runCatching {
+            player.javaClass.methods.firstOrNull {
+                it.name == "F" && it.parameterCount == 1 &&
+                    it.parameterTypes[0] == Float::class.javaPrimitiveType
+            }?.invoke(player, 1.0f)
+            val method = player.javaClass.methods.firstOrNull {
+                it.name == "A" && it.parameterCount == 2 &&
+                    it.parameterTypes[0] == String::class.java
+            } ?: run {
+                Log.w(TAG, "voiceSeek: play method A(String,int) not found")
+                return false
+            }
+            val ok = method.invoke(player, path, offset) as? Boolean ?: false
+            if (ok) {
+                voicePlayingFlag = true
+                voicePausedFlag = false
+                voicePausedPositionMs = 0
+                voicePausedPath = null
+            }
+            Log.i(TAG, "voiceSeek: path=${path.take(120)} positionMs=$offset ok=$ok")
+            ok
+        }.getOrElse { t ->
+            Log.w(TAG, "voiceSeek failed: ${t.javaClass.simpleName} ${t.message}")
+            false
+        }
+    }
+
+    /**
+     * 用系统应用打开本地文件（TIM 的 content:// FileProvider）：
+     * TIM manifest 里 `androidx.core.content.FileProvider` 的 authorities 为
+     * `com.tencent.tim.fileprovider;com.tencent.tim.external.fileprovider`，其 paths 资源（@xml/t）
+     * 含 files-path/cache-path/root-path(".")，所以任意应用私有目录文件都能转成 content URI。
+     * 反射 `androidx.core.content.FileProvider.getUriForFile(Context, String, File)`，先试第一个 authority，
+     * 失败再试第二个；然后 ACTION_VIEW + setDataAndType(mime) + FLAG_GRANT_READ_URI_PERMISSION
+     * + FLAG_ACTIVITY_NEW_TASK，交给系统播放器/文档查看器。异常返回 false。
+     */
+    fun openLocalFile(path: String): Boolean {
+        if (!isHost) return false
+        val file = java.io.File(path)
+        if (!file.isFile || file.length() <= 0L) {
+            Log.w(TAG, "fileOpen: local file missing/empty path=${path.take(120)}")
+            return false
+        }
+        val cl = hostClassLoader() ?: return false
+        val context: Context = (runCatching {
+            Class.forName("mqq.app.MobileQQ", false, cl)
+                .getField("sMobileQQ").get(null)
+        }.getOrNull() as? Context)
+            ?: runCatching { AppEnvironment.context }.getOrNull()
+            ?: run {
+                Log.w(TAG, "fileOpen: no host context")
+                return false
+            }
+        val extension = file.extension.lowercase(Locale.ROOT)
+        val mime = android.webkit.MimeTypeMap.getSingleton()
+            .getMimeTypeFromExtension(extension) ?: "*/*"
+        return runCatching {
+            var uri: android.net.Uri? = null
+            var usedAuthority = ""
+            // 优先用 TIM 自己的 FileProvider7Helper（内部用 TIM 的 FileProvider 类与
+            // authority = packageName + ".fileprovider"，避免直接反射 androidx 类时
+            // 命中模块自带/被 R8 重命名的类导致 ClassNotFoundException）。
+            runCatching {
+                val helperClass = Class.forName(
+                    "com.tencent.mobileqq.utils.kapalaiadapter.FileProvider7Helper",
+                    false, cl,
+                )
+                val method = helperClass.methods.firstOrNull {
+                    it.name == "getUriForFile" && it.parameterCount == 2 &&
+                        it.parameterTypes[0] == Context::class.java &&
+                        it.parameterTypes[1] == java.io.File::class.java
+                } ?: return@runCatching
+                val candidate = method.invoke(null, context, file) as? android.net.Uri
+                if (candidate != null) {
+                    uri = candidate
+                    usedAuthority = "FileProvider7Helper"
+                }
+            }
+            if (uri == null) {
+                val fileProviderClass = Class.forName("androidx.core.content.FileProvider", false, cl)
+                val getUriForFile = fileProviderClass.getMethod(
+                    "getUriForFile",
+                    Context::class.java,
+                    String::class.java,
+                    java.io.File::class.java,
+                )
+                for (authority in listOf(
+                    "com.tencent.tim.fileprovider",
+                    "com.tencent.tim.external.fileprovider",
+                )) {
+                    val candidate = runCatching {
+                        getUriForFile.invoke(null, context, authority, file) as? android.net.Uri
+                    }.getOrNull()
+                    if (candidate != null) {
+                        uri = candidate
+                        usedAuthority = authority
+                        break
+                    }
+                }
+            }
+            if (uri == null) {
+                Log.w(TAG, "fileOpen: FileProvider.getUriForFile failed name=${file.name}")
+                return false
+            }
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, mime)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(intent)
+            Log.i(
+                TAG,
+                "fileOpen: ok name=${file.name} mime=$mime authority=$usedAuthority",
+            )
+            true
+        }.getOrElse { t ->
+            Log.w(TAG, "fileOpen: open failed name=${file.name}: ${t.javaClass.simpleName} ${t.message}")
+            false
+        }
+    }
+
+    /**
+     * 打开 ARK 卡片：优先 TIM 的 JumpActivity（scheme 分发/data 链接），
+     * 其次 QRoute IJumpApi/bp.b JumpAction，最后系统 ACTION_VIEW。主线程执行；返回是否已拉起。
+     * 阻塞部分很短（startActivity 调用），UI 可直接在主线程调；非主线程会 post 到主线程。
+     */
+    fun openArkUrl(url: String): Boolean {
+        if (!isHost) return false
+        if (url.isBlank()) {
+            Log.w(TAG, "openArkUrl: empty url")
+            return false
+        }
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            return openArkUrlOnMain(url)
+        }
+        mainHandler.post {
+            runCatching { openArkUrlOnMain(url) }
+                .onFailure { Log.w(TAG, "openArkUrl failed: ${it.javaClass.simpleName} ${it.message}") }
+        }
+        return true
+    }
+
+    private fun openArkUrlOnMain(url: String): Boolean {
+        val cl = hostClassLoader() ?: run {
+            Log.w(TAG, "openArkUrl: no host classloader")
+            return false
+        }
+        val activity = hostActivity()
+        val context: Context = activity ?: appContext() ?: hostContext() ?: run {
+            Log.w(TAG, "openArkUrl: no context")
+            return false
+        }
+        val uri = runCatching { android.net.Uri.parse(url) }.getOrNull() ?: return false
+        // 1) TIM JumpActivity（内部按 scheme/宿主分发：小程序/链接/加群/资料卡等）
+        val jumpClass = runCatching {
+            Class.forName("com.tencent.mobileqq.activity.JumpActivity", false, cl)
+        }.getOrNull()
+        if (jumpClass != null) {
+            val ok = runCatching {
+                val intent = Intent(context, jumpClass)
+                intent.data = uri
+                if (activity == null) intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                context.startActivity(intent)
+                true
+            }.getOrElse { t ->
+                Log.w(
+                    TAG,
+                    "openArkUrl: JumpActivity failed: ${t.javaClass.simpleName} ${t.message}",
+                )
+                false
+            }
+            if (ok) {
+                Log.i(TAG, "openArkUrl: JumpActivity url=${url.take(120)}")
+                return true
+            }
+        }
+        // 2) QRoute IJumpApi.doJumpAction / bp.b + bl.a()（TIM JumpAction 分发）
+        if (tryJumpAction(cl, activity, context, url)) {
+            Log.i(TAG, "openArkUrl: JumpAction url=${url.take(120)}")
+            return true
+        }
+        // 3) 系统 ACTION_VIEW（http/https 链接）
+        return runCatching {
+            val intent = Intent(Intent.ACTION_VIEW, uri)
+            if (activity == null) intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(intent)
+            Log.i(TAG, "openArkUrl: ACTION_VIEW url=${url.take(120)}")
+            true
+        }.getOrElse { t ->
+            Log.w(
+                TAG,
+                "openArkUrl: ACTION_VIEW failed: ${t.javaClass.simpleName} ${t.message} " +
+                    "url=${url.take(120)}",
+            )
+            false
+        }
+    }
+
+    /**
+     * 用 TIM 自己的 GrabHbViewModel 走原生红包领取（和 AIO 点击完全一致）：
+     * 内部会先取 pskey → 发 hb_pre_grap 预领取请求拿到 hb_pre_data → 再开 PayBridgeActivity。
+     * 直接用 MsgRecord 是为了让 TIM 自己序列化 protobuf/解密，避免手抄参数导致
+     * 「授权校验不通过」。
+     */
+    fun openRedPacketMsg(chatId: String, msgId: Long): Boolean {
+        if (!isHost) return false
+        if (msgId == 0L) {
+            Log.w(TAG, "openRedPacketMsg: msgId=0 chat=$chatId")
+            return false
+        }
+        return runCatching {
+            val hostCl = hostClassLoader() ?: return false
+            val context = hostActivity() ?: appContext() ?: hostContext() ?: run {
+                Log.w(TAG, "openRedPacketMsg: no context chat=$chatId")
+                return false
+            }
+            // 优先用 Activity 的 classLoader：TIM 的 QFix/热修 dex 可能挂在它下面，
+            // 直接用它才能解析 GrabHbViewModel 依赖的混淆类。
+            val cl = context.classLoader ?: hostCl
+            val record = fetchRawMsgRecord(chatId, msgId) ?: run {
+                Log.w(TAG, "openRedPacketMsg: no record chat=$chatId msg=$msgId")
+                return false
+            }
+            val vmClass = Class.forName(
+                "com.tencent.qqnt.qwallet.aio.hb.GrabHbViewModel", false, cl,
+            )
+            val i0Method = vmClass.methods.firstOrNull {
+                it.name == "i0" && it.parameterCount == 3
+            } ?: run {
+                Log.w(TAG, "openRedPacketMsg: GrabHbViewModel.i0 not found")
+                return false
+            }
+            // 直接从方法签名取 TIM 自己的 Function1 Class（避免按名字加载遇到 TIM 混淆解析问题），
+            // 并在同一个 ClassLoader 里生成 Proxy，invoke 时类型才匹配。
+            val function1Class = i0Method.parameterTypes[2]
+            val unitInstance = runCatching {
+                Class.forName("kotlin.Unit", false, function1Class.classLoader)
+                    .getField("INSTANCE").get(null)
+            }.getOrNull()
+            val callback = java.lang.reflect.Proxy.newProxyInstance(
+                function1Class.classLoader,
+                arrayOf(function1Class),
+            ) { _, method, args ->
+                if (method.name == "invoke") {
+                    val code = (args?.firstOrNull() as? Number)?.toInt() ?: -1
+                    Log.i(TAG, "openRedPacketMsg: grab callback code=$code chat=$chatId msg=$msgId")
+                }
+                unitInstance
+            }
+            mainHandler.post {
+                runCatching {
+                    val vm = vmClass.getDeclaredConstructor().apply { isAccessible = true }.newInstance()
+                    i0Method.invoke(vm, context, record, callback)
+                    Log.i(
+                        TAG,
+                        "openRedPacketMsg: GrabHbViewModel.i0 invoked chat=$chatId msg=$msgId",
+                    )
+                }.onFailure {
+                    Log.w(
+                        TAG,
+                        "openRedPacketMsg: native grab failed: ${it.javaClass.simpleName} ${it.message} " +
+                            "chat=$chatId msg=$msgId",
+                        it,
+                    )
+                }
+            }
+            true
+        }.getOrElse { t ->
+            Log.w(
+                TAG,
+                "openRedPacketMsg: failed: ${t.javaClass.simpleName} ${t.message} chat=$chatId msg=$msgId",
+            )
+            false
+        }
+    }
+
+    /**
+     * 打开 TIM 原生红包领取/详情页（PayBridgeActivity，graphb 视图）。
+     * 复刻 `GrabHbViewModel.j0` 的 Intent：
+     * - extra "json" = {userId, view_tag:"graphb", app_info, comeForm:2,
+     *   extra_data:<json1 字符串>, senderuin}；
+     * - json1 = {listid, senderuin, name, grouptype, groupid, channel, resource_type/skin_id/
+     *   outer_skin_id/skin_from/hb_from/fromHBList, groupuin, authkey, curFriendUin, pay_flag, hb_flag}；
+     * - 另加 "callbackSn"="0"、"pay_requestcode"=5。
+     * grouptype: chatType 1→0、2→1、4→11；groupid: 单聊用当前 uin，其它用 peerUin。
+     * 主线程 startActivity（无 Activity 时 +FLAG_ACTIVITY_NEW_TASK）。失败返回 false 并打日志。
+     */
+    fun openRedPacket(
+        chatId: String,
+        billNo: String,
+        authkey: String,
+        channel: Int,
+        senderUin: Long,
+        grabState: Int,
+    ): Boolean {
+        if (!isHost) return false
+        if (billNo.isBlank()) {
+            Log.w(TAG, "openRedPacket: empty billNo chat=$chatId")
+            return false
+        }
+        val meta = chatMeta[chatId] ?: ensureChatContext(chatId) ?: run {
+            Log.w(TAG, "openRedPacket: no chat meta chat=$chatId")
+            return false
+        }
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            return openRedPacketOnMain(chatId, meta, billNo, authkey, channel, senderUin, grabState)
+        }
+        mainHandler.post {
+            runCatching {
+                openRedPacketOnMain(chatId, meta, billNo, authkey, channel, senderUin, grabState)
+            }.onFailure {
+                Log.w(TAG, "openRedPacket failed: ${it.javaClass.simpleName} ${it.message}")
+            }
+        }
+        return true
+    }
+
+    private fun openRedPacketOnMain(
+        chatId: String,
+        meta: ChatMeta,
+        billNo: String,
+        authkey: String,
+        channel: Int,
+        senderUin: Long,
+        grabState: Int,
+    ): Boolean {
+        val cl = hostClassLoader() ?: run {
+            Log.w(TAG, "openRedPacket: no host classloader")
+            return false
+        }
+        val activity = hostActivity()
+        val context: Context = activity ?: appContext() ?: hostContext() ?: run {
+            Log.w(TAG, "openRedPacket: no context")
+            return false
+        }
+        val currentUin = currentWalletUin()
+        val currentNick = currentWalletNickName().ifBlank { currentUin }
+        val peerUinStr = when {
+            meta.peerUin != 0L -> meta.peerUin.toString()
+            meta.peerUid.isNotBlank() -> meta.peerUid
+            else -> ""
+        }
+        // com.tencent.qqnt.qwallet.a.a: a(chatType) 1→0/2→1/4→11；c(chatType,peerUin) 单聊→当前uid，其它→peerUin
+        val groupType = when (meta.chatType) {
+            1 -> 0
+            2 -> 1
+            4 -> 11
+            else -> 0
+        }
+        val groupId = if (meta.chatType == 1) currentUin else peerUinStr
+        if (currentUin.isBlank()) {
+            Log.w(TAG, "openRedPacket: current uin empty, json userId/groupid may be empty chat=$chatId")
+        }
+        return runCatching {
+            val json1 = org.json.JSONObject().apply {
+                put("listid", billNo)
+                put("senderuin", senderUin.toString())
+                put("name", currentNick)
+                put("grouptype", groupType.toString())
+                put("groupid", groupId)
+                put("channel", channel)
+                put("resource_type", 0)
+                put("skin_id", 0)
+                put("outer_skin_id", "")
+                put("skin_from", 0)
+                put("hb_from", 0)
+                put("fromHBList", 0)
+                put("groupuin", senderUin.toString())
+                put("authkey", authkey)
+                put("curFriendUin", peerUinStr)
+                put("pay_flag", 0)
+                put("hb_flag", 0)
+            }
+            // 走 TIM 的「红包详情」页（redgiftDetail，和灰度提示条点击同一条路径）：
+            // 详情页由 TIM 自己加载，领取按钮点击时由其内部走完整的预领取/授权流程，
+            // 比手工拼 graphb 参数可靠（graphb 缺 hb_pre_data 会报「授权校验不通过」）。
+            val detailData = org.json.JSONObject().apply {
+                put("listid", billNo)
+                put("name", currentNick)
+                put("grouptype", groupType.toString())
+                put("groupid", groupId)
+                put("authkey", authkey)
+            }
+            val json2 = org.json.JSONObject().apply {
+                put("userId", currentUin)
+                put("viewTag", "redgiftDetail")
+                put("appInfo", "appid#1344242394|bargainor_id#1000030201|channel#graytips")
+                put("app_info", "appid#1344242394|bargainor_id#1000030201|channel#graytips")
+                put("come_from", 2)
+                put("comeForm", 2)
+                put("extra_data", detailData.toString())
+                put("grouptype", groupType.toString())
+                put("groupid", groupId)
+            }
+            val intent = Intent()
+            intent.putExtra("json", json2.toString())
+            intent.putExtra("callbackSn", "0")
+            intent.putExtra("pay_requestcode", 5)
+            val payBridgeClass = runCatching {
+                Class.forName("com.tencent.mobileqq.activity.PayBridgeActivity", false, cl)
+            }.getOrNull()
+            if (payBridgeClass != null) {
+                intent.setClass(context, payBridgeClass)
+            } else {
+                // 兜底：按类名启动（PayBridgeActivity @RoutePage("/base/payBridge")）
+                intent.setClassName(context.packageName, "com.tencent.mobileqq.activity.PayBridgeActivity")
+            }
+            if (activity == null) intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            Log.i(
+                TAG,
+                "openRedPacket: chat=$chatId billNo=${billNo.take(48)} grouptype=$groupType " +
+                    "groupId=$groupId curFriendUin=$peerUinStr userId=$currentUin " +
+                    "nick=$currentNick channel=$channel grabState=$grabState -> PayBridgeActivity",
+            )
+            context.startActivity(intent)
+            Log.i(TAG, "openRedPacket: PayBridgeActivity started chat=$chatId")
+            true
+        }.getOrElse { t ->
+            Log.w(
+                TAG,
+                "openRedPacket: startActivity failed: ${t.javaClass.simpleName} ${t.message} " +
+                    "chat=$chatId billNo=${billNo.take(40)}",
+            )
+            false
+        }
+    }
+
+    /** canRecallOthers 日志去重：chatId -> 上次结果（仅在结果变化时打日志）。 */
+    private val canRecallOthersLogged = ConcurrentHashMap<String, Boolean>()
+
+    /**
+     * 当前账号在群内是否群主或管理员（决定能否撤回其他人消息）：
+     * 非群聊立即 false；否则复用 loadChatInfo（60s 缓存）的成员列表，找 isMe 成员返回
+     * isOwner || isAdmin。查询失败/无成员 false。日志仅在结果变化时打。
+     */
+    fun canRecallOthers(chatId: String): Boolean {
+        if (!isHost) return false
+        return runCatching {
+            val meta = chatMeta[chatId] ?: ensureChatContext(chatId)
+            if (meta?.isGroup != true) {
+                logCanRecallOthers(chatId, false, false, false, false)
+                return false
+            }
+            val me = ensureGroupMembersForManage(chatId).firstOrNull { it.isMe }
+            val owner = me?.isOwner == true
+            val admin = me?.isAdmin == true
+            val allowed = me != null && (owner || admin)
+            logCanRecallOthers(chatId, me != null, owner, admin, allowed)
+            allowed
+        }.getOrElse { t ->
+            Log.w(TAG, "canRecallOthers($chatId) failed: ${t.javaClass.simpleName} ${t.message}")
+            false
+        }
+    }
+
+    /** 结果变化时才打：`canRecallOthers: chat=.. me=.. owner=.. admin=.. -> allowed`。 */
+    private fun logCanRecallOthers(
+        chatId: String,
+        meFound: Boolean,
+        owner: Boolean,
+        admin: Boolean,
+        allowed: Boolean,
+    ) {
+        if (canRecallOthersLogged.put(chatId, allowed) != allowed) {
+            Log.i(
+                TAG,
+                "canRecallOthers: chat=$chatId me=$meFound owner=$owner admin=$admin -> $allowed",
+            )
+        }
+    }
+
+    /**
+     * 文件消息「下载 + 打开」：
+     * 1) knownPath / 已下载缓存（downloadedMediaByElement[elementId]）存在 → 直接 openLocalFile；
+     * 2) 否则按 TIM AIOFileManagerApiNtImpl.downloadFile 同款构造 RichMediaElementGetReq
+     *    {msgId, peerUid=chatMeta.peerUid, chatType, elementId, downloadType=1}，调
+     *    IKernelMsgService.getRichMediaElement(req) 触发下载；
+     * 3) 轮询 downloadedMediaByElement[elementId]（下载完成回调 onRichMediaDownloadComplete 写入），
+     *    最长 90s（200ms/次），拿到路径后 openLocalFile。
+     * 阻塞，需在 IO 线程调用；日志前缀 `fileOpen:`。
+     */
+    fun downloadAndOpenFile(chatId: String, msgId: Long, elementId: Long, knownPath: String?): Boolean {
+        if (!isHost) return false
+        // 1) 已有本地路径：直接打开。
+        val known = knownPath?.takeIf { pathUsable(it) }
+            ?: downloadedMediaByElement[elementId]?.takeIf { pathUsable(it) }
+        if (known != null) {
+            Log.i(TAG, "fileOpen: msg=$msgId elem=$elementId cached path=${known.take(120)}")
+            return openLocalFile(known)
+        }
+        // 2) 触发内核 richmedia 下载（同 TIM AIOFileManagerApiNtImpl.downloadFile）。
+        val meta = chatMeta[chatId] ?: ensureChatContext(chatId) ?: run {
+            Log.w(TAG, "fileOpen: msg=$msgId elem=$elementId meta unavailable")
+            return false
+        }
+        if (meta.peerUid.isBlank() || elementId == 0L || msgId == 0L) {
+            Log.w(
+                TAG,
+                "fileOpen: msg=$msgId elem=$elementId invalid target " +
+                    "(peerUid=${meta.peerUid}, elementId=$elementId, msgId=$msgId)",
+            )
+            return false
+        }
+        val requested = requestRichMediaElementDownload(chatId, msgId, elementId)
+        if (!requested) return false
+        Log.i(TAG, "fileOpen: msg=$msgId elem=$elementId download requested")
+        // 3) 等待下载完成回调写入缓存（200ms/次，最多 90s）。
+        val deadline = android.os.SystemClock.uptimeMillis() + 90_000L
+        while (android.os.SystemClock.uptimeMillis() < deadline) {
+            val path = downloadedMediaByElement[elementId]?.takeIf { pathUsable(it) }
+            if (path != null) {
+                val ok = openLocalFile(path)
+                Log.i(TAG, "fileOpen: msg=$msgId elem=$elementId downloaded path=${path.take(120)} ok=$ok")
+                return ok
+            }
+            Thread.sleep(200L)
+        }
+        Log.w(TAG, "fileOpen: msg=$msgId elem=$elementId download timeout (90s)")
+        return false
+    }
+
+    /**
+     * 触发内核 richmedia 下载（文件/视频/语音通用）：RichMediaElementGetReq{msgId, peerUid,
+     * chatType, elementId, downloadType=1} → `IKernelMsgService.getRichMediaElement(req)`
+     * （与 TIM AIOFileManagerApiNtImpl.downloadFile 同款请求）。成功发出返回 true（不等待下载完成）。
+     */
+    private fun requestRichMediaElementDownload(
+        chatId: String,
+        msgId: Long,
+        elementId: Long,
+    ): Boolean {
+        if (!isHost || msgId == 0L || elementId == 0L) return false
+        val meta = chatMeta[chatId] ?: ensureChatContext(chatId) ?: return false
+        if (meta.peerUid.isBlank()) return false
+        if (!ensureServices()) return false
+        val service = waitForService(timeoutMs = 1_500L) { msgService } ?: return false
+        val cl = hostClassLoader() ?: return false
+        return runCatching {
+            val reqClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.RichMediaElementGetReq", false, cl,
+            )
+            val req = reqClass.getConstructor().newInstance()
+            reqClass.getField("msgId").setLong(req, msgId)
+            reqClass.getField("peerUid").set(req, meta.peerUid)
+            reqClass.getField("chatType").setInt(req, meta.chatType)
+            reqClass.getField("elementId").setLong(req, elementId)
+            reqClass.getField("downloadType").setInt(req, 1)
+            val target = resolveKernelMethod(service, "getRichMediaElement", 1) ?: run {
+                Log.w(TAG, "fileDownload: getRichMediaElement not found")
+                return false
+            }
+            target.second.invoke(target.first, req)
+            true
+        }.getOrElse { t ->
+            Log.w(
+                TAG,
+                "fileDownload: getRichMediaElement failed: ${t.javaClass.simpleName} ${t.message}",
+            )
+            false
+        }
+    }
+
+    /** 触发文件下载（非阻塞，仅发请求）。日志 `fileDownload: start msg=.. elem=..`。 */
+    fun startFileDownload(chatId: String, msgId: Long, elementId: Long): Boolean {
+        val ok = requestRichMediaElementDownload(chatId, msgId, elementId)
+        Log.i(TAG, "fileDownload: start msg=$msgId elem=$elementId ok=$ok")
+        return ok
+    }
+
+    /** FileElement 的下载状态快照（progress 内核值基本只有 0/100，字节进度靠扫临时文件）。 */
+    private class FileElementState(
+        val progress: Int,
+        val transferStatus: Int,
+        val filePath: String?,
+        val fileName: String,
+        val fileSize: Long,
+        val fileUuid: String,
+    )
+
+    /** 按 msgId 从内核取单条 MsgRecord（`getMsgsByMsgId(Contact, ArrayList<Long>, IMsgOperateCallback)`）。 */
+    private fun fetchRawMsgRecord(chatId: String, msgId: Long): Any? {
+        if (!isHost || msgId == 0L) return null
+        if (!ensureServices()) return null
+        val meta = chatMeta[chatId] ?: ensureChatContext(chatId) ?: return null
+        val contact = contacts[chatId] ?: ensureKernelContact(chatId, meta) ?: return null
+        val service = waitForService(timeoutMs = 1_500L) { msgService } ?: return null
+        val cl = hostClassLoader() ?: return null
+        return try {
+            val callbackClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.IMsgOperateCallback", false, cl,
+            )
+            val latch = CountDownLatch(1)
+            var records: List<Any?> = emptyList()
+            val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, method, args ->
+                if (method.name == "onResult" && args != null && args.size >= 3) {
+                    @Suppress("UNCHECKED_CAST")
+                    records = (args[2] as? List<Any?>) ?: emptyList()
+                    latch.countDown()
+                }
+                null
+            }
+            val method = service.javaClass.methods.firstOrNull {
+                it.name == "getMsgsByMsgId" && it.parameterCount == 3
+            } ?: return null
+            method.invoke(service, contact, arrayListOf(msgId), callback)
+            latch.await(6, TimeUnit.SECONDS)
+            records.firstOrNull()
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "fileDownload: fetch msg record failed: ${t.javaClass.simpleName} ${t.message}",
+            )
+            null
+        }
+    }
+
+    /** 从 MsgRecord 的 elements 里找目标 FileElement 的 progress/transferStatus/filePath。 */
+    private fun fileElementState(chatId: String, msgId: Long, elementId: Long): FileElementState? {
+        val record = fetchRawMsgRecord(chatId, msgId) ?: return null
+        val elements = invokeGetter(record, "getElements") as? List<*> ?: return null
+        for (element in elements) {
+            element ?: continue
+            val file = invokeGetter(element, "getFileElement") ?: continue
+            val eid = (invokeGetter(element, "getElementId") as? Number)?.toLong() ?: 0L
+            if (elementId != 0L && eid != elementId) continue
+            return FileElementState(
+                progress = (invokeGetter(file, "getProgress") as? Number)?.toInt() ?: -1,
+                transferStatus =
+                    (invokeGetter(file, "getTransferStatus") as? Number)?.toInt() ?: -1,
+                filePath = (invokeGetter(file, "getFilePath") as? String)
+                    ?.takeIf { it.isNotBlank() },
+                fileName = (invokeGetter(file, "getFileName") as? String).orEmpty(),
+                fileSize = (invokeGetter(file, "getFileSize") as? Number)?.toLong() ?: 0L,
+                fileUuid = (invokeGetter(file, "getFileUuid") as? String).orEmpty(),
+            )
+        }
+        return null
+    }
+
+    /**
+     * 文件下载进度（字节数进度）：
+     * 1) 已下载完成（缓存路径 / FileElement.filePath 可用）→ 100；
+     * 2) 否则 refetch 消息拿 fileSize/fileName/fileUuid，扫 TIM 私有目录找**下载中的临时/部分文件**
+     *    （cacheDir/filesDir/getExternalFilesDir/getExternalCacheDir/Tencent/TIMfile_recv[.tmp]，
+     *    深度 ≤3、近 10 分钟修改、size>0；优先按文件名/uuid 匹配，否则取最近修改的最大文件），
+     *    按 msgId 缓存候选路径，后续只 stat；pct = len*100/fileSize 且 1..99，length 不变保持上次；
+     * 3) 拿不到文件/大小 → **-1**（不确定态；绝不返回 0，UI 显示不确定动画），日志只打一次。
+     * UI 300ms 轮询安全：候选已知时只 stat；否则 500ms 节流重查内核。
+     */
+    fun fileDownloadProgress(chatId: String, msgId: Long, elementId: Long): Int {
+        if (!isHost || elementId == 0L) return -1
+        downloadedMediaByElement[elementId]?.takeIf { pathUsable(it) }?.let {
+            // 已完成：清掉 richmedia 进度表（避免下次重新下载读到旧的 100）。
+            richMediaProgressByElement.remove(elementId)
+            richMediaProgressByMsgId.remove(msgId)
+            logFileProgressIfChanged(chatId, msgId, elementId, 100)
+            return 100
+        }
+        // 内核 onRichMediaProgerssUpdate 的真实下载进度优先于临时文件扫描。
+        val richPct = richMediaProgressByElement[elementId]
+            ?: richMediaProgressByMsgId[msgId]
+        if (richPct != null) {
+            val pct = richPct.coerceIn(0, 100)
+            logFileProgressIfChanged(chatId, msgId, elementId, pct)
+            return pct
+        }
+        val key = "$chatId:$msgId:$elementId"
+        // 兜底快路径：候选临时文件 + 总大小已知 → 直接 stat 计算字节进度（不重查内核）。
+        val candidatePath = filePartialCandidate[key]
+        val knownTotal = filePartialTotalSize[key] ?: 0L
+        if (candidatePath != null && knownTotal > 0L) {
+            val pct = partialProgressPct(key, candidatePath, knownTotal)
+            if (pct >= 0) {
+                logFilePartialIfChanged(chatId, msgId, elementId, candidatePath, knownTotal, pct)
+                return pct
+            }
+            // 文件消失（下载完成改名/取消）：清候选，走慢路径重扫。
+            filePartialCandidate.remove(key)
+        }
+        // 慢路径节流：UI 300ms 轮询时，同一 element 500ms 内只重查内核一次。
+        val now = android.os.SystemClock.uptimeMillis()
+        val lastAt = fileProgressLastAt[key] ?: 0L
+        if (now - lastAt < 500L) {
+            return fileProgressLogged[key] ?: -1
+        }
+        fileProgressLastAt[key] = now
+        val state = fileElementState(chatId, msgId, elementId) ?: run {
+            logFileProgressUnknown(chatId, msgId, elementId)
+            return -1
+        }
+        val statePath = state.filePath?.takeIf { pathUsable(it) }
+        if (statePath != null) {
+            downloadedMediaByElement[elementId] = statePath
+            logFileProgressIfChanged(chatId, msgId, elementId, 100)
+            return 100
+        }
+        if (state.fileSize <= 0L) {
+            logFileProgressUnknown(chatId, msgId, elementId)
+            return -1
+        }
+        // 目录扫描节流：未找到候选文件时最多 1s 扫一次（单次有界扫描）；找到候选后走上面的 stat 快路径。
+        val lastScanAt = filePartialScanAt[key] ?: 0L
+        if (now - lastScanAt < 1_000L) {
+            return fileProgressLogged[key] ?: -1
+        }
+        filePartialScanAt[key] = now
+        val partial = runCatching {
+            findPartialDownloadFile(state.fileName, state.fileUuid)
+        }.getOrNull()
+        if (partial == null) {
+            logFileProgressUnknown(chatId, msgId, elementId)
+            return -1
+        }
+        filePartialCandidate[key] = partial.absolutePath
+        filePartialTotalSize[key] = state.fileSize
+        val pct = partialProgressPct(key, partial.absolutePath, state.fileSize)
+        if (pct < 0) {
+            logFileProgressUnknown(chatId, msgId, elementId)
+            return -1
+        }
+        logFilePartialIfChanged(chatId, msgId, elementId, partial.absolutePath, state.fileSize, pct)
+        return pct
+    }
+
+    /**
+     * 部分文件字节进度：len*100/total（1..99）；length 未变化时保持上次进度；
+     * 文件不存在/大小为 0 返回 -1。
+     */
+    private fun partialProgressPct(key: String, path: String, total: Long): Int {
+        val file = java.io.File(path)
+        if (!file.isFile) return -1
+        val len = file.length()
+        if (len <= 0L || total <= 0L) return -1
+        val lastLen = filePartialLastLen[key]
+        val lastPct = fileProgressLogged[key] ?: -1
+        if (lastLen != null && lastLen == len && lastPct in 1..99) return lastPct
+        filePartialLastLen[key] = len
+        return (len * 100L / total).toInt().coerceIn(1, 99)
+    }
+
+    /** 进度日志仅在变化时打一次（防 UI 轮询刷屏）。 */
+    private fun logFilePartialIfChanged(
+        chatId: String,
+        msgId: Long,
+        elementId: Long,
+        path: String,
+        total: Long,
+        pct: Int,
+    ) {
+        val key = "$chatId:$msgId:$elementId"
+        if (fileProgressLogged.put(key, pct) != pct) {
+            val len = runCatching { java.io.File(path).length() }.getOrDefault(0L)
+            Log.i(
+                TAG,
+                "fileDownload: partial msg=$msgId elem=$elementId path=${path.take(100)} " +
+                    "len=$len total=$total pct=$pct",
+            )
+        }
+    }
+
+    /** 「进度未知」只打一次（之后返回 -1 由 UI 显示不确定动画）。 */
+    private fun logFileProgressUnknown(chatId: String, msgId: Long, elementId: Long) {
+        val key = "$chatId:$msgId:$elementId"
+        fileProgressLogged.put(key, -1)
+        if (fileProgressUnknownLogged.add(key)) {
+            Log.i(TAG, "fileDownload: progress unknown msg=$msgId elem=$elementId")
+        }
+    }
+
+    /**
+     * 扫 TIM 私有目录找下载中的临时/部分文件（本进程即 TIM 进程，可直接读私有数据）：
+     * 目录：cacheDir/filesDir/getExternalFilesDir/getExternalCacheDir + Tencent/TIMfile_recv[.tmp]；
+     * 有界扫描：递归深度 ≤3、目录项 >2000 跳过、只看近 10 分钟修改且 size>0 的文件；
+     * 优先文件名包含 fileName/fileUuid（忽略大小写），否则返回最近修改的最大文件作为候选。
+     */
+    private fun findPartialDownloadFile(fileName: String, fileUuid: String): java.io.File? {
+        val context = timApplicationContext() ?: hostContext() ?: return null
+        val roots = ArrayList<java.io.File>()
+        fun addRoot(root: java.io.File?) {
+            root ?: return
+            roots.add(root)
+        }
+        runCatching { addRoot(context.cacheDir) }
+        runCatching { addRoot(context.filesDir) }
+        runCatching { addRoot(context.getExternalFilesDir(null)) }
+        runCatching { addRoot(context.getExternalCacheDir()) }
+        runCatching {
+            context.getExternalFilesDir(null)?.parentFile?.let { dataDir ->
+                addRoot(java.io.File(dataDir, "Tencent/TIMfile_recv"))
+                addRoot(java.io.File(dataDir, "Tencent/TIMfile_recv/.tmp"))
+            }
+        }
+        val recentThreshold = System.currentTimeMillis() - 10 * 60 * 1000L
+        val needles = listOf(fileName, fileUuid).filter { it.isNotBlank() }
+        var bestMatch: java.io.File? = null
+        var bestOther: java.io.File? = null
+        fun consider(file: java.io.File) {
+            if (!file.isFile) return
+            val len = runCatching { file.length() }.getOrDefault(0L)
+            if (len <= 0L) return
+            if (runCatching { file.lastModified() }.getOrDefault(0L) < recentThreshold) return
+            val name = file.name
+            if (needles.any { name.contains(it, ignoreCase = true) }) {
+                val current = bestMatch
+                if (current == null ||
+                    runCatching { file.lastModified() }.getOrDefault(0L) >
+                    runCatching { current.lastModified() }.getOrDefault(0L)
+                ) {
+                    bestMatch = file
+                }
+            } else {
+                val current = bestOther
+                val newer = current == null ||
+                    runCatching { file.lastModified() }.getOrDefault(0L) >
+                    runCatching { current.lastModified() }.getOrDefault(0L)
+                if (newer || (current != null &&
+                        runCatching { file.lastModified() }.getOrDefault(0L) ==
+                        runCatching { current.lastModified() }.getOrDefault(0L) &&
+                        len > runCatching { current.length() }.getOrDefault(0L))
+                ) {
+                    bestOther = file
+                }
+            }
+        }
+        fun walk(dir: java.io.File?, depth: Int) {
+            if (dir == null || depth > 3) return
+            val list = runCatching { dir.listFiles() }.getOrNull() ?: return
+            if (list.size > 2000) return
+            for (entry in list) {
+                entry ?: continue
+                if (runCatching { entry.isDirectory }.getOrDefault(false)) {
+                    walk(entry, depth + 1)
+                } else {
+                    consider(entry)
+                }
+            }
+        }
+        roots.distinctBy { it.absolutePath }.forEach { root -> walk(root, 0) }
+        return bestMatch ?: bestOther
+    }
+
+    /** 宿主 TIM Application（mqq.app.MobileQQ.sMobileQQ）：扫私有目录/创建播放器用。 */
+    private fun timApplicationContext(): Context? {
+        val cl = hostClassLoader() ?: return null
+        return runCatching {
+            Class.forName("mqq.app.MobileQQ", false, cl).getField("sMobileQQ").get(null)
+        }.getOrNull() as? Context
+    }
+
+    /** 已下载文件本地路径（缓存 → 重取消息 FileElement.filePath）；未完成返回 null。 */
+    fun downloadedFilePath(chatId: String, msgId: Long, elementId: Long): String? {
+        if (!isHost || elementId == 0L) return null
+        downloadedMediaByElement[elementId]?.takeIf { pathUsable(it) }?.let { return it }
+        val path = fileElementState(chatId, msgId, elementId)?.filePath?.takeIf { pathUsable(it) }
+            ?: return null
+        downloadedMediaByElement[elementId] = path
+        return path
+    }
+
+    /** 进度日志仅在变化时打一次（防 UI 轮询刷屏）。 */
+    private fun logFileProgressIfChanged(
+        chatId: String,
+        msgId: Long,
+        elementId: Long,
+        progress: Int,
+    ) {
+        val key = "$chatId:$msgId:$elementId"
+        if (fileProgressLogged.put(key, progress) != progress) {
+            Log.i(TAG, "fileDownload: progress msg=$msgId elem=$elementId progress=$progress")
+        }
+    }
+
+    /** 发送带引用的文本消息（引用 = ReplyElement + TextElement）。阻塞，需在 IO 线程调用。 */
+    fun sendTextMessageWithReply(
+        chatId: String,
+        text: String,
+        replyToMsgId: Long,
+        replySenderUid: String,
+        replySourceText: String,
+    ): Boolean {
+        if (!isHost) return false
+        val cl = hostClassLoader() ?: return false
+        return try {
+            val (api, apiClass) = qrouteMsgUtilApi() ?: return false
+            val createReply = apiClass.methods.firstOrNull {
+                it.name == "createReplyElement" && it.parameterCount == 3
+            } ?: return false
+            var replyElement = createReply.invoke(api, replyToMsgId, replySenderUid, replySourceText)
+            if (replyElement == null) {
+                // 兜底：只用 msgId 的重载
+                val createReplySimple = apiClass.methods.firstOrNull {
+                    it.name == "createReplyElement" && it.parameterCount == 1
+                } ?: return false
+                replyElement = createReplySimple.invoke(api, replyToMsgId)
+            }
+            replyElement ?: return false
+            val textElementClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.TextElement", false, cl,
+            )
+            val textElement = textElementClass.getConstructor().newInstance()
+            textElementClass.getMethod("setContent", String::class.java).invoke(textElement, text)
+            val (element, msgElementClass) = newMsgElement(cl, ELEMENT_TYPE_TEXT)
+            msgElementClass.getMethod("setTextElement", textElementClass)
+                .invoke(element, textElement)
+            Log.i(TAG, "reply element ready: msg=$replyToMsgId uid=${replySenderUid.take(12)}")
+            sendElements(chatId, ArrayList<Any>().apply {
+                add(replyElement)
+                add(element)
+            })
+        } catch (t: Throwable) {
+            Log.e(TAG, "sendTextMessageWithReply failed: ${t.javaClass.simpleName} ${t.message}", t)
+            false
+        }
+    }
+
+    /**
+     * 群聊 @ 发送（可同时引用）：
+     * 1) 引用：QRoute `IMsgUtilApi.createReplyElement(msgId, senderUid, sourceText)`（3 参优先，1 参兜底），
+     *    放在 elements 第一位；
+     * 2) 按 [atTargets] 顺序在 [text] 中定位 `display` 子串切段：普通文本段用 TextElement，
+     *    @ 目标用 QRoute `createAtTextElement(name=display, uid, type)`——群成员 type=2、@全体 type=1 且
+     *    uid 传 ""；QRoute 不可用则反射 TextElement{setContent/setAtNtUid/setAtType}+MsgElement(type=1)；
+     *    找不到 display 的 target 跳过并打日志；
+     * 3) 末尾剩余文本作普通 TextElement；`sendElements` 发送。
+     * [atTargets] 为空时退化为 sendTextMessageWithReply/sendTextMessage。阻塞，IO 线程调用。
+     */
+    fun sendTextWithAt(
+        chatId: String,
+        text: String,
+        atTargets: List<AtTarget>,
+        replyToMsgId: Long = 0L,
+        replySenderUid: String = "",
+        replySourceText: String = "",
+    ): Boolean {
+        if (!isHost) return false
+        if (atTargets.isEmpty()) {
+            return if (replyToMsgId != 0L) {
+                sendTextMessageWithReply(chatId, text, replyToMsgId, replySenderUid, replySourceText)
+            } else {
+                sendTextMessage(chatId, text)
+            }
+        }
+        val cl = hostClassLoader() ?: return false
+        return try {
+            val elements = ArrayList<Any>()
+            if (replyToMsgId != 0L) {
+                createReplyElementForSend(cl, replyToMsgId, replySenderUid, replySourceText)
+                    ?.let { elements.add(it) }
+            }
+            val qroute = qrouteMsgUtilApi()
+            val api = qroute?.first
+            val apiClass = qroute?.second
+            var cursor = 0
+            for (target in atTargets) {
+                val display = target.display
+                if (display.isEmpty()) continue
+                val index = text.indexOf(display, cursor)
+                if (index < 0) {
+                    Log.w(
+                        TAG,
+                        "sendTextWithAt: display not found (cursor=$cursor) display=${display.take(40)}",
+                    )
+                    continue
+                }
+                if (index > cursor) {
+                    elements.add(newPlainTextElement(cl, text.substring(cursor, index)))
+                }
+                val atElement = buildAtElement(cl, api, apiClass, target)
+                if (atElement != null) {
+                    elements.add(atElement)
+                } else {
+                    // @ 元素构造失败：把 display 当普通文本，保证消息内容不丢。
+                    elements.add(newPlainTextElement(cl, text.substring(index, index + display.length)))
+                }
+                cursor = index + display.length
+            }
+            if (cursor < text.length) {
+                elements.add(newPlainTextElement(cl, text.substring(cursor)))
+            }
+            if (elements.isEmpty()) {
+                Log.w(TAG, "sendTextWithAt: empty elements chat=$chatId")
+                return false
+            }
+            val ok = sendElements(chatId, elements)
+            Log.i(
+                TAG,
+                "sendTextWithAt: chat=$chatId ats=${atTargets.size} text=${text.take(60)} " +
+                    "reply=$replyToMsgId ok=$ok",
+            )
+            ok
+        } catch (t: Throwable) {
+            Log.w(TAG, "sendTextWithAt failed: ${t.javaClass.simpleName} ${t.message}")
+            false
+        }
+    }
+
+    /** QRoute createReplyElement（3 参优先、1 参兜底）；失败返回 null。 */
+    private fun createReplyElementForSend(
+        cl: ClassLoader,
+        msgId: Long,
+        senderUid: String,
+        sourceText: String,
+    ): Any? {
+        val (api, apiClass) = qrouteMsgUtilApi() ?: return null
+        apiClass.methods.firstOrNull { it.name == "createReplyElement" && it.parameterCount == 3 }
+            ?.let { method ->
+                runCatching { method.invoke(api, msgId, senderUid, sourceText) }.getOrNull()
+                    ?.let { return it }
+            }
+        return apiClass.methods.firstOrNull { it.name == "createReplyElement" && it.parameterCount == 1 }
+            ?.let { method -> runCatching { method.invoke(api, msgId) }.getOrNull() }
+    }
+
+    /** 普通文本 MsgElement（TextElement.content + elementType=1）。 */
+    private fun newPlainTextElement(cl: ClassLoader, content: String): Any {
+        val textElementClass = Class.forName(
+            "com.tencent.qqnt.kernel.nativeinterface.TextElement", false, cl,
+        )
+        val textElement = textElementClass.getConstructor().newInstance()
+        textElementClass.getMethod("setContent", String::class.java).invoke(textElement, content)
+        val (element, msgElementClass) = newMsgElement(cl, ELEMENT_TYPE_TEXT)
+        msgElementClass.getMethod("setTextElement", textElementClass).invoke(element, textElement)
+        return element
+    }
+
+    /**
+     * @ 元素：QRoute `IMsgUtilApi.createAtTextElement(name, uid, type)` 优先（实现 = TextElement
+     * {content=name, atNtUid=uid, atType=type} + MsgElement{elementType=1}）；失败时反射手工构造。
+     * 群成员 type=2 + 成员 uid；@全体 type=1 + uid 传空字符串。
+     */
+    private fun buildAtElement(
+        cl: ClassLoader,
+        api: Any?,
+        apiClass: Class<*>?,
+        target: AtTarget,
+    ): Any? {
+        val uid = if (target.isAll) "" else target.uid
+        val type = if (target.isAll) 1 else 2
+        if (api != null && apiClass != null) {
+            apiClass.methods.firstOrNull {
+                it.name == "createAtTextElement" && it.parameterCount == 3
+            }?.let { method ->
+                runCatching { method.invoke(api, target.display, uid, type) }.getOrNull()
+                    ?.let { return it }
+            }
+        }
+        return runCatching {
+            val textElementClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.TextElement", false, cl,
+            )
+            val textElement = textElementClass.getConstructor().newInstance()
+            textElementClass.getMethod("setContent", String::class.java)
+                .invoke(textElement, target.display)
+            textElementClass.getMethod("setAtNtUid", String::class.java)
+                .invoke(textElement, uid)
+            textElementClass.getMethod("setAtType", Int::class.javaPrimitiveType)
+                .invoke(textElement, type)
+            val (element, msgElementClass) = newMsgElement(cl, ELEMENT_TYPE_TEXT)
+            msgElementClass.getMethod("setTextElement", textElementClass).invoke(element, textElement)
+            element
+        }.onFailure {
+            Log.w(TAG, "sendTextWithAt: buildAtElement failed: ${it.javaClass.simpleName} ${it.message}")
+        }.getOrNull()
+    }
+
+    /** 发送本地图片（相册 / 拍照）。阻塞，需在 IO 线程调用。 */
+    fun sendImageMessage(chatId: String, filePath: String, width: Int, height: Int): Boolean {
+        if (!isHost) return false
+        val file = java.io.File(filePath)
+        if (!file.isFile) return false
+        return try {
+            val (api, apiClass) = qrouteMsgUtilApi() ?: return false
+            val createPic = apiClass.methods
+                .firstOrNull { it.name == "createPicElement" && it.parameterCount == 3 }
+                ?: return false
+            val element = createPic.invoke(api, filePath, false, 0)
+                ?: return false
+            Log.i(TAG, "createPicElement ok: ${element.javaClass.simpleName}")
+            sendElements(chatId, ArrayList<Any>().apply { add(element) })
+        } catch (t: Throwable) {
+            Log.e(TAG, "sendImageMessage failed: ${t.javaClass.simpleName} ${t.message}", t)
+            false
+        }
+    }
+
+    /**
+     * 发送失败补救：本地文件不存在时，按收藏数据（emoPath/resid/md5 匹配）重新解析/下载。
+     */
+    private fun recoverFavoriteEmojiPath(requested: String): String? {
+        if (requested.isBlank()) return null
+        val svc = favroamingService() ?: return null
+        val dataList = runCatching {
+            svc.javaClass.getMethod("getEmoticonDataList").invoke(svc) as? List<*>
+        }.getOrNull().orEmpty()
+        val requestedFile = java.io.File(requested)
+        val requestedName = requestedFile.nameWithoutExtension
+        var fallback: String? = null
+        for (data in dataList) {
+            data ?: continue
+            fun fieldString(name: String): String? = runCatching {
+                data.javaClass.getField(name).get(data) as? String
+            }.getOrNull()
+            val emoPath = fieldString("emoPath")
+            val resid = fieldString("resid")
+            val md5 = fieldString("md5")
+            val exact = emoPath != null && emoPath == requested
+            val matches = exact ||
+                (!resid.isNullOrBlank() && requestedName.contains(resid, ignoreCase = true)) ||
+                (!md5.isNullOrBlank() && requestedName.equals(md5, ignoreCase = true))
+            if (!matches) continue
+            val resolved = resolveCustomEmojiPath(svc, data) ?: continue
+            if (exact) return resolved
+            if (fallback == null) fallback = resolved
+        }
+        return fallback
+    }
+
+    /**
+     * 发送收藏表情（以「表情」形态发送）。阻塞，需在 IO 线程调用。
+     *
+     * QQ 内核里 `IMsgUtilApi.createPicElement(path, original, picSubType)` 的第三个参数就是
+     * `PicElement.picSubType`：0 = 普通图片，1 = 表情图片。收藏表情按 1 发送，
+     * 对方客户端会渲染成表情而不是普通图片。
+     */
+    fun sendCustomEmojiMessage(chatId: String, filePath: String): Boolean {
+        if (!isHost) return false
+        var effectivePath = filePath
+        var file = java.io.File(filePath)
+        if (!file.isFile) {
+            // 收藏表情新同步后文件可能还没下载/已被清理：先重试下载再发送。
+            val recovered = runCatching { recoverFavoriteEmojiPath(filePath) }.getOrNull()
+            Log.i(
+                TAG,
+                "emoji: send fav retry requested=${filePath.take(100)} recovered=${recovered?.take(100)}",
+            )
+            if (recovered == null) {
+                Log.w(TAG, "emoji: send fav failed chat=$chatId (file missing, retry failed)")
+                return false
+            }
+            effectivePath = recovered
+            file = java.io.File(recovered)
+        }
+        if (!file.isFile || file.length() <= 0L) return false
+        return try {
+            val (api, apiClass) = qrouteMsgUtilApi() ?: return false
+            val createPic = apiClass.methods
+                .firstOrNull { it.name == "createPicElement" && it.parameterCount == 3 }
+                ?: return false
+            val element = createPic.invoke(api, effectivePath, false, 1)
+                ?: return false
+            Log.i(TAG, "sendCustomEmoji: picSubType=1 path=${effectivePath.takeLast(48)}")
+            sendElements(chatId, ArrayList<Any>().apply { add(element) })
+        } catch (t: Throwable) {
+            Log.e(TAG, "sendCustomEmojiMessage failed: ${t.javaClass.simpleName} ${t.message}", t)
+            false
+        }
+    }
+
+    /** 发送本地文件。阻塞，需在 IO 线程调用。 */
+    fun sendFileMessage(
+        chatId: String,
+        filePath: String,
+        fileName: String,
+        fileSize: Long,
+    ): Boolean {
+        if (!isHost) return false
+        val file = java.io.File(filePath)
+        if (!file.isFile) return false
+        return try {
+            val (api, apiClass) = qrouteMsgUtilApi() ?: return false
+            val createFile = apiClass.methods
+                .firstOrNull { it.name == "createFileElement" && it.parameterCount == 1 }
+                ?: return false
+            val element = createFile.invoke(api, filePath) ?: return false
+            Log.i(TAG, "createFileElement ok: ${element.javaClass.simpleName}")
+            sendElements(chatId, ArrayList<Any>().apply { add(element) })
+        } catch (t: Throwable) {
+            Log.e(TAG, "sendFileMessage failed: ${t.javaClass.simpleName} ${t.message}", t)
+            false
+        }
+    }
+
+    /**
+     * 发送视频消息（TIM 短消息视频，elementType=5）。
+     *
+     * 关键结论（真机+反编译核对）：TIM 4.1 的 **4 参** `createVideoElement(path, 4601, true, thumb)`
+     * 内部 `MsgUtil.y` 会 `QRoute.api(IGuildVideoApi)` 取 `com.tencent.guild.api.video.impl.GuildVideoApiImpl`，
+     * 而 TIM 包内没有该 guild 插件 → 必然抛 `InvocationTargetException(IllegalStateException: build API fatal)`。
+     * 所以只用 **1 参** `createVideoElement(origPath)`（`MsgUtil.x`：算 md5、把视频/缩略图落到 TIM 富媒体发送目录、
+     * MediaMetadataRetriever 截首帧生成 thumb），再自行补齐 fileTime(秒)/thumb/宽高（`MsgUtil.x` 的 fileTime=0）。
+     *
+     * 发送结果：`sendMsg` 的 IOperateCallback result 在 TIM 上可能是 -1（消息其实已插入），
+     * 这里注册 [PendingVideoSend]，等 onAddSendMsg/onMsgInfoListUpdate 回显按 chatId+fileSize 匹配，
+     * `sendElements==true || 回显匹配` 即判定成功；成功后才写 [sentVideoMeta] 供 reload 回填。
+     * 元素创建失败时直接返回 false（不发半成品，避免留下黑视频）。
+     */
+    fun sendVideoMessage(
+        chatId: String,
+        filePath: String,
+        thumbPath: String?,
+        durationMs: Long,
+        width: Int,
+        height: Int,
+    ): Boolean {
+        if (!isHost) return false
+        val file = java.io.File(filePath)
+        if (!file.isFile || file.length() <= 0L) {
+            Log.w(TAG, "sendVideo: file missing/empty path=$filePath")
+            return false
+        }
+        if (!ensureServices()) {
+            Log.w(TAG, "sendVideo: kernel services not ready chat=$chatId")
+            return false
+        }
+        Log.i(
+            TAG,
+            "sendVideo: start chat=$chatId filePath=$filePath size=${file.length()} " +
+                "inDurMs=$durationMs inSize=${width}x$height inThumb=${thumbPath?.take(100)}",
+        )
+        val chatMeta = ensureChatContext(chatId)
+        if (chatMeta == null || chatMeta.peerUid.isBlank()) {
+            Log.w(TAG, "sendVideo: no chat meta (peerUid) for chat=$chatId")
+            return false
+        }
+        // 1) 元数据兜底：入参时长/宽高缺失时自己探测（旋转 90/270 已交换宽高）。
+        val probe = probeVideoMetadata(filePath)
+        val finalDurationMs = if (durationMs > 0L) durationMs else probe?.durationMs ?: 0L
+        val finalWidth = if (width > 0) width else probe?.width ?: 0
+        val finalHeight = if (height > 0) height else probe?.height ?: 0
+        val durationSeconds = ((finalDurationMs + 500L) / 1000L).toInt().coerceAtLeast(0)
+        // 2) 缩略图：显式截首帧（发送过程中的错误会打印完整路径与异常）。
+        val thumb = thumbPath?.takeIf { isImageFilePath(it) && pathUsable(it) }
+            ?: generateVideoFrameJpg(filePath, "send_${file.name}")
+        Log.i(
+            TAG,
+            "sendVideo: meta durMs=$finalDurationMs (${durationSeconds}s) " +
+                "${finalWidth}x$finalHeight probe=${probe != null} thumb=${thumb?.take(100)} " +
+                "peer=${chatMeta.peerUid} chatType=${chatMeta.chatType}",
+        )
+        val pending = PendingVideoSend(
+            chatId = chatId,
+            fileSize = file.length(),
+            filePath = filePath,
+            thumbPath = thumb,
+            durationSeconds = durationSeconds,
+            width = finalWidth,
+            height = finalHeight,
+            startedAt = android.os.SystemClock.uptimeMillis(),
+        )
+        pendingVideoSends.add(pending)
+        try {
+            // 3) 首选 TIM 自己的 QRoute 发送 API（AIO 发送管线，自动带 extBufForUI/上传/落盘，
+            //    与 TIM 相册发送视频完全同路径）：
+            //    IMsgSendHelper.sendVideo(String peerUid, int chatType, String origPath,
+            //                             int businessType, boolean quality, String thumbPath)
+            var apiUsed = "IMsgSendHelper.sendVideo"
+            val helperInvoked = runCatching {
+                val qroute = qrouteApiClass("com.tencent.qqnt.aio.api.IMsgSendHelper")
+                if (qroute == null) {
+                    Log.w(TAG, "sendVideo: QRoute IMsgSendHelper unavailable")
+                    return@runCatching false
+                }
+                val api = qroute.first
+                val apiClass = qroute.second
+                val method = apiClass.methods.firstOrNull {
+                    it.name == "sendVideo" && it.parameterCount == 6
+                } ?: run {
+                    val methods = apiClass.methods
+                        .filter { it.name.contains("video", ignoreCase = true) }
+                        .joinToString { m -> m.name + "(" + m.parameterTypes.joinToString { it.simpleName } + ")" }
+                    Log.w(TAG, "sendVideo: IMsgSendHelper.sendVideo not found; videoMethods=$methods")
+                    return@runCatching false
+                }
+                method.invoke(api, chatMeta.peerUid, chatMeta.chatType, filePath, 0, true, thumb)
+                Log.i(TAG, "sendVideo: IMsgSendHelper.sendVideo invoked (origPath=$filePath)")
+                true
+            }.getOrElse { t ->
+                val cause = (t as? java.lang.reflect.InvocationTargetException)?.targetException ?: t
+                Log.w(
+                    TAG,
+                    "sendVideo: IMsgSendHelper.sendVideo failed: ${cause.javaClass.name}: ${cause.message}",
+                )
+                cause.stackTrace.take(6).forEach { st ->
+                    Log.w(TAG, "sendVideo: cause at ${st.className}.${st.methodName}:${st.lineNumber}")
+                }
+                false
+            }
+            if (!helperInvoked) {
+                // 4) 兜底：IMsgUtilApi.createVideoElement(origPath) + sendElements。
+                //    注意：4 参 createVideoElement 在 TIM 上必失败（内部 QRoute GuildVideoApi 插件缺失），只用 1 参。
+                apiUsed = "createVideoElement(String)+sendElements"
+                val element = runCatching {
+                    val qroute = qrouteMsgUtilApi()
+                    val api = qroute?.first
+                    val apiClass = qroute?.second
+                    if (api == null || apiClass == null) return@runCatching null
+                    val oneArg = apiClass.methods.firstOrNull {
+                        it.name == "createVideoElement" && it.parameterCount == 1
+                    } ?: return@runCatching null
+                    oneArg.invoke(api, filePath)
+                }.getOrElse { t ->
+                    val cause = (t as? java.lang.reflect.InvocationTargetException)?.targetException ?: t
+                    Log.w(
+                        TAG,
+                        "sendVideo: createVideoElement failed: ${cause.javaClass.name}: ${cause.message}",
+                    )
+                    cause.stackTrace.take(6).forEach { st ->
+                        Log.w(TAG, "sendVideo: cause at ${st.className}.${st.methodName}:${st.lineNumber}")
+                    }
+                    null
+                }
+                if (element == null) {
+                    Log.w(TAG, "sendVideo: no element built -> return false (avoid black video) chat=$chatId")
+                    return false
+                }
+                applyVideoElementMeta(filePath, element, thumb, durationSeconds, finalWidth, finalHeight, file.length())
+                sendElements(chatId, ArrayList<Any>().apply { add(element) })
+            }
+            // 5) 发送成功判定：sendMsg 回调在 TIM 上不可靠（-1 也可能已插入），以内核回显为准。
+            val echoSeen = pending.latch.await(6, TimeUnit.SECONDS)
+            Log.i(
+                TAG,
+                "sendVideo: chat=$chatId file=${file.name} size=${file.length()} api=$apiUsed " +
+                    "kernelEcho=$echoSeen msgId=${pending.msgId} dur=${durationSeconds}s " +
+                    "${finalWidth}x$finalHeight ok=$echoSeen",
+            )
+            if (echoSeen && sentVideoMetaFor(file.length()) == null) {
+                registerSentVideoMeta(
+                    fileSize = file.length(),
+                    filePath = filePath,
+                    thumbPath = thumb,
+                    durationSeconds = durationSeconds,
+                    width = finalWidth,
+                    height = finalHeight,
+                )
+            }
+            return echoSeen
+        } finally {
+            pendingVideoSends.remove(pending)
+        }
+    }
+
+    /** 内核回显匹配自发视频（onAddSendMsg/onMsgInfoListUpdate）：chatId + fileSize 相同即认为已发出。 */
+    private fun handleVideoSendEcho(methodName: String, args: Array<out Any?>?) {
+        if (pendingVideoSends.isEmpty()) return
+        val records = collectMsgRecords(args)
+        if (records.isEmpty()) return
+        for (record in records) {
+            val chatType = (invokeGetter(record, "getChatType") as? Number)?.toInt() ?: 0
+            val peerUid = invokeGetter(record, "getPeerUid") as? String ?: ""
+            val chatId = buildChatId(chatType, peerUid, 0L) ?: continue
+            val elements = invokeGetter(record, "getElements") as? List<*> ?: continue
+            var videoSize = 0L
+            var videoPath: String? = null
+            var thumbPath: String? = null
+            var durationSeconds = 0
+            var videoWidth = 0
+            var videoHeight = 0
+            for (element in elements) {
+                element ?: continue
+                val video = invokeGetter(element, "getVideoElement") ?: continue
+                videoSize = (invokeGetter(video, "getFileSize") as? Number)?.toLong() ?: 0L
+                videoPath = (invokeGetter(video, "getFilePath") as? String)?.takeIf { pathUsable(it) }
+                @Suppress("UNCHECKED_CAST")
+                val thumbs = invokeGetter(video, "getThumbPath") as? Map<*, *>
+                thumbPath = thumbs.orEmpty().entries
+                    .sortedByDescending { (it.key as? Number)?.toInt() ?: 0 }
+                    .mapNotNull { (it.value as? String)?.takeIf { path -> path.isNotBlank() } }
+                    .firstOrNull()
+                durationSeconds = (invokeGetter(video, "getFileTime") as? Number)?.toInt() ?: 0
+                videoWidth = (invokeGetter(video, "getThumbWidth") as? Number)?.toInt() ?: 0
+                videoHeight = (invokeGetter(video, "getThumbHeight") as? Number)?.toInt() ?: 0
+                break
+            }
+            if (videoSize <= 0L) continue
+            val msgId = (invokeGetter(record, "getMsgId") as? Number)?.toLong() ?: 0L
+            var matched = false
+            for (pending in pendingVideoSends) {
+                if (pending.chatId != chatId || pending.fileSize != videoSize) continue
+                matched = true
+                if (pending.msgId == 0L) pending.msgId = msgId
+                pending.latch.countDown()
+                Log.i(
+                    TAG,
+                    "sendVideo: kernel echo $methodName msg=$msgId chat=$chatId size=$videoSize",
+                )
+            }
+            // chatId 格式偶有差异（群 peerUid/群号）或发送管线压缩导致 fileSize 变化时，
+            // 单条 pending 退化匹配（chatId 相同即可）。
+            if (!matched && pendingVideoSends.size == 1) {
+                val pending = pendingVideoSends.first()
+                if (pending.fileSize == videoSize || pending.chatId == chatId) {
+                    matched = true
+                    if (pending.msgId == 0L) pending.msgId = msgId
+                    pending.latch.countDown()
+                    Log.i(
+                        TAG,
+                        "sendVideo: kernel echo $methodName msg=$msgId size=$videoSize " +
+                            "(fallback chat=$chatId pending=${pending.chatId} pendingSize=${pending.fileSize})",
+                    )
+                }
+            }
+            if (matched) {
+                // 优先用回显元素里的真实值，缺失用发送时探测/生成的值兜底；
+                // key 同时覆盖回显 fileSize（reload 时元素 fileSize 以此为准）与发送源文件 size。
+                val matchPending = pendingVideoSends.firstOrNull { p ->
+                    p.fileSize == videoSize || p.chatId == chatId
+                }
+                registerSentVideoMeta(
+                    videoSize,
+                    videoPath ?: matchPending?.filePath,
+                    thumbPath ?: matchPending?.thumbPath,
+                    if (durationSeconds > 0) durationSeconds else matchPending?.durationSeconds ?: 0,
+                    if (videoWidth > 0) videoWidth else matchPending?.width ?: 0,
+                    if (videoHeight > 0) videoHeight else matchPending?.height ?: 0,
+                )
+                if (matchPending != null && matchPending.fileSize != videoSize) {
+                    // 服务端/内核重编码后大小可能变化：给源文件大小也记一份，防止 reload 用旧 key。
+                    registerSentVideoMeta(
+                        matchPending.fileSize,
+                        videoPath ?: matchPending.filePath,
+                        thumbPath ?: matchPending.thumbPath,
+                        if (durationSeconds > 0) durationSeconds else matchPending.durationSeconds,
+                        if (videoWidth > 0) videoWidth else matchPending.width,
+                        if (videoHeight > 0) videoHeight else matchPending.height,
+                    )
+                }
+            }
+        }
+    }
+
+    /** 记录自发视频元数据（TTL 10 分钟，写入时顺带清理过期项）：reload 后按 fileSize 回填元素空字段。 */
+    private fun registerSentVideoMeta(
+        fileSize: Long,
+        filePath: String?,
+        thumbPath: String?,
+        durationSeconds: Int,
+        width: Int,
+        height: Int,
+    ) {
+        if (fileSize <= 0L) return
+        val now = android.os.SystemClock.uptimeMillis()
+        val iterator = sentVideoMeta.entries.iterator()
+        while (iterator.hasNext()) {
+            if (now - iterator.next().value.at > SENT_VIDEO_META_TTL_MS) iterator.remove()
+        }
+        sentVideoMeta[fileSize] = SentVideoMeta(filePath, thumbPath, durationSeconds, width, height, now)
+        Log.i(
+            TAG,
+            "sendVideo: sentVideoMeta size=$fileSize path=${filePath?.take(100)} " +
+                "thumb=${thumbPath?.take(100)} dur=${durationSeconds}s ${width}x$height",
+        )
+    }
+
+    /** 取自发视频缓存元数据（过期自动清理）。 */
+    private fun sentVideoMetaFor(fileSize: Long): SentVideoMeta? {
+        if (fileSize <= 0L) return null
+        val meta = sentVideoMeta[fileSize] ?: return null
+        if (android.os.SystemClock.uptimeMillis() - meta.at > SENT_VIDEO_META_TTL_MS) {
+            sentVideoMeta.remove(fileSize)
+            return null
+        }
+        return meta
+    }
+
+    /**
+     * 把探测到的时长/缩略图/尺寸/文件大小写进 MsgElement.videoElement：
+     * `MsgUtil.x` 生成时 fileTime=0（UI 会显示 0:00），这里按实测毫秒覆盖；缩略图优先保留 TIM 生成的，
+     * 没有则写我们截的首帧图。
+     */
+    private fun applyVideoElementMeta(
+        filePath: String,
+        element: Any,
+        thumbPath: String?,
+        durationSeconds: Int,
+        width: Int,
+        height: Int,
+        fileSize: Long,
+    ) {
+        runCatching {
+            val video = element.javaClass.getMethod("getVideoElement").invoke(element)
+                ?: return@runCatching
+            val videoClass = video.javaClass
+            if (durationSeconds > 0) {
+                videoClass.getField("fileTime").setInt(video, durationSeconds)
+            }
+            var usedThumb: String? = null
+            runCatching {
+                @Suppress("UNCHECKED_CAST")
+                val existing = videoClass.getField("thumbPath").get(video) as? Map<*, *>
+                usedThumb = existing.orEmpty().entries
+                    .sortedByDescending { (it.key as? Number)?.toInt() ?: 0 }
+                    .mapNotNull { (it.value as? String)?.takeIf { path -> path.isNotBlank() } }
+                    .firstOrNull()
+            }
+            val finalThumb = usedThumb ?: thumbPath
+            if (finalThumb != null) {
+                @Suppress("UNCHECKED_CAST")
+                val map = videoClass.getField("thumbPath").get(video) as? HashMap<Int, String>
+                    ?: HashMap()
+                map[0] = finalThumb
+                videoClass.getField("thumbPath").set(video, map)
+                val thumbFile = java.io.File(finalThumb)
+                if (thumbFile.isFile) {
+                    videoClass.getField("thumbSize").setInt(video, thumbFile.length().toInt())
+                }
+                runCatching {
+                    val opts = android.graphics.BitmapFactory.Options()
+                    android.graphics.BitmapFactory.decodeFile(finalThumb, opts)
+                    if (opts.outWidth > 0) {
+                        videoClass.getField("thumbWidth").setInt(video, opts.outWidth)
+                    }
+                    if (opts.outHeight > 0) {
+                        videoClass.getField("thumbHeight").setInt(video, opts.outHeight)
+                    }
+                }
+            }
+            if (width > 0) {
+                val current = runCatching { videoClass.getField("thumbWidth").getInt(video) }.getOrDefault(0)
+                if (current <= 0) videoClass.getField("thumbWidth").setInt(video, width)
+            }
+            if (height > 0) {
+                val current = runCatching { videoClass.getField("thumbHeight").getInt(video) }.getOrDefault(0)
+                if (current <= 0) videoClass.getField("thumbHeight").setInt(video, height)
+            }
+            if (fileSize > 0L) {
+                val current = runCatching { videoClass.getField("fileSize").getLong(video) }.getOrDefault(0L)
+                if (current <= 0L) videoClass.getField("fileSize").setLong(video, fileSize)
+            }
+            val elementPath = runCatching { videoClass.getField("filePath").get(video) as? String }.getOrNull()
+            Log.i(
+                TAG,
+                "sendVideo: element meta fileTime=${durationSeconds}s thumb=${finalThumb?.take(100)} " +
+                    "elemPath=${elementPath?.take(100)} (src=$filePath)",
+            )
+        }.onFailure {
+            Log.w(TAG, "sendVideo: applyVideoElementMeta failed: ${it.javaClass.simpleName} ${it.message}")
+        }
+    }
+
+    /** 从 MsgElement 里取 videoElement 的 filePath/thumbPath（用于 sentVideoMeta）。 */
+    private fun extractVideoElementMeta(element: Any): ElementVideoMeta? = runCatching {
+        val video = element.javaClass.getMethod("getVideoElement").invoke(element)
+            ?: return@runCatching null
+        val videoClass = video.javaClass
+        val filePath = runCatching { videoClass.getField("filePath").get(video) as? String }
+            .getOrNull()?.takeIf { it.isNotBlank() }
+        @Suppress("UNCHECKED_CAST")
+        val thumbs = runCatching { videoClass.getField("thumbPath").get(video) as? Map<*, *> }
+            .getOrNull()
+        val thumbPath = thumbs.orEmpty().entries
+            .sortedByDescending { (it.key as? Number)?.toInt() ?: 0 }
+            .mapNotNull { (it.value as? String)?.takeIf { path -> path.isNotBlank() } }
+            .firstOrNull()
+        ElementVideoMeta(filePath, thumbPath)
+    }.getOrNull()
+
+    private class ElementVideoMeta(val filePath: String?, val thumbPath: String?)
+
+    // ---------------------------------------------------------------------
+    // 系统录音机 → 语音消息（MediaStore.RECORD_SOUND + TimUiHook.onActivityResult）
+    // ---------------------------------------------------------------------
+
+    /** 系统录音的 requestCode（唯一；结果由 TimUiHook → UiHost.dispatchActivityResult 路由回来）。 */
+    private const val VOICE_RECORD_REQUEST_CODE = 0x4D33
+
+    private data class VoiceRecordPending(val chatId: String, val at: Long)
+
+    @Volatile
+    private var pendingVoiceRecord: VoiceRecordPending? = null
+
+    private fun voiceRecordDir(): java.io.File? {
+        val context = appContext() ?: hostContext() ?: return null
+        return java.io.File(context.cacheDir, "voice_record").apply { mkdirs() }
+    }
+
+    /**
+     * 用系统录音机录音：从当前前台 TIM Activity 调 startActivityForResult(RECORD_SOUND)，
+     * 结果在 [handleVoiceRecordActivityResult] 里接收并发送到 [chatId]。
+     * 返回 false：无前台 Activity / 已有录音在途。阻塞无（仅投递主线程）。
+     */
+    fun startSystemVoiceRecord(chatId: String): Boolean {
+        if (!isHost) return false
+        if (chatId.isBlank()) return false
+        if (pendingVoiceRecord != null) {
+            Log.w(TAG, "voiceRecord: start ignored chat=$chatId (pending in flight)")
+            return false
+        }
+        val activity = hostActivity() ?: run {
+            Log.w(TAG, "voiceRecord: start failed chat=$chatId (no foreground activity)")
+            return false
+        }
+        val intent = Intent("android.provider.MediaStore.RECORD_SOUND").apply {
+            addCategory(Intent.CATEGORY_DEFAULT)
+        }
+        val pending = VoiceRecordPending(chatId, System.currentTimeMillis())
+        return runCatching {
+            mainHandler.post {
+                pendingVoiceRecord = pending
+                runCatching {
+                    // TIM QBaseActivity 会弹「即将离开 TIM」确认框，直接放行这一次。
+                    UiHost.expectExternalLaunch()
+                    activity.startActivityForResult(intent, VOICE_RECORD_REQUEST_CODE)
+                    Log.i(
+                        TAG,
+                        "voiceRecord: start chat=$chatId activity=${activity.javaClass.simpleName} " +
+                            "requestCode=$VOICE_RECORD_REQUEST_CODE",
+                    )
+                }.onFailure { t ->
+                    pendingVoiceRecord = null
+                    Log.w(
+                        TAG,
+                        "voiceRecord: start failed chat=$chatId: " +
+                            "${t.javaClass.simpleName} ${t.message}",
+                    )
+                }
+            }
+            true
+        }.getOrElse { t ->
+            Log.w(TAG, "voiceRecord: start post failed: ${t.javaClass.simpleName} ${t.message}")
+            false
+        }
+    }
+
+    /**
+     * TimUiHook.onActivityResult → UiHost.dispatchActivityResult 的最先处理入口。
+     * 命中 VOICE_RECORD_REQUEST_CODE 时消费结果（不继续派发给 Compose registry），返回 true。
+     */
+    fun handleVoiceRecordActivityResult(
+        requestCode: Int,
+        resultCode: Int,
+        data: Intent?,
+    ): Boolean {
+        if (requestCode != VOICE_RECORD_REQUEST_CODE) return false
+        val pending = pendingVoiceRecord ?: return false
+        pendingVoiceRecord = null
+        if (resultCode != Activity.RESULT_OK) {
+            Log.i(TAG, "voiceRecord: result cancelled chat=${pending.chatId} resultCode=$resultCode")
+            return true
+        }
+        val uri = data?.data
+            ?: runCatching {
+                @Suppress("DEPRECATION")
+                data?.getParcelableExtra(android.provider.MediaStore.EXTRA_OUTPUT) as? android.net.Uri
+            }.getOrNull()
+            ?: data?.clipData?.getItemAt(0)?.uri
+            ?: runCatching {
+                data?.getStringExtra(android.provider.MediaStore.EXTRA_OUTPUT)
+                    ?.let { android.net.Uri.fromFile(java.io.File(it)) }
+            }.getOrNull()
+        Log.i(
+            TAG,
+            "voiceRecord: result uri=${uri?.toString()?.take(120)} chat=${pending.chatId} " +
+                "extras=${data?.extras?.keySet()?.joinToString(",")?.take(120)}",
+        )
+        if (uri == null) {
+            Log.w(TAG, "voiceRecord: result ignored (no uri) chat=${pending.chatId}")
+            return true
+        }
+        val chatId = pending.chatId
+        Thread {
+            runCatching { finishVoiceRecord(chatId, uri) }.onFailure { t ->
+                Log.w(
+                    TAG,
+                    "voiceRecord: finish failed chat=$chatId: ${t.javaClass.simpleName} ${t.message}",
+                )
+            }
+        }.start()
+        return true
+    }
+
+    /** 复制 content/file URI 到 cacheDir/voice_record，并发送语音。 */
+    private fun finishVoiceRecord(chatId: String, uri: android.net.Uri) {
+        val context = appContext() ?: hostContext() ?: return
+        val dir = java.io.File(context.cacheDir, "voice_record").apply { mkdirs() }
+        val ext = voiceRecordExtension(context, uri)
+        val target = java.io.File(dir, "record_${System.currentTimeMillis()}.$ext")
+        val resolver = context.contentResolver
+        val copied = runCatching {
+            when {
+                uri.scheme == "file" -> {
+                    val src = java.io.File(requireNotNull(uri.path))
+                    if (!src.isFile) return@runCatching false
+                    src.copyTo(target, overwrite = true)
+                    true
+                }
+                else -> {
+                    val input = resolver.openInputStream(uri) ?: return@runCatching false
+                    input.use { inp -> target.outputStream().use { out -> inp.copyTo(out) } }
+                    true
+                }
+            }
+        }.getOrElse { t ->
+            Log.w(
+                TAG,
+                "voiceRecord: copy failed uri=$uri: ${t.javaClass.simpleName} ${t.message}",
+            )
+            false
+        }
+        if (!copied || !target.isFile || target.length() <= 0L) {
+            Log.w(
+                TAG,
+                "voiceRecord: result invalid uri=$uri path=${target.absolutePath} " +
+                    "size=${if (target.isFile) target.length() else -1}",
+            )
+            return
+        }
+        Log.i(
+            TAG,
+            "voiceRecord: result uri=$uri path=${target.absolutePath} size=${target.length()}",
+        )
+        val durationMs = probeAudioDurationMs(target.absolutePath)
+        sendRecordedVoice(chatId, target.absolutePath, durationMs, ext)
+    }
+
+    private fun voiceRecordExtension(context: Context, uri: android.net.Uri): String {
+        val mime = runCatching { context.contentResolver.getType(uri) }.getOrNull().orEmpty()
+        val fromMime = when {
+            mime.contains("mp4", true) || mime.contains("m4a", true) || mime.contains("aac", true) -> "m4a"
+            mime.contains("amr", true) -> "amr"
+            mime.contains("3gpp", true) || mime.contains("3gp", true) -> "3gp"
+            mime.contains("wav", true) || mime.contains("x-wav", true) -> "wav"
+            mime.contains("mpeg", true) || mime.contains("mp3", true) -> "mp3"
+            mime.contains("ogg", true) || mime.contains("opus", true) -> "ogg"
+            else -> ""
+        }
+        if (fromMime.isNotEmpty()) return fromMime
+        val display = runCatching {
+            context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                if (!cursor.moveToFirst()) return@use ""
+                val idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                if (idx >= 0) cursor.getString(idx).orEmpty() else ""
+            }
+        }.getOrNull().orEmpty()
+        return when {
+            display.endsWith(".amr", true) -> "amr"
+            display.endsWith(".m4a", true) || display.endsWith(".mp4", true) -> "m4a"
+            display.endsWith(".aac", true) -> "aac"
+            display.endsWith(".3gp", true) -> "3gp"
+            display.endsWith(".wav", true) -> "wav"
+            display.endsWith(".mp3", true) -> "mp3"
+            display.endsWith(".ogg", true) || display.endsWith(".opus", true) -> "ogg"
+            else -> "m4a"
+        }
+    }
+
+    private fun probeAudioDurationMs(path: String): Int = runCatching {
+        val retriever = android.media.MediaMetadataRetriever()
+        try {
+            retriever.setDataSource(path)
+            val ms = retriever.extractMetadata(
+                android.media.MediaMetadataRetriever.METADATA_KEY_DURATION,
+            )?.toLongOrNull() ?: 0L
+            ms.coerceAtLeast(0L).toInt()
+        } finally {
+            runCatching { retriever.release() }
+        }
+    }.getOrDefault(0)
+
+    /** 发送录好的语音：优先 silk 转码（TIM 语音格式），失败再直接发原始文件（日志区分）。 */
+    private fun sendRecordedVoice(chatId: String, path: String, durationMs: Int, ext: String) {
+        var ok = false
+        var code = -1
+        var used = "direct"
+        if (ext != "silk" && ext != "amr") {
+            // 优先转 silk（TIM/QQ PTT 标准格式；系统录音多为 m4a/aac，直接发对方可能无法播放）
+            val silkPath = runCatching { transcodeToSilk(path) }.getOrNull()
+            if (silkPath != null && java.io.File(silkPath).let { it.isFile && it.length() > 0L }) {
+                val silkDuration = durationMs.takeIf { it > 0 } ?: probeAudioDurationMs(silkPath)
+                val (silkOk, silkCode) = sendVoiceElement(chatId, silkPath, silkDuration)
+                Log.i(
+                    TAG,
+                    "voiceRecord: send attempt=silk chat=$chatId path=$silkPath ok=$silkOk code=$silkCode",
+                )
+                if (silkOk) {
+                    ok = true
+                    code = silkCode
+                    used = "silk"
+                }
+            } else {
+                Log.w(TAG, "voiceRecord: silk transcode unavailable path=$path")
+            }
+        }
+        if (!ok) {
+            val directDuration = durationMs.takeIf { it > 0 } ?: probeAudioDurationMs(path)
+            val (directOk, directCode) = sendVoiceElement(chatId, path, directDuration)
+            Log.i(
+                TAG,
+                "voiceRecord: send attempt=direct chat=$chatId path=$path ok=$directOk code=$directCode " +
+                    "ext=$ext",
+            )
+            ok = directOk
+            code = directCode
+            used = "direct"
+        }
+        Log.i(TAG, "voiceRecord: send chat=$chatId ok=$ok code=$code attempt=$used")
+        if (ok) refreshChatsSoon()
+    }
+
+    /** 计算文件 MD5（小写 hex；与 TIM 内核 Md5 一致，分块读取大文件）。 */
+    private fun md5HexOfFile(path: String): String? = runCatching {
+        val digest = java.security.MessageDigest.getInstance("MD5")
+        java.io.FileInputStream(path).use { input ->
+            val buffer = ByteArray(64 * 1024)
+            while (true) {
+                val read = input.read(buffer)
+                if (read <= 0) break
+                digest.update(buffer, 0, read)
+            }
+        }
+        digest.digest().joinToString("") { "%02x".format(it) }
+    }.getOrNull()
+
+    /** createPttElement(path, durationMs) + kernel sendMsg；返回 (ok, code)。 */
+    private fun sendVoiceElement(chatId: String, path: String, durationMs: Int): Pair<Boolean, Int> {
+        if (!isHost) return false to -1
+        val file = java.io.File(path)
+        if (!file.isFile || file.length() <= 0L) return false to -1
+        return try {
+            val (api, apiClass) = qrouteMsgUtilApi() ?: return false to -1
+            val method = apiClass.methods.firstOrNull {
+                it.name == "createPttElement" && it.parameterCount == 2
+            } ?: return false to -1
+            val element = method.invoke(api, path, durationMs.coerceAtLeast(1000)) ?: return false to -1
+            Log.i(
+                TAG,
+                "voiceRecord: createPttElement ok durationMs=$durationMs class=${element.javaClass.simpleName}",
+            )
+            // 记录本地文件映射（消息回读时 filePath 可能为空）。
+            // createPttElement 返回 MsgElement，md5/uuid/name 在其内部 PttElement 上（直接读 MsgElement 全是 null）。
+            runCatching {
+                val ptt = invokeGetter(element, "getPttElement")
+                val rawMd5 = ptt?.let { invokeGetter(it, "getMd5HexStr") } as? String
+                val rawUuid = ptt?.let { invokeGetter(it, "getFileUuid") } as? String
+                val rawName = ptt?.let { invokeGetter(it, "getFileName") } as? String
+                val computedMd5 = md5HexOfFile(path)
+                val md5 = rawMd5?.takeIf { it.isNotBlank() } ?: computedMd5
+                val uuid = rawUuid?.takeIf { it.isNotBlank() }
+                val name = rawName?.takeIf { it.isNotBlank() } ?: file.name
+                val keys = LinkedHashSet<String>()
+                listOfNotNull(md5, uuid, name, file.name, file.nameWithoutExtension)
+                    .filter { it.isNotBlank() }
+                    .forEach { keys.add(it) }
+                keys.forEach { sentVoiceLocalPaths[it] = path }
+                if (sentVoiceLocalPaths.size > 100) sentVoiceLocalPaths.clear()
+                Log.i(
+                    TAG,
+                    "voiceRecord: map local path md5=$md5 (raw=$rawMd5 computed=$computedMd5) " +
+                        "uuid=$uuid name=$name keys=${keys.toList()} path=$path",
+                )
+            }
+            sendElementsResult(chatId, ArrayList<Any>().apply { add(element) })
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "voiceRecord: sendVoiceElement failed: ${t.javaClass.simpleName} ${t.message}",
+            )
+            false to -1
+        }
+    }
+
+    /** 与 [sendElements] 相同，但返回 (success, code) 供语音发送日志。 */
+    private fun sendElementsResult(chatId: String, elements: ArrayList<Any>): Pair<Boolean, Int> {
+        if (!isHost) return false to -1
+        if (!ensureServices()) return false to -1
+        val contact = contacts[chatId] ?: return false to -1
+        val service = msgService ?: return false to -1
+        val cl = hostClassLoader() ?: return false to -1
+        return try {
+            val callbackClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.IOperateCallback", false, cl,
+            )
+            val latch = CountDownLatch(1)
+            var resultCode = -1
+            var resultMessage = ""
+            val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, method, args ->
+                if (method.name == "onResult" && args != null && args.isNotEmpty()) {
+                    resultCode = (args[0] as? Number)?.toInt() ?: -1
+                    resultMessage = args.getOrNull(1) as? String ?: ""
+                    latch.countDown()
+                }
+                null
+            }
+            val method = service.javaClass.methods.firstOrNull {
+                it.name == "sendMsg" && it.parameterCount == 5
+            } ?: return false to -1
+            method.invoke(service, 0L, contact, elements, HashMap<Int, Any>(), callback)
+            latch.await(10, TimeUnit.SECONDS)
+            Log.i(TAG, "sendElementsResult($chatId) result=$resultCode msg=$resultMessage")
+            (resultCode == 0) to resultCode
+        } catch (t: Throwable) {
+            Log.e(TAG, "sendElementsResult failed: ${t.javaClass.simpleName} ${t.message}", t)
+            false to -1
+        }
+    }
+
+    // ---- 录音转码：m4a/aac → PCM16 mono 16k → silk（TIM SilkCodecWrapper） ----
+
+    /** MediaCodec 解码任意音频 → PCM16 monophonic 16kHz（失败 null）。 */
+    private fun decodeAudioToPcm16k(path: String): ByteArray? = runCatching {
+        val extractor = android.media.MediaExtractor()
+        try {
+            extractor.setDataSource(path)
+            var trackIndex = -1
+            var mime = ""
+            for (i in 0 until extractor.trackCount) {
+                val format = extractor.getTrackFormat(i)
+                val m = format.getString(android.media.MediaFormat.KEY_MIME).orEmpty()
+                if (m.startsWith("audio/")) {
+                    trackIndex = i
+                    mime = m
+                    break
+                }
+            }
+            if (trackIndex < 0) return@runCatching null
+            extractor.selectTrack(trackIndex)
+            val srcFormat = extractor.getTrackFormat(trackIndex)
+            val srcRate = srcFormat.getInteger(android.media.MediaFormat.KEY_SAMPLE_RATE)
+            val srcChannels = srcFormat.getInteger(android.media.MediaFormat.KEY_CHANNEL_COUNT)
+            val decoder = android.media.MediaCodec.createDecoderByType(mime)
+            decoder.configure(srcFormat, null, null, 0)
+            decoder.start()
+            val raw = java.io.ByteArrayOutputStream()
+            val info = android.media.MediaCodec.BufferInfo()
+            var sawInputEos = false
+            var sawOutputEos = false
+            var outRate = srcRate
+            var outChannels = srcChannels
+            var outPcmEncoding = 2 // AudioFormat.ENCODING_PCM_16BIT
+            val deadline = perfUptime() + 20_000L
+            while (!sawOutputEos && perfUptime() < deadline) {
+                if (!sawInputEos) {
+                    val inIndex = decoder.dequeueInputBuffer(10_000L)
+                    if (inIndex >= 0) {
+                        val input = decoder.getInputBuffer(inIndex)
+                        val sampleSize = extractor.readSampleData(input ?: java.nio.ByteBuffer.allocate(0), 0)
+                        if (sampleSize < 0) {
+                            decoder.queueInputBuffer(
+                                inIndex, 0, 0, 0L,
+                                android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM,
+                            )
+                            sawInputEos = true
+                        } else {
+                            decoder.queueInputBuffer(inIndex, 0, sampleSize, extractor.sampleTime, 0)
+                            extractor.advance()
+                        }
+                    }
+                }
+                val outIndex = decoder.dequeueOutputBuffer(info, 10_000L)
+                if (outIndex == android.media.MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    val of = decoder.outputFormat
+                    outRate = of.getInteger(android.media.MediaFormat.KEY_SAMPLE_RATE)
+                    outChannels = of.getInteger(android.media.MediaFormat.KEY_CHANNEL_COUNT)
+                    outPcmEncoding = if (of.containsKey(android.media.MediaFormat.KEY_PCM_ENCODING)) {
+                        of.getInteger(android.media.MediaFormat.KEY_PCM_ENCODING)
+                    } else {
+                        2
+                    }
+                } else if (outIndex >= 0) {
+                    val outBuf = decoder.getOutputBuffer(outIndex) ?: continue
+                    outBuf.position(info.offset)
+                    outBuf.limit(info.offset + info.size)
+                    val bytes = ByteArray(info.size)
+                    outBuf.get(bytes)
+                    raw.write(convertPcmTo16BitMono(bytes, outPcmEncoding, outChannels))
+                    decoder.releaseOutputBuffer(outIndex, false)
+                    if (info.flags and android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                        sawOutputEos = true
+                    }
+                }
+            }
+            runCatching { decoder.stop() }
+            runCatching { decoder.release() }
+            val pcm = raw.toByteArray()
+            if (pcm.isEmpty()) return@runCatching null
+            resamplePcm16Mono(pcm, outRate, 16_000)
+        } finally {
+            runCatching { extractor.release() }
+        }
+    }.getOrNull()
+
+    /** 任意 PCM 编码/声道 → 16-bit 小端单声道（非 16bit 先转，多声道取平均）。 */
+    private fun convertPcmTo16BitMono(bytes: ByteArray, encoding: Int, channels: Int): ByteArray {
+        val ch = channels.coerceAtLeast(1)
+        return when (encoding) {
+            4 -> { // ENCODING_PCM_FLOAT
+                val floats = java.nio.ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                    .asFloatBuffer()
+                val frames = floats.remaining() / ch
+                val out = ByteArray(frames * 2)
+                for (f in 0 until frames) {
+                    var sum = 0.0f
+                    for (c in 0 until ch) sum += floats.get(f * ch + c)
+                    val v = (sum / ch * 32767.0f).toInt().coerceIn(-32768, 32767)
+                    out[f * 2] = (v and 0xFF).toByte()
+                    out[f * 2 + 1] = ((v shr 8) and 0xFF).toByte()
+                }
+                out
+            }
+            else -> {
+                if (ch == 1) return bytes
+                val frames = bytes.size / (2 * ch)
+                val out = ByteArray(frames * 2)
+                for (f in 0 until frames) {
+                    var sum = 0
+                    for (c in 0 until ch) {
+                        val idx = (f * ch + c) * 2
+                        if (idx + 1 >= bytes.size) break
+                        sum += ((bytes[idx].toInt() and 0xFF) or (bytes[idx + 1].toInt() shl 8)).toShort()
+                    }
+                    val v = sum / ch
+                    out[f * 2] = (v and 0xFF).toByte()
+                    out[f * 2 + 1] = ((v shr 8) and 0xFF).toByte()
+                }
+                out
+            }
+        }
+    }
+
+    /** PCM16 mono 线性重采样到 [targetRate]。 */
+    private fun resamplePcm16Mono(pcm: ByteArray, srcRate: Int, targetRate: Int): ByteArray {
+        if (srcRate <= 0 || srcRate == targetRate) return pcm
+        val srcFrames = pcm.size / 2
+        if (srcFrames <= 0) return pcm
+        val dstFrames = (srcFrames.toLong() * targetRate / srcRate).toInt().coerceAtLeast(1)
+        val out = ByteArray(dstFrames * 2)
+        val src = java.nio.ByteBuffer.wrap(pcm).order(java.nio.ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+        for (i in 0 until dstFrames) {
+            val srcPos = i.toDouble() * srcRate / targetRate
+            val i0 = srcPos.toInt().coerceIn(0, srcFrames - 1)
+            val i1 = (i0 + 1).coerceAtMost(srcFrames - 1)
+            val frac = srcPos - i0
+            val v = (src.get(i0) * (1 - frac) + src.get(i1) * frac).toInt().coerceIn(-32768, 32767)
+            out[i * 2] = (v and 0xFF).toByte()
+            out[i * 2 + 1] = ((v shr 8) and 0xFF).toByte()
+        }
+        return out
+    }
+
+    /**
+     * m4a/aac/mp3 → PCM16 mono 16kHz → silk。
+     * 修复：不再反射混淆字段（旧代码 `c.a.f118264c` 是 JADX 合成字段名，运行时 NoSuchFieldException），
+     * 改用 TIM `SilkCodecWrapper` 的**公开 InputStream 接口**：
+     *   1) ctor(Context,true) → `b(16000,16000,1)` 初始化编码器（TIM PttSliceUploadProcessor 同款参数）；
+     *   2) 按类型查找内部 PipedOutputStream 字段（运行时字段名无关），按 20ms/640B 帧写入 PCM；
+     *   3) 调公开 `read(byte[],int,int)` 编码：返回 [2B 小端长度][silk payload]（QQAudioUtils.g 写入）；
+     *   4) 文件头 = `RecordParams.a(1,16000)` 同款：`byte(速率档=2) + "#!SILK_V3"`，再接各帧。
+     * 成功把 silk 写进 cacheDir/voice_record。
+     */
+    private fun transcodeToSilk(srcPath: String): String? {
+        val context = appContext() ?: hostContext() ?: return null
+        val cl = hostClassLoader() ?: return null
+        val pcm = decodeAudioToPcm16k(srcPath) ?: run {
+            Log.w(TAG, "voiceRecord: transcode decode failed path=$srcPath")
+            return null
+        }
+        val silkBytes = runCatching {
+            val silkClass = Class.forName("com.tencent.mobileqq.utils.SilkCodecWrapper", false, cl)
+            val silk = silkClass.getConstructor(
+                Context::class.java,
+                Boolean::class.javaPrimitiveType,
+            ).newInstance(context, true)
+            // 初始化编码器：sampleRate=16000, bitRate=16000, channels=1（TIM 录音/上传同款）
+            silkClass.getMethod(
+                "b",
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+            ).invoke(silk, 16_000, 16_000, 1)
+            // PipedOutputStream 字段名运行时可能混淆，按类型查找（不依赖 JADX 合成名）
+            var pipeOut: java.io.PipedOutputStream? = null
+            var cls: Class<*>? = silkClass
+            while (cls != null && pipeOut == null) {
+                for (field in cls.declaredFields) {
+                    if (java.io.PipedOutputStream::class.java.isAssignableFrom(field.type)) {
+                        field.isAccessible = true
+                        pipeOut = runCatching { field.get(silk) as? java.io.PipedOutputStream }
+                            .getOrNull()
+                        if (pipeOut != null) break
+                    }
+                }
+                cls = cls.superclass
+            }
+            val out = pipeOut ?: run {
+                Log.w(TAG, "voiceRecord: silk pipe field not found (SilkCodecWrapper runtime fields)")
+                return@runCatching null
+            }
+            val readMethod = silkClass.getMethod(
+                "read",
+                ByteArray::class.java,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+            )
+            val frameIn = 640 // 16000Hz × 20ms × 2B(PCM16 mono)
+            val frameOut = ByteArray(4096)
+            val silkData = java.io.ByteArrayOutputStream()
+            var offset = 0
+            while (offset < pcm.size) {
+                val len = minOf(frameIn, pcm.size - offset)
+                val chunk = ByteArray(frameIn)
+                System.arraycopy(pcm, offset, chunk, 0, len)
+                if (len < frameIn) {
+                    java.util.Arrays.fill(chunk, len, frameIn, 0.toByte())
+                }
+                runCatching { out.write(chunk, 0, frameIn) }.getOrElse { t ->
+                    Log.w(
+                        TAG,
+                        "voiceRecord: silk pipe write failed offset=$offset: " +
+                            "${t.javaClass.simpleName} ${t.message}",
+                    )
+                    return@runCatching null
+                }
+                val n = runCatching { readMethod.invoke(silk, frameOut, 0, frameOut.size) as? Int }
+                    .getOrNull() ?: -1
+                if (n > 0) silkData.write(frameOut, 0, n)
+                offset += len
+            }
+            runCatching { out.close() }
+            runCatching { silkClass.getMethod("release").invoke(silk) }
+            val frames = silkData.toByteArray()
+            if (frames.isEmpty()) null else frames
+        }.onFailure { t ->
+            Log.w(TAG, "voiceRecord: silk encode failed: ${t.javaClass.simpleName} ${t.message}")
+        }.getOrNull() ?: return null
+        val dir = voiceRecordDir() ?: return null
+        val target = java.io.File(dir, "record_${System.currentTimeMillis()}.silk")
+        runCatching {
+            target.outputStream().use { output ->
+                output.write(byteArrayOf(2)) // 16000Hz 档位索引（QQAudioUtils.f118249a: 8000,12000,16000,...）
+                output.write("#!SILK_V3".toByteArray(Charsets.US_ASCII))
+                output.write(silkBytes)
+            }
+        }.getOrElse { t ->
+            Log.w(TAG, "voiceRecord: silk write failed: ${t.javaClass.simpleName} ${t.message}")
+            return null
+        }
+        if (!target.isFile || target.length() <= 0L) return null
+        Log.i(
+            TAG,
+            "voiceRecord: silk transcode ok pcm=${pcm.size}B frames=${silkBytes.size}B " +
+                "file=${target.length()}B path=${target.absolutePath}",
+        )
+        return target.absolutePath
+    }
+
+    /**
+     * +1（复读消息）：把被操作消息的内容重新发一条到当前会话。
+     *
+     * TIM 不支持表情回应（内核 `setMsgEmojiLikes` 在 TIM 上返回 -10122 无权限，路线已放弃），
+     * 所以这里用「重发」实现：文本类消息原样重发；其它类型把原消息转发到当前会话自身。
+     * 阻塞，需在 IO 线程调用；失败返回 false（UI 负责提示）。
+     */
+    fun sendPlusOne(chatId: String, msgId: Long): Boolean {
+        if (!isHost || chatId.isBlank() || msgId == 0L) return false
+        if (!ensureServices()) return false
+        return try {
+            val source = fetchMessagesByIds(chatId, arrayListOf(msgId))[msgId]
+            if (source == null) {
+                Log.w(TAG, "plusOne failed: source not found chat=$chatId msg=$msgId")
+                return false
+            }
+            // 表情/图片/未知元素会被映射成 "[表情]" 之类的形态占位文本，不能当普通文本重发。
+            val placeholderContents = setOf(
+                "[图片]", "[视频]", "[文件]", "[语音]", "[表情]", "[红包]", "[消息]", "[系统消息]",
+            )
+            val canRepeatAsText = source.type == ChatMessageType.TEXT &&
+                source.content.isNotBlank() &&
+                source.content !in placeholderContents
+            if (canRepeatAsText) {
+                val ok = sendTextMessage(chatId, source.content)
+                if (ok) {
+                    Log.i(TAG, "plusOne: repeat text ok chat=$chatId msg=$msgId len=${source.content.length}")
+                } else {
+                    Log.w(TAG, "plusOne failed: repeat text chat=$chatId msg=$msgId")
+                }
+                ok
+            } else {
+                // 图片/文件/语音/视频/聊天记录/红包等无法用文本表达：转发到当前会话自身实现复读。
+                val ok = forwardMessages(chatId, listOf(msgId), listOf(chatId))
+                Log.i(
+                    TAG,
+                    "plusOne: repeat via forward chat=$chatId msg=$msgId type=${source.type} " +
+                        "blank=${source.content.isBlank()} ok=$ok",
+                )
+                ok
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "plusOne failed: ${t.javaClass.simpleName} ${t.message}")
+            false
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 好友列表 / 联系人详情
+    // ---------------------------------------------------------------------
+
+    private fun letterFor(name: String): Char {
+        val first = name.trim().firstOrNull() ?: return '#'
+        return if (first in 'A'..'Z') first
+        else if (first in 'a'..'z') first.uppercaseChar()
+        else '#'
+    }
+
+    private fun seedFor(uin: Long, fallback: Int): Int =
+        if (uin != 0L) ((uin xor (uin ushr 32)).toInt() and 0x7fffffff) else fallback
+
+    /** 读取真实好友列表（阻塞，IO 线程调用）。 */
+    fun loadContacts(): List<ContactItem>? {
+        if (!isHost) return null
+        if (!ensureServices()) return null
+        var service = buddyService
+        if (service == null) {
+            val deadline = android.os.SystemClock.uptimeMillis() + 1_200L
+            while (android.os.SystemClock.uptimeMillis() < deadline && service == null) {
+                Thread.sleep(120L)
+                ensureServices()
+                service = buddyService
+            }
+        }
+        if (service == null) {
+            Log.w(TAG, "perf: loadContacts buddy service null")
+            return null
+        }
+        return try {
+            val cl = hostClassLoader() ?: return null
+            val reqTypeClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.BuddyListReqType",
+                false,
+                cl,
+            )
+            val reqType = reqTypeClass.enumConstants?.firstOrNull {
+                (it as? Enum<*>)?.name == "KNOMAL"
+            } ?: return null
+            @Suppress("UNCHECKED_CAST")
+            val categories = service.javaClass
+                .getMethod("getBuddyListFromCache", String::class.java, reqTypeClass)
+                .invoke(service, "", reqType) as? List<Any?> ?: return null
+            val uids = LinkedHashSet<String>()
+            categories.forEach { category ->
+                @Suppress("UNCHECKED_CAST")
+                val list = category?.let { invokeGetter(it, "getBuddyUids") } as? List<*>
+                list.orEmpty().forEach { uid -> (uid as? String)?.takeIf { it.isNotBlank() }?.let(uids::add) }
+            }
+            if (uids.isEmpty()) {
+                Log.w(TAG, "buddy list empty")
+                return null
+            }
+            val uidList = ArrayList(uids)
+            @Suppress("UNCHECKED_CAST")
+            val nickMap = runCatching {
+                service.javaClass
+                    .getMethod("getBuddyNick", ArrayList::class.java)
+                    .invoke(service, uidList) as? Map<*, *>
+            }.getOrNull()
+            @Suppress("UNCHECKED_CAST")
+            val remarkMap = runCatching {
+                service.javaClass
+                    .getMethod("getBuddyRemark", ArrayList::class.java)
+                    .invoke(service, uidList) as? Map<*, *>
+            }.getOrNull()
+
+            val contacts = uidList.map { uid ->
+                val nick = nickMap?.get(uid) as? String
+                val remark = remarkMap?.get(uid) as? String
+                val name = remark?.takeIf { it.isNotBlank() }
+                    ?: nick?.takeIf { it.isNotBlank() }
+                    ?: "好友"
+                val uin = uinForUid(uid)
+                ContactItem(
+                    id = "tim_friend_$uid",
+                    name = name,
+                    letter = letterFor(name),
+                    signature = "",
+                    avatarSeed = seedFor(uin, uid.hashCode() and 0x7fffffff),
+                    isOnline = false,
+                    isVip = false,
+                    avatarPath = userAvatarPath(uid, uin),
+                )
+            }.sortedWith(compareBy({ it.letter }, { it.name }))
+            loadedContacts = contacts
+            Log.i(TAG, "loadContacts: ${contacts.size} friends, avatars=${contacts.count { it.avatarPath != null }}")
+            contacts
+        } catch (t: Throwable) {
+            Log.e(TAG, "loadContacts failed: ${t.javaClass.simpleName} ${t.message}", t)
+            null
+        }
+    }
+
+    /** 读取某个好友的详情（阻塞，IO 线程调用）。 */
+    fun loadContactDetail(contactId: String): ContactDetail? {
+        if (!isHost) return null
+        if (!ensureServices()) return null
+        val uid = contactId.removePrefix("tim_friend_")
+        if (uid.isBlank()) return null
+        if (loadedContacts.isEmpty()) loadContacts()
+        var contact = loadedContacts.firstOrNull { it.id == contactId }
+
+        var nick: String? = null
+        var remark: String? = null
+        var signature: String? = null
+        var phone: String? = null
+        var email: String? = null
+        var uin = uinForUid(uid)
+        runCatching {
+            val service = profileService ?: return@runCatching
+            val uidList = ArrayList<String>().apply { add(uid) }
+            @Suppress("UNCHECKED_CAST")
+            val infos = service.javaClass
+                .getMethod("getCoreAndBaseInfo", String::class.java, ArrayList::class.java)
+                .invoke(service, "", uidList) as? Map<*, *>
+            val info = infos?.get(uid) ?: return@runCatching
+            val core = invokeGetter(info, "getCoreInfo")
+            if (core != null) {
+                nick = invokeGetter(core, "getNick") as? String
+                remark = invokeGetter(core, "getRemark") as? String
+                val coreUin = (invokeGetter(core, "getUin") as? Number)?.toLong() ?: 0L
+                if (coreUin != 0L) uin = coreUin
+            }
+            val infoUin = (invokeGetter(info, "getUin") as? Number)?.toLong() ?: 0L
+            if (uin == 0L && infoUin != 0L) uin = infoUin
+            val base = invokeGetter(info, "getBaseInfo")
+            if (base != null) {
+                signature = invokeGetter(base, "getLongNick") as? String
+                phone = invokeGetter(base, "getPhoneNum") as? String
+                email = invokeGetter(base, "getEMail") as? String
+            }
+        }
+        val displayName = remark?.takeIf { it.isNotBlank() }
+            ?: nick?.takeIf { it.isNotBlank() }
+            ?: contact?.name
+            ?: "好友"
+        val avatar = contact?.avatarPath ?: userAvatarPath(uid, uin)
+        if (contact == null) {
+            contact = ContactItem(
+                id = contactId,
+                name = displayName,
+                letter = letterFor(displayName),
+                avatarSeed = seedFor(uin, uid.hashCode() and 0x7fffffff),
+                avatarPath = avatar,
+            )
+        } else if (contact.name != displayName) {
+            contact = contact.copy(name = displayName, letter = letterFor(displayName))
+        }
+        if (!signature.isNullOrBlank()) {
+            contact = contact.copy(signature = signature.orEmpty())
+        }
+        val chatId = ensureChatForUid(uid, displayName, avatar, uin)
+        return ContactDetail(
+            contact = contact,
+            timId = if (uin != 0L) uin.toString() else uid,
+            remark = remark.orEmpty(),
+            phone = phone.orEmpty(),
+            email = email.orEmpty(),
+            region = "",
+            tags = emptyList(),
+            chatId = chatId,
+        )
+    }
+
+    /** 联系人详情点「发消息」：优先复用已有最近会话，否则合成一个 c2c 会话并缓存 Contact。 */
+    private fun ensureChatForUid(uid: String, name: String, avatarPath: String?, uin: Long): String {
+        chatMeta.entries.firstOrNull { it.value.chatType == 1 && it.value.peerUid == uid }?.let {
+            return it.key
+        }
+        val chatId = "tim_1_$uid"
+        val meta = ChatMeta(1, uid, uin, name, false)
+        cacheContact(chatId, meta)
+        com.material3tim.data.repository.LiveChats.upsert(
+            ChatItem(
+                id = chatId,
+                name = name,
+                lastMessage = "",
+                timeLabel = "",
+                avatarSeed = seedFor(uin, uid.hashCode() and 0x7fffffff),
+                avatarPath = avatarPath,
+            ),
+        )
+        return chatId
+    }
+
+    // ---------------------------------------------------------------------
+    // 统一「用户资料」：按聊天上下文拉任意用户（含非好友/群成员）
+    // ---------------------------------------------------------------------
+
+    /** uin → uid（内核 ProfileService.getUidByUin）。 */
+    private fun uidByUin(uin: Long): String? {
+        if (uin == 0L) return null
+        val service = profileService ?: return null
+        return runCatching {
+            @Suppress("UNCHECKED_CAST")
+            val map = service.javaClass
+                .getMethod("getUidByUin", String::class.java, ArrayList::class.java)
+                .invoke(service, "", ArrayList<Long>().apply { add(uin) }) as? Map<*, *>
+            map?.entries?.firstOrNull { (it.key as? Number)?.toLong() == uin }?.value as? String
+        }.getOrNull()?.takeIf { it.isNotBlank() }
+    }
+
+    /**
+     * 统一用户资料：聊天里点头像进入（群成员/私聊对方，含非好友）。
+     * [chatId] 用于判断群上下文（群角色/群名片/目标成员）；[uid]/[uin] 二选一可用。
+     * 返回：联系人展示信息 + 好友关系 + 我在该群的角色 + 目标群成员信息。失败返回 null。
+     */
+    fun loadUserProfile(chatId: String, uid: String, uin: String): UserProfile? {
+        if (!isHost) return null
+        if (!ensureServices()) return null
+        val started = android.os.SystemClock.uptimeMillis()
+        return try {
+            val cleanUid = uid.trim()
+            val cleanUinText = uin.trim().filter { it.isDigit() }
+            if (cleanUid.isBlank() && cleanUinText.isBlank()) {
+                Log.w(TAG, "userProfile: skip chat=$chatId (uid/uin both empty)")
+                return null
+            }
+            if (profileService == null) {
+                val deadline = android.os.SystemClock.uptimeMillis() + 800L
+                while (android.os.SystemClock.uptimeMillis() < deadline && profileService == null) {
+                    Thread.sleep(100L)
+                    ensureServices()
+                }
+            }
+            val isGroupChat = chatMeta[chatId]?.isGroup == true || chatId.startsWith("tim_2_")
+            val groupCode = if (isGroupChat) {
+                groupCodeFor(chatId) ?: chatId.split('_').getOrNull(2)?.toLongOrNull() ?: 0L
+            } else {
+                0L
+            }
+            var myRole: GroupMemberRole? = null
+            var targetMember: ChatMember? = null
+            if (isGroupChat && groupCode != 0L) {
+                // 快路径：只读群成员缓存（毫秒级）；缺失/过期时后台 getAllMemberListV2 刷新，
+                // 完成后 emit DataUpdate(MEMBERS)，UI 局部刷新即可拿到角色/群名片。
+                val membersStarted = perfUptime()
+                val members = groupMembersFast(groupCode)
+                Log.i(
+                    TAG,
+                    "perf: userProfile members fast group=$groupCode size=${members.size} " +
+                        "ms=${perfUptime() - membersStarted}",
+                )
+                val me = members.firstOrNull { it.isMe }
+                myRole = when {
+                    me == null -> null
+                    me.isOwner -> GroupMemberRole.OWNER
+                    me.isAdmin -> GroupMemberRole.ADMIN
+                    else -> GroupMemberRole.MEMBER
+                }
+                targetMember = members.firstOrNull { member ->
+                    (cleanUid.isNotBlank() && member.uid == cleanUid) ||
+                        (cleanUinText.isNotBlank() && member.uin == cleanUinText)
+                }
+            }
+            var targetUid = cleanUid.ifBlank { targetMember?.uid.orEmpty() }
+            var targetUin = cleanUinText.toLongOrNull() ?: 0L
+            if (targetUin == 0L) targetUin = targetMember?.uin?.toLongOrNull() ?: 0L
+            if (targetUid.isBlank() && targetUin != 0L) {
+                targetUid = uidByUin(targetUin).orEmpty()
+            }
+            if (targetUid.isBlank()) {
+                Log.w(
+                    TAG,
+                    "userProfile: failed chat=$chatId (uid unresolved, uin=$targetUin " +
+                        "member=${targetMember?.name})",
+                )
+                return null
+            }
+            if (targetUin == 0L) {
+                targetUin = runCatching { uinForUid(targetUid) }.getOrDefault(0L)
+            }
+            // 内核资料：昵称/备注/签名/QQ号 + isBuddy（好友关系首选来源）。
+            var nick: String? = null
+            var remark: String? = null
+            var signature = ""
+            var kernelIsBuddy = false
+            runCatching {
+                val service = profileService ?: return@runCatching
+                @Suppress("UNCHECKED_CAST")
+                val infos = service.javaClass
+                    .getMethod("getCoreAndBaseInfo", String::class.java, ArrayList::class.java)
+                    .invoke(service, "", ArrayList<String>().apply { add(targetUid) }) as? Map<*, *>
+                val info = infos?.get(targetUid)
+                if (info != null) {
+                    val core = invokeGetter(info, "getCoreInfo")
+                    if (core != null) {
+                        nick = (invokeGetter(core, "getNick") as? String)?.takeIf { it.isNotBlank() }
+                        remark = (invokeGetter(core, "getRemark") as? String)?.takeIf { it.isNotBlank() }
+                        (invokeGetter(core, "getUin") as? Number)?.toLong()?.takeIf { it != 0L }
+                            ?.let { targetUin = it }
+                    }
+                    val base = invokeGetter(info, "getBaseInfo")
+                    if (base != null) {
+                        signature = (invokeGetter(base, "getLongNick") as? String).orEmpty()
+                    }
+                    kernelIsBuddy = (invokeGetter(info, "getIsBuddy") as? Boolean) == true
+                }
+            }.onFailure {
+                Log.w(TAG, "userProfile: profileService failed uid=$targetUid: ${it.javaClass.simpleName} ${it.message}")
+            }
+            // 好友关系：profileService.isBuddy → 内核 buddyService.isBuddy → 联系人列表。
+            var isFriend = kernelIsBuddy || (myUid != null && targetUid == myUid)
+            if (!isFriend) {
+                isFriend = runCatching {
+                    val buddy = nativeBuddyService()
+                    (buddy?.javaClass?.getMethod("isBuddy", String::class.java)
+                        ?.invoke(buddy, targetUid) as? Boolean) == true
+                }.getOrDefault(false)
+            }
+            if (!isFriend) {
+                isFriend = runCatching {
+                    loadedContacts.any { it.id == "tim_friend_$targetUid" } ||
+                        (loadedContacts.isEmpty() && loadContacts()
+                            ?.any { it.id == "tim_friend_$targetUid" } == true)
+                }.getOrDefault(false)
+            }
+            val displayName = targetMember?.name?.takeIf { it.isNotBlank() }
+                ?: remark
+                ?: nick
+                ?: (if (targetUin != 0L) targetUin.toString() else targetUid)
+            val avatar = targetMember?.avatarPath ?: userAvatarPath(targetUid, targetUin)
+            val avatarSeed = seedFor(targetUin, targetUid.hashCode() and 0x7fffffff)
+            val contact = ContactItem(
+                id = if (isFriend) "tim_friend_$targetUid" else "tim_user_$targetUid",
+                name = displayName,
+                letter = letterFor(displayName),
+                signature = signature,
+                avatarSeed = avatarSeed,
+                isOnline = false,
+                isVip = false,
+                avatarPath = avatar,
+            )
+            val profile = UserProfile(
+                name = displayName,
+                timId = if (targetUin != 0L) targetUin.toString() else targetUid,
+                signature = signature,
+                avatarSeed = avatarSeed,
+                avatarPath = avatar,
+                contact = contact,
+                isFriend = isFriend,
+                chatId = chatId.ifBlank { "tim_1_$targetUid" },
+                groupCode = if (groupCode != 0L) groupCode.toString() else "",
+                myRole = myRole,
+                targetMember = targetMember,
+            )
+            Log.i(
+                TAG,
+                "userProfile: chat=$chatId uid=$targetUid uin=$targetUin group=$groupCode " +
+                    "isFriend=$isFriend kernelBuddy=$kernelIsBuddy myRole=$myRole " +
+                    "member=${targetMember?.name} name=$displayName avatar=${avatar != null} " +
+                    "elapsedMs=${android.os.SystemClock.uptimeMillis() - started}",
+            )
+            profile
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "userProfile: failed chat=$chatId uid=$uid uin=$uin: " +
+                    "${t.javaClass.simpleName} ${t.message}",
+            )
+            null
+        }
+    }
+
+    private class MappedMessage(val message: ChatMessage, val sortTime: Long, val timeMillis: Long)
+
+    /** QQ NT MsgConstant：1=@全体，4=@我，2=@指定人（ATTYPEONE），8=@角色 等按位组合。 */
+    private const val AT_TYPE_ALL = 1
+    private const val AT_TYPE_ME = 4
+
+    /**
+     * 解析消息是否 @ 我：优先 MsgRecord.atType（MsgConstant 位：ATTYPEME=4）；
+     * 若 raw atType 为 0，再扫 TextElement.atType/atUid/atNtUid 与本机 uin/uid 比对兜底。
+     * @return (原始 atType, atMe)；@全体(bit1) 不算 atMe。
+     */
+    private fun resolveAtMe(record: Any, elements: List<*>): Pair<Int, Boolean> {
+        val rawAtType = (invokeGetter(record, "getAtType") as? Number)?.toInt() ?: 0
+        if ((rawAtType and AT_TYPE_ME) != 0) return rawAtType to true
+        if (rawAtType != 0) return rawAtType to false
+        // 兜底：TextElement.atType/atUid/atNtUid（部分消息 MsgRecord.atType 未回填）
+        val myUidValue = myUid
+        for (element in elements) {
+            element ?: continue
+            val text = invokeGetter(element, "getTextElement") ?: continue
+            val textAtType = (invokeGetter(text, "getAtType") as? Number)?.toInt() ?: 0
+            if ((textAtType and AT_TYPE_ME) != 0) return textAtType to true
+            val atUid = (invokeGetter(text, "getAtUid") as? Number)?.toLong() ?: 0L
+            if (atUid != 0L && atUid.toString() == myUin) return textAtType to true
+            val atTinyId = (invokeGetter(text, "getAtTinyId") as? Number)?.toLong() ?: 0L
+            if (atTinyId != 0L && atTinyId.toString() == myUin) return textAtType to true
+            val atNtUid = invokeGetter(text, "getAtNtUid") as? String
+            if (!atNtUid.isNullOrBlank() && myUidValue != null && atNtUid == myUidValue) {
+                return textAtType to true
+            }
+        }
+        return rawAtType to false
+    }
+
+    private fun mapMsgRecord(chatId: String, record: Any?): MappedMessage? = try {
+        if (record == null) return null
+        val meta = chatMeta[chatId]
+        val msgId = (invokeGetter(record, "getMsgId") as? Number)?.toLong() ?: 0L
+        val msgTime = (invokeGetter(record, "getMsgTime") as? Number)?.toLong() ?: 0L
+        val senderUid = invokeGetter(record, "getSenderUid") as? String ?: ""
+        val senderUin = (invokeGetter(record, "getSenderUin") as? Number)?.toLong() ?: 0L
+        val isMe = (myUid != null && senderUid == myUid) ||
+            (senderUin != 0L && senderUin.toString() == myUin)
+        val senderName = if (isMe) {
+            "我"
+        } else {
+            listOf(
+                invokeGetter(record, "getSendRemarkName") as? String,
+                invokeGetter(record, "getSendMemberName") as? String,
+                invokeGetter(record, "getSendNickName") as? String,
+                invokeGetter(record, "getPeerName") as? String,
+            ).firstOrNull { !it.isNullOrBlank() } ?: "对方"
+        }
+        val recordSeq = (invokeGetter(record, "getMsgSeq") as? Number)?.toLong() ?: 0L
+        val elements = invokeGetter(record, "getElements") as? List<*> ?: emptyList<Any?>()
+        val (rawAtType, atMe) = resolveAtMe(record, elements)
+        if (rawAtType != 0 || atMe) {
+            Log.i(
+                TAG,
+                "atMe: msg=$msgId chat=$chatId atType=$rawAtType atMe=$atMe " +
+                    "group=${meta?.isGroup == true}",
+            )
+        }
+        val (described, parts) = describeElementsWithParts(elements, msgId)
+        val replyInfo = extractReplyInfo(elements)
+        val timeMillis = if (msgTime < 10_000_000_000L) msgTime * 1000L else msgTime
+        val timeLabel = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(timeMillis))
+        val isGroup = meta?.isGroup == true
+        val senderAvatarPath = when {
+            isMe -> selfAvatarPath()
+            isGroup -> memberAvatarPath(senderUid, senderUin)
+            else -> meta?.let { chatAvatarPath(it) }
+        }
+        if (described.type == ChatMessageType.VIDEO) {
+            // 记录该视频消息所属会话上下文（聊天记录内跨会话视频播放 URL 必须用内层 peer）。
+            cacheVideoPlayContext(record, msgId)
+            if (described.imagePath == null) {
+                requestVideoThumb(chatId, msgId, described.elementId)
+            }
+        }
+        // 语音未下载（filePath 为空）：触发内核下载语音文件（TIM PttMsgItem.h2 同款请求），
+        // 下载完成后 re-loadMessages 会带上路径，气泡即可播放。
+        if (described.type == ChatMessageType.VOICE && described.mediaPath == null) {
+            requestPttDownload(record, msgId, described.elementId)
+        }
+        val message = ChatMessage(
+            id = "tim_${msgId}",
+            chatId = chatId,
+            seq = recordSeq,
+            senderName = senderName,
+            senderSeed = ((senderUin xor (senderUin ushr 32)).toInt() and 0x7fffffff),
+            isMe = isMe,
+            atMe = atMe,
+            type = described.type,
+            content = described.content,
+            timeLabel = timeLabel,
+            isRead = true,
+            voiceSeconds = described.voiceSeconds,
+            fileSize = described.fileSize,
+            showSenderName = isGroup && !isMe,
+            senderAvatarPath = senderAvatarPath,
+            imagePath = described.imagePath,
+            imageWidth = described.imageWidth,
+            imageHeight = described.imageHeight,
+            isEmojiImage = described.emojiImage,
+            mediaPath = described.mediaPath,
+            timeSeparator = null,
+            timestampMs = timeMillis,
+            chatRecordTitle = described.recordTitle,
+            chatRecordSummary = described.recordSummary,
+            chatRecordMsgId = msgId,
+            chatRecordElementId = described.recordElementId,
+            chatRecordCount = described.recordCount,
+            videoSeconds = described.videoSeconds,
+            videoThumbPath = if (described.type == ChatMessageType.VIDEO) described.imagePath else null,
+            videoPath = if (described.type == ChatMessageType.VIDEO) described.mediaPath else null,
+            elementId = described.elementId,
+            msgId = msgId,
+            downloadProgress = described.downloadProgress,
+            transferStatus = described.transferStatus,
+            arkApp = described.arkApp,
+            arkSource = described.arkSource,
+            arkTitle = described.arkTitle,
+            arkDesc = described.arkDesc,
+            arkTag = described.arkTag,
+            arkPreviewUrl = described.arkPreviewUrl,
+            arkPreviewPath = described.arkPreviewPath,
+            arkJumpUrl = described.arkJumpUrl,
+            arkPrompt = described.arkPrompt,
+            arkGroupNotice = described.arkGroupNotice,
+            redPacketBillNo = described.redPacketBillNo,
+            redPacketAuthkey = described.redPacketAuthkey,
+            redPacketChannel = described.redPacketChannel,
+            redPacketSenderUin = described.redPacketSenderUin.takeIf { it != 0L } ?: senderUin,
+            redPacketSubtitle = described.redPacketSubtitle,
+            redPacketGrabState = described.redPacketGrabState,
+            redPacketGrabbedAmount = described.redPacketGrabbedAmount,
+            redPacketStateText = described.redPacketStateText,
+            parts = parts,
+            senderUid = senderUid,
+            senderUin = if (senderUin != 0L) senderUin.toString() else "",
+            replyToMsgId = replyInfo?.msgId ?: 0L,
+            replyToSeq = replyInfo?.seq ?: 0L,
+            replyToSenderUid = replyInfo?.senderUid.orEmpty(),
+            replyToContent = replyInfo?.sourceText.orEmpty(),
+            replyToName = "",
+            hasReply = replyInfo != null,
+        )
+        MappedMessage(
+            message = message,
+            sortTime = recordSeq.takeIf { it != 0L } ?: msgId,
+            timeMillis = timeMillis,
+        )
+    } catch (t: Throwable) {
+        Log.w(TAG, "mapMsgRecord failed: ${t.javaClass.simpleName} ${t.message}")
+        null
+    }
+
+    private class ElementInfo(
+        val type: ChatMessageType,
+        val content: String,
+        val voiceSeconds: Int = 0,
+        val fileSize: String = "",
+        val imagePath: String? = null,
+        val imageWidth: Int = 0,
+        val imageHeight: Int = 0,
+        val emojiImage: Boolean = false,
+        val mediaPath: String? = null,
+        val recordTitle: String = "",
+        val recordSummary: List<String> = emptyList(),
+        val recordElementId: Long = 0L,
+        val recordCount: Int = 0,
+        val videoSeconds: Int = 0,
+        val elementId: Long = 0,
+        val downloadProgress: Int = -1,
+        val transferStatus: Int = -1,
+        val arkApp: String = "",
+        val arkSource: String = "",
+        val arkTitle: String = "",
+        val arkDesc: String = "",
+        val arkTag: String = "",
+        val arkPreviewUrl: String = "",
+        val arkPreviewPath: String? = null,
+        val arkJumpUrl: String = "",
+        val arkPrompt: String = "",
+        val redPacketBillNo: String = "",
+        val redPacketAuthkey: String = "",
+        val redPacketChannel: Int = 0,
+        val redPacketSenderUin: Long = 0L,
+        val redPacketGrabState: Int = -1,
+        val redPacketGrabbedAmount: Long = 0L,
+        val redPacketSubtitle: String = "",
+        val redPacketStateText: String = "",
+        val arkGroupNotice: Boolean = false,
+    )
+
+    // ---------------------------------------------------------------------
+    // ARK 卡片（小程序 / 结构化消息 / 分享卡片）：解析 + 预览图下载
+    // ---------------------------------------------------------------------
+
+    private fun arkIsNull(value: Any?): Boolean =
+        value == null || value === org.json.JSONObject.NULL
+
+    /** 大小写不敏感地取 JSON 字段值（兼容 JSONObject.NULL）。 */
+    private fun arkField(obj: org.json.JSONObject?, name: String): Any? {
+        if (obj == null) return null
+        runCatching { obj.opt(name) }.getOrNull()?.let { value ->
+            if (!arkIsNull(value)) return value
+        }
+        val keys = obj.keys()
+        while (keys.hasNext()) {
+            val key = keys.next()
+            if (key.equals(name, ignoreCase = true)) {
+                val value = runCatching { obj.opt(key) }.getOrNull()
+                if (!arkIsNull(value)) return value
+            }
+        }
+        return null
+    }
+
+    /** 取 JSON 文本字段（值可能是字符串/对象/数组，做容错）。 */
+    private fun arkText(obj: org.json.JSONObject?, vararg names: String): String {
+        if (obj == null) return ""
+        for (name in names) {
+            when (val value = arkField(obj, name)) {
+                null -> continue
+                is String -> if (value.isNotBlank() && value != "null") return value.trim()
+                is Number, is Boolean -> return value.toString()
+                is org.json.JSONObject ->
+                    arkText(value, "text", "title", "desc", "content", "nickname", "source", "url")
+                        .takeIf { it.isNotBlank() }?.let { return it }
+                is org.json.JSONArray -> {
+                    for (i in 0 until minOf(value.length(), 8)) {
+                        val item = value.optJSONObject(i) ?: continue
+                        arkText(item, "text", "title", "desc", "content", "url")
+                            .takeIf { it.isNotBlank() }?.let { return it }
+                    }
+                }
+            }
+        }
+        return ""
+    }
+
+    /** 取 JSON URL 字段（对象/数组时内层找 url/picUrl/preview）。 */
+    private fun arkUrl(obj: org.json.JSONObject?, vararg names: String): String {
+        if (obj == null) return ""
+        for (name in names) {
+            val value = arkField(obj, name) ?: continue
+            val candidate = when (value) {
+                is String -> value.trim()
+                is org.json.JSONObject ->
+                    arkText(value, "url", "jumpUrl", "picUrl", "preview", "icon", "src")
+                is org.json.JSONArray -> {
+                    var found = ""
+                    for (i in 0 until minOf(value.length(), 8)) {
+                        val item = value.optJSONObject(i) ?: continue
+                        found = arkText(item, "url", "jumpUrl", "picUrl", "preview", "icon", "src")
+                        if (found.isNotBlank()) break
+                    }
+                    found
+                }
+                else -> ""
+            }
+            if (candidate.isNotBlank() && candidate != "null") return candidate
+        }
+        return ""
+    }
+
+    private val arkCardFieldNames = listOf(
+        "title", "desc", "summary", "content", "preview", "picUrl", "icon", "cover",
+        "jumpUrl", "url", "qqdocurl",
+    )
+
+    private fun arkHasCardFields(obj: org.json.JSONObject): Boolean =
+        arkCardFieldNames.any { arkField(obj, it) != null }
+
+    /** 优先挑真正像卡片的对象（有标题/预览/跳转），避免选中只带 desc 的顶层 meta。 */
+    private fun arkHasPrimaryCardFields(obj: org.json.JSONObject): Boolean =
+        listOf("title", "preview", "picUrl", "jumpUrl", "qqdocurl").any { arkField(obj, it) != null }
+
+    /**
+     * 收集 meta 候选对象：meta 本身、meta 下任意一层对象（news/detail_1/card/music/video/
+     * miniapp_01/...）、meta 为 JSON 字符串时解析后的对象、JSON 数组元素。深度 <= 3。
+     */
+    private fun arkMetaCandidates(root: org.json.JSONObject): List<org.json.JSONObject> {
+        val result = ArrayList<org.json.JSONObject>()
+        fun walk(value: Any?, depth: Int) {
+            if (depth > 3 || value == null || arkIsNull(value)) return
+            when (value) {
+                is org.json.JSONObject -> {
+                    result.add(value)
+                    val keys = value.keys()
+                    while (keys.hasNext()) {
+                        val key = keys.next()
+                        walk(runCatching { value.opt(key) }.getOrNull(), depth + 1)
+                    }
+                }
+                is org.json.JSONArray -> {
+                    for (i in 0 until minOf(value.length(), 8)) {
+                        walk(runCatching { value.optJSONObject(i) }.getOrNull(), depth + 1)
+                    }
+                }
+                is String -> {
+                    val trimmed = value.trim()
+                    if (trimmed.startsWith("{")) {
+                        runCatching { org.json.JSONObject(trimmed) }.getOrNull()?.let { walk(it, depth + 1) }
+                    }
+                }
+            }
+        }
+        walk(arkField(root, "meta"), 0)
+        if (result.isEmpty()) result.add(root)
+        return result
+    }
+
+    /** prompt 形如 `[QQ小程序]哔哩哔哩` → 哔哩哔哩。 */
+    private fun arkPromptSuffix(prompt: String): String {
+        val trimmed = prompt.trim()
+        if (trimmed.isEmpty()) return ""
+        val match = Regex("^\\[([^\\]]*)\\]\\s*(.*)$").find(trimmed) ?: return ""
+        return match.groupValues[2].trim()
+    }
+
+    /** prompt 形如 `[QQ小程序]标题` → QQ小程序。 */
+    private fun arkPromptPrefix(prompt: String): String {
+        val trimmed = prompt.trim()
+        if (trimmed.isEmpty()) return ""
+        return Regex("^\\[([^\\]]*)\\]").find(trimmed)?.groupValues?.getOrNull(1)?.trim().orEmpty()
+    }
+
+    private fun arkFirstNonBlank(vararg values: String): String =
+        values.firstOrNull { it.isNotBlank() }?.trim() ?: ""
+
+    /** 来源名推断：prompt 后缀 → meta source/nickname/host.nick/desc → linkInfo.title → app 映射。 */
+    private fun arkInferSource(
+        app: String,
+        prompt: String,
+        meta: org.json.JSONObject,
+        linkTitle: String,
+        root: org.json.JSONObject,
+    ): String {
+        arkPromptSuffix(prompt).takeIf { it.isNotBlank() }?.let { return it }
+        arkText(meta, "source", "sourceName", "nickname", "nick", "hostNick", "appName")
+            .takeIf { it.isNotBlank() && it.length <= 40 }?.let { return it }
+        (arkField(meta, "host") as? org.json.JSONObject)?.let { host ->
+            arkText(host, "nick", "name").takeIf { it.isNotBlank() && it.length <= 40 }?.let { return it }
+        }
+        if (linkTitle.isNotBlank() && linkTitle.length <= 40) return linkTitle
+        Regex("^\\[([^\\]]+)\\]").find(prompt.trim())?.groupValues?.getOrNull(1)
+            ?.trim()?.takeIf { it.isNotBlank() }?.let { return it }
+        arkText(root, "desc").takeIf { it.isNotBlank() && it.length <= 40 }?.let { return it }
+        val mapped = when {
+            app.contains("miniapp", ignoreCase = true) -> "小程序"
+            app.contains("structmsg", ignoreCase = true) -> "分享"
+            app.contains("multimsg", ignoreCase = true) -> "聊天记录"
+            app.contains("mannounce", ignoreCase = true) -> "群公告"
+            app.contains("qqmusic", ignoreCase = true) -> "QQ音乐"
+            app.contains("qqvideo", ignoreCase = true) -> "腾讯视频"
+            app.contains("location", ignoreCase = true) -> "位置"
+            app.contains("contact", ignoreCase = true) -> "名片"
+            app.contains("gift", ignoreCase = true) -> "礼物"
+            app.contains("vote", ignoreCase = true) -> "投票"
+            app.contains("doc", ignoreCase = true) -> "文档"
+            else -> ""
+        }
+        if (mapped.isNotBlank()) return mapped
+        return app.substringAfterLast('.').ifBlank { "卡片" }
+    }
+
+    private fun arkNormalizeUrl(url: String): String {
+        val trimmed = url.trim()
+        if (trimmed.isEmpty()) return trimmed
+        if (trimmed.startsWith("//")) return "https:$trimmed"
+        if (trimmed.contains("://")) return trimmed
+        // ARK 里的 url 常常省略 scheme（如 m.q.qq.com/a/s/xxx 小程序通用链接），补 https 后
+        // JumpActivity 才能正确路由；b23.tv 等分享短链同理。
+        if (trimmed.contains('.') && !trimmed.contains(' ') && !trimmed.contains('\n')) {
+            return "https://$trimmed"
+        }
+        return trimmed
+    }
+
+    /**
+     * 解析 ArkElement → ElementInfo(ARK)。bytesData 是 JSON：
+     * `{app,view,desc,prompt,meta:{...}}`；meta 可能是对象或 JSON 字符串，卡片字段通常在其下一层。
+     * 解析失败返回 null（调用方回退 `[消息]`，不吞消息）。
+     */
+    /**
+     * 识别「聊天记录类 ARK」（自己发送的合并转发）：TIM 把合并转发转成
+     * `app=com.tencent.multimsg & view=contact` 的 ArkElement，meta 里是
+     * `detail{source,summary,resid,uniseq,news[].text}`（ArkMsgUtils.convertMultiStructMsgToArkMsg 构造）。
+     * 命中后映射成与「别人发的聊天记录」相同的 CHAT_RECORD 卡片字段：
+     * - title = detail.source（如「群聊的聊天记录」）
+     * - preview = detail.news[].text（每条被转发消息一行）
+     * - chatRecordMsgId 由 mapMsgRecord 用外层 msgId 填充；elementId 用 ARK 元素 id，
+     *   loadChatRecord 会按 (msgId,elementId)/(0,msgId)/(msgId,0) 等组合调用内核 getMultiMsg。
+     * - detail.uniseq 对应 TIM 的 ArkMsgUtils.appendExtraInfo（= ArkMsgItem.msgId），可作校验日志。
+     */
+    private fun describeMultiMsgArkRecord(
+        root: org.json.JSONObject,
+        app: String,
+        view: String,
+        msgId: Long,
+        elementId: Long,
+        rawData: String,
+    ): ElementInfo? {
+        val appIsMulti = app.contains("multimsg", ignoreCase = true)
+        val viewIsContact = view.isBlank() || view.equals("contact", ignoreCase = true)
+        if (!appIsMulti || !viewIsContact) return null
+        val metaRaw = arkField(root, "meta")
+        val metaObj: org.json.JSONObject? = when (metaRaw) {
+            is org.json.JSONObject -> metaRaw
+            is String -> runCatching { org.json.JSONObject(metaRaw) }.getOrNull()
+            else -> null
+        }
+        val detail = metaObj?.optJSONObject("detail")
+            ?: metaObj
+            ?: root.optJSONObject("detail")
+            ?: run {
+                if (loggedChatRecordArk.add(msgId)) {
+                    Log.w(TAG, "chatRecord: ark not mapped reason=no detail msg=$msgId app=$app")
+                }
+                return null
+            }
+        val source = detail.optString("source").trim()
+        val summary = detail.optString("summary").trim()
+        val resid = detail.optString("resid").trim()
+        val uniseq = detail.optString("uniseq").trim()
+        val previews = ArrayList<String>()
+        val news = runCatching { detail.optJSONArray("news") }.getOrNull()
+        if (news != null) {
+            for (i in 0 until news.length()) {
+                val text = news.optJSONObject(i)?.optString("text").orEmpty().trim()
+                if (text.isNotBlank() && previews.size < 6) previews.add(text)
+            }
+        }
+        if (previews.isEmpty() && summary.isNotBlank()) {
+            previews.addAll(
+                summary.split('\n')
+                    .map { it.trim() }
+                    .filter { it.isNotBlank() }
+                    .filterNot { it.contains("转发消息") || it.contains("条消息") }
+                    .take(4),
+            )
+        }
+        val title = source.ifBlank { "聊天记录" }
+        val countFromSummary = Regex("(\\d+)\\s*条").find(summary)
+            ?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+        val count = listOf(countFromSummary, previews.size).filter { it > 0 }.maxOrNull() ?: 1
+        if (loggedChatRecordArk.add(msgId)) {
+            Log.i(
+                TAG,
+                "chatRecord: ark detected msg=$msgId app=$app view=$view resid=${resid.take(40)} " +
+                    "uniseq=${uniseq.take(24)} source=${title.take(40)} news=${previews.size} " +
+                    "count=$count type=CHAT_RECORD raw=${rawData.take(800)}",
+            )
+        }
+        return ElementInfo(
+            type = ChatMessageType.CHAT_RECORD,
+            content = title,
+            recordTitle = title,
+            recordSummary = previews.take(4),
+            recordElementId = elementId,
+            recordCount = count,
+            elementId = elementId,
+        )
+    }
+
+    /**
+     * ARK 文本字段 base64 兜底解码：
+     * TIM 自己发的「群公告」ARK 的 title/summary 可能是 base64（如「群公告」→ `576k5YWs5ZGK`）。
+     * 严格规则（避免误伤正常英文/数字）：
+     * - 长度 >= 8 且为 4 的倍数、仅含 [A-Za-z0-9+/=]；
+     * - 解码必须是合法 UTF-8（无 \uFFFD）且全部可打印/中文；
+     * - 解码结果含 CJK 才替换；非 CJK 时仅当原串带 '=' 且解码结果含空格/标点才替换。
+     */
+    private fun arkDecodeText(raw: String, field: String, msgId: Long): String {
+        val value = raw.trim()
+        if (value.isEmpty()) return raw
+        if (value.length < 8 || value.length % 4 != 0) return raw
+        if (!Regex("^[A-Za-z0-9+/=]+$").matches(value)) return raw
+        val decoded = runCatching {
+            String(android.util.Base64.decode(value, android.util.Base64.DEFAULT), Charsets.UTF_8)
+        }.getOrNull() ?: return raw
+        if (decoded.isEmpty() || decoded.contains('\uFFFD')) return raw
+        val printable = decoded.all { ch ->
+            ch == '\n' || ch == '\r' || ch == '\t' || ch.code in 0x20..0x7E ||
+                ch.code in 0x3000..0x9FFF || ch.code in 0xFF00..0xFFEF
+        }
+        if (!printable) return raw
+        val hasCjk = decoded.any { ch ->
+            ch.code in 0x4E00..0x9FFF || ch.code in 0x3000..0x303F || ch.code in 0xFF00..0xFFEF
+        }
+        val hasLetters = decoded.any { it.isLetterOrDigit() }
+        val hasSpaceLike = decoded.any { it == ' ' || it == '\n' || it == '，' || it == '。' || it == ':' || it == '：' }
+        if (!hasCjk && !(value.contains('=') && hasSpaceLike && hasLetters)) return raw
+        val key = "$msgId|$field|${value.take(80)}"
+        if (loggedArkBase64.add(key)) {
+            Log.i(
+                TAG,
+                "ark: base64 decoded field=$field msg=$msgId raw=${value.take(60)} " +
+                    "decoded=${decoded.replace('\n', ' ').take(80)}",
+            )
+        }
+        return decoded
+    }
+
+    private fun describeArkElement(ark: Any, msgId: Long, elementId: Long): ElementInfo? {
+        val rawData = when (val bytes = invokeGetter(ark, "getBytesData")) {
+            is String -> bytes
+            is ByteArray -> String(bytes, Charsets.UTF_8)
+            else -> ""
+        }
+        if (rawData.isBlank()) {
+            Log.w(TAG, "ark element: empty bytesData msg=$msgId elem=$elementId")
+            return null
+        }
+        val root = runCatching { org.json.JSONObject(rawData) }.getOrNull() ?: run {
+            Log.w(TAG, "ark element: bytesData not JSON msg=$msgId data=${rawData.take(500)}")
+            return null
+        }
+        val app = arkText(root, "app").ifBlank { arkText(root, "appid") }
+        val arkView = arkText(root, "view")
+        // 自己发送的聊天记录：TIM 侧是 com.tencent.multimsg/contact 的 ARK，统一映射成 CHAT_RECORD 卡片。
+        val chatRecordInfo = runCatching {
+            describeMultiMsgArkRecord(root, app, arkView, msgId, elementId, rawData)
+        }.onFailure {
+            Log.w(
+                TAG,
+                "chatRecord: ark parse failed msg=$msgId: ${it.javaClass.simpleName} ${it.message}",
+            )
+        }.getOrNull()
+        if (chatRecordInfo != null) return chatRecordInfo
+        if (app.isNotBlank() && loggedArkRawApps.add(app)) {
+            // 每个 app 首次打完整（截断 2000 字符）JSON，便于真机对照真实结构修 fallback。
+            Log.i(TAG, "ark element raw: app=$app msg=$msgId data=${rawData.take(2000)}")
+        }
+        val candidates = arkMetaCandidates(root)
+        val meta = candidates.firstOrNull { arkHasPrimaryCardFields(it) }
+            ?: candidates.firstOrNull { arkHasCardFields(it) }
+            ?: candidates.first()
+        // linkInfo fallback（JSON meta 缺字段时）
+        val linkInfo = invokeGetter(ark, "getLinkInfo")
+        // 群公告等 ARK 的文本字段可能是 base64（如「群公告」→ 576k5YWs5ZGK），统一做严格解码兜底。
+        val linkTitle = arkDecodeText(
+            (linkInfo?.let { invokeGetter(it, "getTitle") } as? String)?.trim().orEmpty(),
+            "linkTitle",
+            msgId,
+        )
+        val linkDesc = arkDecodeText(
+            (linkInfo?.let { invokeGetter(it, "getDesc") } as? String)?.trim().orEmpty(),
+            "linkDesc",
+            msgId,
+        )
+        val linkIcon = (linkInfo?.let { invokeGetter(it, "getIcon") } as? String)?.trim().orEmpty()
+        val prompt = arkDecodeText(arkText(root, "prompt"), "prompt", msgId)
+        val promptSuffix = arkPromptSuffix(prompt)
+        val metaTitleRaw = arkDecodeText(arkText(meta, "title", "appName", "name"), "title", msgId)
+        val metaDescRaw = arkDecodeText(
+            arkText(meta, "desc", "summary", "content", "description", "subtitle"),
+            "summary",
+            msgId,
+        )
+        // 小程序卡片（miniapp）：meta.title 通常是品牌/应用名（如「哔哩哔哩」），
+        // meta.desc 才是内容标题；与 structmsg 等「title=内容标题」的语义相反，需要换位。
+        val miniAppBrand = if (app.contains("miniapp", ignoreCase = true)) {
+            metaTitleRaw.takeIf { it.isNotBlank() && it.length <= 12 && metaDescRaw.length > it.length }
+        } else {
+            null
+        }
+        val title = if (miniAppBrand != null) {
+            arkFirstNonBlank(metaDescRaw, metaTitleRaw, linkTitle, promptSuffix, "卡片")
+        } else {
+            arkFirstNonBlank(
+                metaTitleRaw,
+                linkTitle,
+                promptSuffix,
+                prompt.replace("[", "").replace("]", ""),
+                "卡片",
+            )
+        }
+        val desc = if (miniAppBrand != null) {
+            ""
+        } else {
+            arkFirstNonBlank(metaDescRaw, linkDesc)
+        }
+        val previewUrl = arkNormalizeUrl(
+            arkFirstNonBlank(
+                arkUrl(
+                    meta,
+                    "preview", "previewUrl", "picUrl", "pic", "icon", "cover", "coverUrl",
+                    "image", "thumbUrl", "thumb",
+                ),
+                linkIcon,
+            ),
+        )
+        val jumpUrl = arkNormalizeUrl(
+            arkFirstNonBlank(
+                arkUrl(
+                    meta,
+                    "jumpUrl", "jump_url", "qqdocurl", "actionUrl", "webUrl", "link", "url",
+                ),
+                arkUrl(root, "url", "sourceUrl"),
+            ),
+        )
+        val tag = arkDecodeText(arkText(meta, "tag", "tagName", "label", "badge"), "tag", msgId).take(20)
+        val promptPrefix = arkPromptPrefix(prompt)
+        val source = arkDecodeText(
+            if (miniAppBrand != null) {
+                miniAppBrand
+            } else {
+                arkInferSource(app, prompt, meta, linkTitle, root)
+            },
+            "source",
+            msgId,
+        )
+        // 群公告 ARK：app/source/标题等含 announce/notice/bulletin 或「群公告」。
+        val groupNoticeCard = listOf(app, source, title, desc, tag).any { text ->
+            text.contains("公告") ||
+                text.contains("announce", ignoreCase = true) ||
+                text.contains("notice", ignoreCase = true) ||
+                text.contains("bulletin", ignoreCase = true)
+        }
+        var feedsId = ""
+        if (groupNoticeCard) {
+            feedsId = Regex("(?i)(?:feeds?_?id|fid)=([A-Za-z0-9_-]{4,})")
+                .find(jumpUrl)
+                ?.groupValues
+                ?.getOrNull(1)
+                .orEmpty()
+            if (loggedArkGroupNotice.add(msgId)) {
+                Log.i(
+                    TAG,
+                    "ark: group notice card msg=$msgId app=$app source=${source.take(40)} " +
+                        "title=${title.take(40)} desc=${desc.take(40)} jump=${jumpUrl.take(160)} " +
+                        "feedsId=$feedsId raw=${rawData.take(800)}",
+                )
+            }
+        }
+        // 小程序页脚显示类别（QQ小程序），避免与标题重复。
+        val promptDisplay = if (miniAppBrand != null && promptPrefix.isNotBlank()) promptPrefix else prompt
+        val previewPath = arkPreviewPath(previewUrl)
+        Log.i(
+            TAG,
+            "ark element: app=$app view=${arkText(root, "view")} title=${title.take(80)} " +
+                "desc=${desc.take(80)} preview=${previewUrl.take(120)} " +
+                "previewPath=${previewPath?.take(120)} jump=${jumpUrl.take(120)} " +
+                "source=${source.take(40)} tag=$tag prompt=${prompt.take(60)}",
+        )
+        return ElementInfo(
+            type = ChatMessageType.ARK,
+            content = prompt.ifBlank { "[卡片]" },
+            elementId = elementId,
+            arkApp = app,
+            arkSource = source,
+            arkTitle = title,
+            arkDesc = desc,
+            arkTag = tag,
+            arkPreviewUrl = previewUrl,
+            arkPreviewPath = previewPath,
+            arkJumpUrl = jumpUrl,
+            arkPrompt = promptDisplay,
+            arkGroupNotice = groupNoticeCard,
+        )
+    }
+
+    private fun arkCacheDir(context: Context): java.io.File =
+        java.io.File(context.cacheDir, "m3tim_ark")
+
+    private fun arkMd5(input: String): String = java.security.MessageDigest.getInstance("MD5")
+        .digest(input.toByteArray(Charsets.UTF_8))
+        .joinToString("") { "%02x".format(it) }
+
+    /**
+     * ARK 预览图：命中缓存直接返回本地路径；未命中则起后台线程下载（HttpURLConnection，
+     * UA=手机浏览器，connect/read 4s，限制 3MB，存 cacheDir/m3tim_ark/<md5>.<ext>）。
+     * 下载是异步的，本次返回 null，下一次 loadMessages 轮询时命中缓存。
+     */
+    private fun arkPreviewPath(url: String): String? {
+        if (url.isBlank()) return null
+        if (!url.startsWith("http", ignoreCase = true)) return null
+        arkPreviewCache[url]?.takeIf { pathUsable(it) }?.let { return it }
+        val context = appContext() ?: return null
+        val target = java.io.File(arkCacheDir(context), "${arkMd5(url)}.${extForUrl(url)}")
+        if (target.isFile && target.length() > 0L) {
+            arkPreviewCache[url] = target.absolutePath
+            return target.absolutePath
+        }
+        if (!arkPreviewRequested.add(url)) return null
+        target.parentFile?.mkdirs()
+        Log.i(TAG, "ark preview download: ${url.take(120)} -> ${target.name}")
+        Thread {
+            try {
+                val connection = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+                connection.connectTimeout = 4_000
+                connection.readTimeout = 4_000
+                connection.instanceFollowRedirects = true
+                connection.setRequestProperty(
+                    "User-Agent",
+                    "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 (KHTML, like Gecko) " +
+                        "Version/4.0 Chrome/126.0 Mobile Safari/537.36",
+                )
+                connection.inputStream.use { input ->
+                    java.io.FileOutputStream(target).use { output ->
+                        val buffer = ByteArray(8192)
+                        var total = 0L
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read <= 0) break
+                            total += read
+                            if (total > 3L * 1024 * 1024) {
+                                throw IllegalStateException("ark preview exceeds 3MB")
+                            }
+                            output.write(buffer, 0, read)
+                        }
+                    }
+                }
+                connection.disconnect()
+                if (target.length() > 0L) {
+                    arkPreviewCache[url] = target.absolutePath
+                    Log.i(
+                        TAG,
+                        "ark preview downloaded: ${target.absolutePath} (${target.length()}B) " +
+                            "for ${url.take(100)}",
+                    )
+                } else {
+                    target.delete()
+                    arkPreviewRequested.remove(url)
+                }
+            } catch (t: Throwable) {
+                Log.w(
+                    TAG,
+                    "ark preview download failed: ${url.take(100)} " +
+                        "${t.javaClass.simpleName} ${t.message}",
+                )
+                target.delete()
+                arkPreviewRequested.remove(url)
+            }
+        }.start()
+        return null
+    }
+
+    // ---------------------------------------------------------------------
+    // 红包消息（WalletElement，elementType=9）
+    // ---------------------------------------------------------------------
+
+    private fun walletAioText(aio: Any?, getter: String): String =
+        (aio?.let { invokeGetter(it, getter) } as? String)?.trim().orEmpty()
+
+    /**
+     * 解析 WalletElement → ElementInfo(RED_PACKET)。
+     * 字段日志（每个消息首次）用于真机核对标题/祝福语映射：
+     * name / sender.title / sender.subTitle / receiver.title / billNo / authkey / channel /
+     * sendUin / grabState / grabbedAmount / msgType / redType / envelopeId。
+     * 解析失败（billNo 与 authkey 都空）返回 null，由调用方回退 `[消息]`。
+     */
+    /** 红包状态文案缓存：listId → 「已领取」/「已领完」/…（TIM 本地钱包缓存）。 */
+    private val redPacketStateCache = ConcurrentHashMap<String, String>()
+    private val redPacketStateRequested = java.util.Collections.newSetFromMap(
+        ConcurrentHashMap<String, Boolean>(),
+    )
+
+    /** TIM 本地缓存的红包状态文案（已领取/已领完/…）；未命中时异步查询，下次 reload 生效。 */
+    private fun redPacketStateText(listId: String): String {
+        if (listId.isBlank()) return ""
+        redPacketStateCache[listId]?.let { return it }
+        // 同步快查（部分 TIM 版本有本地缓存可立即返回）。
+        val sync = runCatching {
+            val cl = hostClassLoader() ?: return ""
+            val apiClass = Class.forName(
+                "com.tencent.mobileqq.qwallet.api.INewQWalletApi", false, cl,
+            )
+            val api = Class.forName("com.tencent.mobileqq.qroute.QRoute", false, cl)
+                .getMethod("api", Class::class.java).invoke(null, apiClass) ?: return ""
+            val method = apiClass.methods.firstOrNull {
+                it.name == "getHbStateText" && it.parameterCount == 1
+            } ?: return ""
+            (method.invoke(api, listId) as? String)?.trim().orEmpty()
+        }.getOrNull().orEmpty()
+        if (sync.isNotBlank()) {
+            redPacketStateCache[listId] = sync
+            return sync
+        }
+        if (redPacketStateRequested.add(listId)) {
+            requestRedPacketStateAsync(listId)
+        }
+        return ""
+    }
+
+    /** 异步查 TIM 红包状态（getHbStateAsync(listId, Function1<String, Unit>)），回调写入缓存。 */
+    private fun requestRedPacketStateAsync(listId: String) {
+        runCatching {
+            val cl = hostClassLoader() ?: return
+            val apiClass = Class.forName(
+                "com.tencent.mobileqq.qwallet.api.INewQWalletApi", false, cl,
+            )
+            val api = Class.forName("com.tencent.mobileqq.qroute.QRoute", false, cl)
+                .getMethod("api", Class::class.java).invoke(null, apiClass) ?: return
+            val method = apiClass.methods.firstOrNull {
+                it.name == "getHbStateAsync" && it.parameterCount == 2
+            } ?: return
+            val function1Class = method.parameterTypes[1]
+            val callback = java.lang.reflect.Proxy.newProxyInstance(
+                function1Class.classLoader,
+                arrayOf(function1Class),
+            ) { _, m, args ->
+                if (m.name == "invoke") {
+                    val text = (args?.firstOrNull() as? String)?.trim().orEmpty()
+                    if (text.isNotEmpty()) {
+                        redPacketStateCache[listId] = text
+                        Log.i(TAG, "red packet state: listId=${listId.take(40)} text=$text")
+                    }
+                }
+                null
+            }
+            mainHandler.post {
+                runCatching { method.invoke(api, listId, callback) }
+                    .onFailure { Log.w(TAG, "redPacketState: invoke failed: ${it.message}") }
+            }
+        }.onFailure { Log.w(TAG, "redPacketState: query failed: ${it.message}") }
+    }
+
+    private fun describeWalletElement(wallet: Any, msgId: Long, elementId: Long): ElementInfo? {
+        val name = (invokeGetter(wallet, "getName") as? String)?.trim().orEmpty()
+        val billNo = (invokeGetter(wallet, "getBillNo") as? String)?.trim().orEmpty()
+        val stateText = redPacketStateText(billNo)
+        val authkey = (invokeGetter(wallet, "getAuthkey") as? String)?.trim().orEmpty()
+        val redChannel = (invokeGetter(wallet, "getRedChannel") as? Number)?.toInt() ?: 0
+        val sendUin = (invokeGetter(wallet, "getSendUin") as? Number)?.toLong() ?: 0L
+        val grabState = (invokeGetter(wallet, "getGrabState") as? Number)?.toInt() ?: -1
+        val grabbedAmount = (invokeGetter(wallet, "getGrabbedAmount") as? Number)?.toLong() ?: 0L
+        val msgType = (invokeGetter(wallet, "getMsgType") as? Number)?.toInt() ?: 0
+        val redType = (invokeGetter(wallet, "getRedType") as? Number)?.toInt() ?: 0
+        val envelopeId = (invokeGetter(wallet, "getEnvelopeId") as? Number)?.toInt() ?: 0
+        val channelId = (invokeGetter(wallet, "getChannelId") as? Number)?.toInt() ?: 0
+        val sessiontype = (invokeGetter(wallet, "getSessiontype") as? Number)?.toInt() ?: 0
+        val confType = (invokeGetter(wallet, "getConfType") as? Number)?.toInt() ?: 0
+        val sender = invokeGetter(wallet, "getSender")
+        val receiver = invokeGetter(wallet, "getReceiver")
+        val senderTitle = walletAioText(sender, "getTitle")
+        val senderSubTitle = walletAioText(sender, "getSubTitle")
+        val senderContent = walletAioText(sender, "getContent")
+        val receiverTitle = walletAioText(receiver, "getTitle")
+        val receiverSubTitle = walletAioText(receiver, "getSubTitle")
+        val logKey = "$msgId:$elementId"
+        if (loggedWalletElements.add(logKey)) {
+            Log.i(
+                TAG,
+                "wallet element: msg=$msgId elem=$elementId name=$name " +
+                    "sender.title=$senderTitle sender.subTitle=$senderSubTitle " +
+                    "sender.content=$senderContent receiver.title=$receiverTitle " +
+                    "receiver.subTitle=$receiverSubTitle billNo=${billNo.take(40)} " +
+                    "authkey=${authkey.take(24)} channel=$redChannel sendUin=$sendUin " +
+                    "grabState=$grabState grabbedAmount=$grabbedAmount msgType=$msgType " +
+                    "redType=$redType envelopeId=$envelopeId channelId=$channelId " +
+                    "sessiontype=$sessiontype confType=$confType stateText=$stateText",
+            )
+        }
+        if (billNo.isBlank() && authkey.isBlank()) {
+            Log.w(TAG, "wallet element: empty billNo/authkey msg=$msgId elem=$elementId")
+            return null
+        }
+        // 标题：TIM 红包卡片主标题来自 receiver.title（如「大吉大利」），receiver.subTitle
+        // 是「赶紧点击拆开吧」类提示；name/sender 字段多为空，按此优先级兜底。
+        val content = arkFirstNonBlank(receiverTitle, name, senderTitle, senderContent, "[红包]")
+        val subtitle = listOf(receiverSubTitle, senderSubTitle, senderTitle, name)
+            .map { it.trim() }
+            .firstOrNull { it.isNotBlank() && it != content && it != "[红包]" }
+            .orEmpty()
+        return ElementInfo(
+            type = ChatMessageType.RED_PACKET,
+            content = content,
+            elementId = elementId,
+            redPacketBillNo = billNo,
+            redPacketAuthkey = authkey,
+            redPacketChannel = redChannel,
+            redPacketSenderUin = sendUin,
+            redPacketGrabState = grabState,
+            redPacketGrabbedAmount = grabbedAmount,
+            redPacketSubtitle = subtitle,
+            redPacketStateText = stateText,
+        )
+    }
+
+    /** 当前账号 uin（红包 PayBridge json 的 userId/groupId 用）。优先内核初始化时缓存的 myUin。 */
+    private fun currentWalletUin(): String {
+        myUin?.takeIf { it.isNotBlank() }?.let { return it }
+        return runCatching {
+            val cl = hostClassLoader() ?: return@runCatching ""
+            val mobileQQ = Class.forName("mqq.app.MobileQQ", false, cl)
+                .getField("sMobileQQ").get(null) ?: return@runCatching ""
+            val runtime = mobileQQ.javaClass.getMethod("peekAppRuntime").invoke(mobileQQ)
+                ?: return@runCatching ""
+            runtime.javaClass.getMethod("getCurrentAccountUin").invoke(runtime) as? String ?: ""
+        }.getOrNull().orEmpty()
+    }
+
+    /** 当前账号昵称：QRoute IQWalletNickNameApi.getCurrentNickName(null)，失败退化 uin。 */
+    private fun currentWalletNickName(): String = runCatching {
+        val cl = hostClassLoader() ?: return@runCatching ""
+        val apiClass = Class.forName(
+            "com.tencent.mobileqq.qwallet.api.IQWalletNickNameApi", false, cl,
+        )
+        val api = Class.forName("com.tencent.mobileqq.qroute.QRoute", false, cl)
+            .getMethod("api", Class::class.java)
+            .invoke(null, apiClass) ?: return@runCatching ""
+        val method = apiClass.methods.firstOrNull {
+            it.name == "getCurrentNickName" && it.parameterCount == 1
+        } ?: return@runCatching ""
+        method.invoke(api, null) as? String ?: ""
+    }.getOrNull().orEmpty()
+
+    private fun unescapeXml(value: String): String = value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#10;", "\n")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+
+    /**
+     * 灰条消息（群主撤回/成员加入/签到提示等）转成纯文本：优先 JSON 灰条的可读摘要，
+     * 其次走 TIM 自己的 JsonGrayTipsUtils 解码，最后按 RevokeElement 字段拼装。
+     */
+    private fun grayTipText(gray: Any?): String {
+        if (gray == null) return "[系统消息]"
+        // 1) JSON 灰条：recentAbstract 通常就是一句可读摘要
+        val json = invokeGetter(gray, "getJsonGrayTipElement")
+        if (json != null) {
+            (invokeGetter(json, "getRecentAbstract") as? String)
+                ?.takeIf { it.isNotBlank() }
+                ?.let { return it }
+            val decoded = runCatching {
+                val cl = hostClassLoader() ?: return@runCatching null
+                val utilClass = Class.forName("com.tencent.qqnt.graytips.JsonGrayTipsUtils", false, cl)
+                val util = utilClass.getField("f180397b").get(null) ?: return@runCatching null
+                val obj = utilClass.methods
+                    .firstOrNull { it.name == "d" && it.parameterCount == 1 }
+                    ?.invoke(util, json)
+                obj?.let { invokeGetter(it, "c") as? CharSequence }?.toString()
+            }.getOrNull()
+            if (!decoded.isNullOrBlank()) return decoded
+        }
+        // 2) 撤回灰条
+        val revoke = invokeGetter(gray, "getRevokeElement")
+        if (revoke != null) {
+            val wording = invokeGetter(revoke, "getWording") as? String
+            val opNick = (invokeGetter(revoke, "getOperatorNick") as? String)
+                ?.takeIf { it.isNotBlank() }
+                ?: (invokeGetter(revoke, "getOperatorRemark") as? String)?.takeIf { it.isNotBlank() }
+            val senderNick = (invokeGetter(revoke, "getOrigMsgSenderNick") as? String)
+                ?.takeIf { it.isNotBlank() }
+            val role = (invokeGetter(revoke, "getOperatorRole") as? Number)?.toInt() ?: 0
+            if (!wording.isNullOrBlank() && wording.contains("撤回")) return wording
+            if (!opNick.isNullOrBlank()) {
+                val selfOperate = (invokeGetter(revoke, "getIsSelfOperate") as? Boolean) ?: false
+                val samePerson = senderNick.isNullOrBlank() || senderNick == opNick || selfOperate
+                return when {
+                    samePerson -> "$opNick 撤回了一条消息"
+                    role == 1 -> "群主 $opNick 撤回了一条成员消息"
+                    role == 2 -> "管理员 $opNick 撤回了一条成员消息"
+                    else -> "$opNick 撤回了一条成员消息"
+                }
+            }
+            if (!wording.isNullOrBlank()) return wording
+            return "有一条消息被撤回"
+        }
+        // 3) 群灰条（成员加入/退出等）
+        val group = invokeGetter(gray, "getGroupElement")
+        if (group != null) {
+            val member = (invokeGetter(group, "getMemberNick") as? String)
+                ?.takeIf { it.isNotBlank() }
+            val sub = (invokeGetter(gray, "getSubElementType") as? Number)?.toInt() ?: 0
+            if (!member.isNullOrBlank()) {
+                return when (sub) {
+                    3, 4 -> "$member 加入了群聊"
+                    5, 6 -> "$member 退出了群聊"
+                    else -> "$member 更新了群资料"
+                }
+            }
+        }
+        // 4) XML 灰条等暂不支持
+        return "[系统消息]"
+    }
+
+    private class ReplyInfo(
+        val msgId: Long,
+        val seq: Long,
+        val senderUid: String,
+        val sourceText: String,
+        val revoked: Boolean,
+        val expired: Boolean,
+        val replyTime: Long,
+    )
+
+    /** 从消息元素里提取引用（回复）信息：elementType=7 的 ReplyElement。 */
+    private fun extractReplyInfo(elements: List<*>): ReplyInfo? {
+        for (element in elements) {
+            if (element == null) continue
+            val type = (invokeGetter(element, "getElementType") as? Number)?.toInt() ?: 0
+            if (type != ELEMENT_TYPE_REPLY) continue
+            val reply = invokeGetter(element, "getReplyElement") ?: continue
+            val replayMsgId = (invokeGetter(reply, "getReplayMsgId") as? Number)?.toLong() ?: 0L
+            val sourceMsgIdInRecords =
+                (invokeGetter(reply, "getSourceMsgIdInRecords") as? Number)?.toLong() ?: 0L
+            val seq = (invokeGetter(reply, "getReplayMsgSeq") as? Number)?.toLong()
+                ?: (invokeGetter(reply, "getReplyMsgSeq") as? Number)?.toLong()
+                ?: 0L
+            val senderUid = (invokeGetter(reply, "getSenderUidStr") as? String).orEmpty()
+            val sourceText = (invokeGetter(reply, "getSourceMsgText") as? String).orEmpty()
+            val revokeType = (invokeGetter(reply, "getReplyMsgRevokeType") as? Number)?.toInt() ?: 0
+            val expired = (invokeGetter(reply, "getSourceMsgExpired") as? Boolean) ?: false
+            val replyTime = (invokeGetter(reply, "getReplyMsgTime") as? Number)?.toLong() ?: 0L
+            // 部分版本的引用元素 replayMsgId 为 0，回退到 sourceMsgIdInRecords。
+            val effectiveMsgId = if (replayMsgId != 0L) replayMsgId else sourceMsgIdInRecords
+            val revoked = revokeType != 0
+            val content = when {
+                revoked -> "原消息已撤回"
+                sourceText.isNotBlank() -> sourceText
+                expired -> "原消息已失效"
+                else -> ""
+            }
+            Log.i(
+                TAG,
+                "reply element: replayMsgId=$replayMsgId sourceId=$sourceMsgIdInRecords " +
+                    "seq=$seq revoke=$revokeType expired=$expired uid=${senderUid.take(8)} " +
+                    "text=${sourceText.take(30)}",
+            )
+            return ReplyInfo(
+                msgId = effectiveMsgId,
+                seq = seq,
+                senderUid = senderUid,
+                sourceText = content,
+                revoked = revoked,
+                expired = expired,
+                replyTime = replyTime,
+            )
+        }
+        return null
+    }
+
+    /** 引用消息的昵称/摘要补全：当前列表 → 按 msgId/seq 从内核补拉 → uid 昵称映射。 */
+    private fun resolveReplyPreviews(chatId: String, messages: List<ChatMessage>): List<ChatMessage> {
+        if (messages.none { it.hasReply }) return messages
+        val byMsgId = messages.associateBy { it.chatRecordMsgId }
+        val bySeq = messages.filter { it.seq > 0L }.associateBy { it.seq }
+        val nameByUid = messages
+            .filter { it.senderUid.isNotBlank() }
+            .groupBy { it.senderUid }
+            .mapValues { (_, list) -> list.first().senderName }
+        // 被引用但不在已加载列表里的消息：按 msgId 从内核补拉（即使它比当前页更早）。
+        val missingIds = messages.asSequence()
+            .filter { it.hasReply && it.replyToMsgId != 0L && byMsgId[it.replyToMsgId] == null }
+            .map { it.replyToMsgId }
+            .distinct()
+            .take(20)
+            .toList()
+        val fetched = if (missingIds.isNotEmpty()) {
+            runCatching { fetchMessagesByIds(chatId, missingIds) }.getOrDefault(emptyMap())
+        } else {
+            emptyMap()
+        }
+        // msgId 缺失但带 seq 的引用：按 seq 补拉。
+        val fetchedBySeq: Map<Long, ChatMessage> = runCatching {
+            messages.asSequence()
+                .filter { it.hasReply && it.replyToSeq > 0L && it.replyToMsgId == 0L }
+                .map { it.replyToSeq }
+                .distinct()
+                .take(20)
+                .toList()
+                .mapNotNull { seq -> fetchMessageBySeq(chatId, seq) }
+                .associateBy { it.seq }
+        }.getOrDefault(emptyMap())
+        return messages.map { message ->
+            if (!message.hasReply) return@map message
+            val target = byMsgId[message.replyToMsgId]
+                ?: fetched[message.replyToMsgId]
+                ?: bySeq[message.replyToSeq]
+                ?: fetchedBySeq[message.replyToSeq]
+                ?: fetchedBySeq.values.firstOrNull { it.chatRecordMsgId != 0L }
+            val targetName = target?.senderName?.takeIf { it.isNotBlank() }
+            val name = message.replyToName.takeIf { it.isNotBlank() }
+                ?: targetName
+                ?: nameByUid[message.replyToSenderUid]
+                ?: if (myUid != null && message.replyToSenderUid == myUid) "我" else "对方"
+            val targetContent = target?.content?.take(100)?.takeIf { it.isNotBlank() }
+            val current = message.replyToContent
+            val content = when {
+                current.isNotBlank() && current != "原消息已撤回" && current != "原消息已失效" -> current
+                // 内核说撤回/失效但被引用消息其实还在列表/能拉到：以真实内容为准。
+                targetContent != null -> targetContent
+                current.isNotBlank() -> current
+                else -> "[消息]"
+            }
+            message.copy(replyToName = name, replyToContent = content)
+        }
+    }
+
+    /** 按 seq 从内核拉一条消息（引用元素 msgId 缺失时兜底）。 */
+    private fun fetchMessageBySeq(chatId: String, seq: Long): ChatMessage? {
+        if (!isHost || seq <= 0L) return null
+        if (!ensureServices()) return null
+        val contact = contacts[chatId] ?: return null
+        val service = msgService ?: return null
+        val cl = hostClassLoader() ?: return null
+        return try {
+            val callbackClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.IMsgOperateCallback", false, cl,
+            )
+            val latch = CountDownLatch(1)
+            var records: List<Any?> = emptyList()
+            var code = -1
+            val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, method, args ->
+                if (method.name == "onResult" && args != null && args.size >= 3) {
+                    code = (args[0] as? Number)?.toInt() ?: -1
+                    @Suppress("UNCHECKED_CAST")
+                    records = (args[2] as? List<Any?>) ?: emptyList()
+                    latch.countDown()
+                }
+                null
+            }
+            val method = service.javaClass.methods.firstOrNull {
+                it.name == "getMsgsBySeqAndCount" && it.parameterCount == 5
+            } ?: return null
+            method.invoke(service, contact, seq, 1, false, callback)
+            latch.await(6, TimeUnit.SECONDS)
+            if (code != 0 || records.isEmpty()) {
+                Log.i(TAG, "fetchMessageBySeq($chatId, $seq): code=$code count=${records.size}")
+                return null
+            }
+            records.mapNotNull { mapMsgRecord(chatId, it) }.firstOrNull()?.message
+        } catch (t: Throwable) {
+            Log.w(TAG, "fetchMessageBySeq failed: ${t.javaClass.simpleName} ${t.message}")
+            null
+        }
+    }
+
+    /** 按 msgId 从内核批量拉取消息（用于补全引用来源，哪怕它比已加载页更早）。 */
+    private fun fetchMessagesByIds(chatId: String, ids: List<Long>): Map<Long, ChatMessage> {
+        if (!isHost || ids.isEmpty()) return emptyMap()
+        if (!ensureServices()) return emptyMap()
+        val contact = contacts[chatId] ?: return emptyMap()
+        val service = msgService ?: return emptyMap()
+        val cl = hostClassLoader() ?: return emptyMap()
+        return try {
+            val callbackClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.IMsgOperateCallback", false, cl,
+            )
+            val latch = CountDownLatch(1)
+            var records: List<Any?> = emptyList()
+            val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, method, args ->
+                if (method.name == "onResult" && args != null && args.size >= 3) {
+                    @Suppress("UNCHECKED_CAST")
+                    records = (args[2] as? List<Any?>) ?: emptyList()
+                    latch.countDown()
+                }
+                null
+            }
+            val method = service.javaClass.methods.firstOrNull {
+                it.name == "getMsgsByMsgId" && it.parameterCount == 3
+            } ?: return emptyMap()
+            method.invoke(service, contact, ArrayList(ids), callback)
+            latch.await(6, TimeUnit.SECONDS)
+            if (records.isEmpty()) {
+                Log.i(TAG, "fetchMessagesByIds($chatId): no records for $ids")
+                return emptyMap()
+            }
+            val mapped = records.mapNotNull { mapMsgRecord(chatId, it) }
+            Log.i(TAG, "fetchMessagesByIds($chatId): fetched ${mapped.size}/${ids.size} for reply previews")
+            mapped.associateBy { it.message.chatRecordMsgId }.mapValues { it.value.message }
+        } catch (t: Throwable) {
+            Log.w(TAG, "fetchMessagesByIds failed: ${t.javaClass.simpleName} ${t.message}")
+            emptyMap()
+        }
+    }
+
+    /** 解析 PicElement → IMAGE [ChatPart]（保留原有 TIM 缓存/缩略图/URL 下载请求逻辑）。 */
+    private fun resolvePicPart(element: Any, msgId: Long): ChatPart {
+        val pic = invokeGetter(element, "getPicElement")
+        val sourcePath = (pic?.let { invokeGetter(it, "getSourcePath") } as? String)
+            ?.takeIf { pathUsable(it) }
+        @Suppress("UNCHECKED_CAST")
+        val thumbs = pic?.let { invokeGetter(it, "getThumbPath") } as? Map<*, *>
+        val thumbPath = thumbs.orEmpty().entries
+            .sortedByDescending { (it.key as? Number)?.toInt() ?: 0 }
+            .mapNotNull { (it.value as? String)?.takeIf { path -> pathUsable(path) } }
+            .firstOrNull()
+        val elementId = (invokeGetter(element, "getElementId") as? Number)?.toLong() ?: 0L
+        // 优先找 TIM 自己缓存的清晰版本（原图/720），避免气泡一直用 198 小缩略图。
+        val timCachedPath = runCatching { timCachedImagePath(element) }.getOrNull()
+        if (sourcePath == null && thumbPath == null) {
+            val remoteUrl = (pic?.let { invokeGetter(it, "getOriginImageUrl") } as? String)
+                ?.takeIf { it.startsWith("http", ignoreCase = true) }
+            Log.i(
+                TAG,
+                "pic missing: msg=$msgId elem=$elementId " +
+                    "uuid=${(pic?.let { invokeGetter(it, "getFileUuid") } as? String)?.take(16)} " +
+                    "md5=${(pic?.let { invokeGetter(it, "getMd5HexStr") } as? String)?.take(16)} " +
+                    "size=${(pic?.let { invokeGetter(it, "getFileSize") } as? Number)?.toLong()} " +
+                    "url=${remoteUrl?.take(50)} " +
+                    "timCached=${timCachedPath?.take(60)} " +
+                    "thumbs=${(thumbs.orEmpty().keys)}",
+            )
+            if (remoteUrl != null) requestImageUrlDownload(msgId, elementId, remoteUrl)
+        }
+        val customDownloadPath = pendingRichMediaPaths["$msgId:$elementId"]
+            ?.takeIf { java.io.File(it).isFile }
+        // 原图优先：PicElement.sourcePath（原图）> 已下载原图 > TIM 缓存（含原图/大图/缩略图）> 198 缩略图。
+        val downloadedOrigin = downloadedImageOrig[msgId]?.takeIf { pathUsable(it) }
+            ?: originImageCacheFile(msgId, elementId)?.let { java.io.File(it).takeIf { f -> f.isFile && f.length() > 0L }?.absolutePath }
+        val path = sourcePath
+            ?: downloadedOrigin
+            ?: timCachedPath
+            ?: thumbPath
+            ?: customDownloadPath
+            ?: downloadedMediaByElement[elementId]?.takeIf { pathUsable(it) }
+            ?: downloadedImagePath(msgId)
+            ?: (pic?.let { invokeGetter(it, "getSourcePath") } as? String)
+                ?.takeIf { it.isNotBlank() }
+        val width = (pic?.let { invokeGetter(it, "getPicWidth") } as? Number)?.toInt() ?: 0
+        val height = (pic?.let { invokeGetter(it, "getPicHeight") } as? Number)?.toInt() ?: 0
+        // picSubType：0 = 普通图片，1 = 表情图片（收藏表情 / 表情包图片）。
+        val picSubType = (pic?.let { invokeGetter(it, "getPicSubType") } as? Number)?.toInt() ?: 0
+        return ChatPart(
+            kind = ChatPartKind.IMAGE,
+            imagePath = path,
+            imageWidth = width,
+            imageHeight = height,
+            emojiImage = picSubType == 1,
+            elementId = elementId,
+        )
+    }
+
+    /** MarketFaceElement（表情包贴纸）解析结果：本地/下载后的贴纸图片路径 + 元素信息。 */
+    private data class MarketFaceImage(
+        val elementId: Long,
+        val packId: Int,
+        val emojiId: String,
+        val name: String,
+        val width: Int,
+        val height: Int,
+        val path: String?,
+        val source: String,
+    )
+
+    /**
+     * 解析 TIM 贴纸消息：MarketFaceElement.staticFacePath/dynamicFacePath 优先（必须是真实图片），
+     * 否则按 emojiPackageId(epId)+emojiId(eId) 复用表情包本地路径解析/HTTP 下载兜底。
+     */
+    private fun resolveMarketFaceImage(element: Any, msgId: Long): MarketFaceImage {
+        val mf = invokeGetter(element, "getMarketFaceElement")
+        val elementId = (invokeGetter(element, "getElementId") as? Number)?.toLong() ?: 0L
+        if (mf == null) {
+            Log.i(TAG, "marketFace: msg=$msgId elem=$elementId missing element")
+            return MarketFaceImage(elementId, 0, "", "", 0, 0, null, "none")
+        }
+        fun str(name: String): String =
+            (invokeGetter(mf, name) as? String).orEmpty()
+        val packId = (invokeGetter(mf, "getEmojiPackageId") as? Number)?.toInt() ?: 0
+        val rawEmojiId = str("getEmojiId")
+        val name = str("getFaceName")
+        val width = (invokeGetter(mf, "getImageWidth") as? Number)?.toInt() ?: 0
+        val height = (invokeGetter(mf, "getImageHeight") as? Number)?.toInt() ?: 0
+        val staticPath = (invokeGetter(mf, "getStaticFacePath") as? String)
+            ?.takeIf { isImageContentFile(it) }
+        val dynamicPath = (invokeGetter(mf, "getDynamicFacePath") as? String)
+            ?.takeIf { isImageContentFile(it) }
+        var path = staticPath ?: dynamicPath
+        var source = when {
+            staticPath != null -> "static"
+            dynamicPath != null -> "dynamic"
+            else -> "none"
+        }
+        if (path == null && packId > 0 && rawEmojiId.isNotBlank()) {
+            val packStr = packId.toString()
+            // emojiId 是 sbufID 的 hex（正常表情包 jobType=0 时即 eId），大小写都试
+            val ids = linkedSetOf(rawEmojiId, rawEmojiId.lowercase(), rawEmojiId.uppercase())
+            for (id in ids) {
+                val local = findLocalPackEmojiPath(packStr, id)
+                if (local != null) {
+                    path = local
+                    source = "package"
+                    break
+                }
+            }
+            if (path == null) {
+                for (id in ids) {
+                    val downloaded = downloadPackEmojiByHttp(packStr, id, width, height)
+                    if (downloaded != null) {
+                        path = downloaded
+                        source = "http"
+                        break
+                    }
+                }
+            }
+        }
+        Log.i(
+            TAG,
+            "marketFace: msg=$msgId pack=$packId eId=$rawEmojiId name=$name " +
+                "path=${path?.take(120)} source=$source size=${width}x$height",
+        )
+        return MarketFaceImage(elementId, packId, rawEmojiId, name, width, height, path, source)
+    }
+
+    /** MarketFaceElement → IMAGE 表情消息（UI 复用图片气泡/添加表情/长按逻辑）。 */
+    private fun describeMarketFaceElement(element: Any, msgId: Long): ElementInfo {
+        val image = resolveMarketFaceImage(element, msgId)
+        return ElementInfo(
+            type = ChatMessageType.IMAGE,
+            content = "[表情]",
+            imagePath = image.path,
+            imageWidth = image.width,
+            imageHeight = image.height,
+            emojiImage = true,
+            mediaPath = image.path,
+            elementId = image.elementId,
+        )
+    }
+
+    /**
+     * 多元素消息解析：按 elements 顺序把「文本/表情」合并成 TEXT part，图片（PIC）切成 IMAGE part，
+     * 引用（REPLY）跳过；遇到语音/视频/文件/聊天记录等非混排元素时回退原 [describeElements]（单元素行为不变）。
+     * - parts <= 1：返回与旧逻辑等价的单元素 ElementInfo + emptyList（绝大多数消息）；
+     * - parts >= 2：primary ElementInfo（type：纯图片时 IMAGE 否则 TEXT；content=文本+「[图片]」/「[表情]」
+     *   摘要；image 字段取第一个 IMAGE）+ 完整 parts。
+     */
+    private fun describeElementsWithParts(
+        elements: List<*>,
+        msgId: Long,
+    ): Pair<ElementInfo, List<ChatPart>> {
+        val parts = ArrayList<ChatPart>()
+        val textBuffer = StringBuilder()
+        fun flushText() {
+            if (textBuffer.isNotEmpty()) {
+                parts.add(ChatPart(kind = ChatPartKind.TEXT, text = textBuffer.toString()))
+                textBuffer.setLength(0)
+            }
+        }
+        for (element in elements) {
+            if (element == null) continue
+            // 聊天记录（合并转发）等特殊元素：保持原解析路径。
+            if (invokeGetter(element, "getMultiForwardMsgElement") != null) {
+                return describeElements(elements, msgId) to emptyList()
+            }
+            when ((invokeGetter(element, "getElementType") as? Number)?.toInt()) {
+                ELEMENT_TYPE_TEXT -> {
+                    val text = invokeGetter(element, "getTextElement")
+                    val content = text?.let { invokeGetter(it, "getContent") as? String }
+                    if (!content.isNullOrBlank()) textBuffer.append(content)
+                }
+                ELEMENT_TYPE_FACE -> textBuffer.append("[表情]")
+                ELEMENT_TYPE_MARKET_FACE -> {
+                    flushText()
+                    runCatching { describeMarketFaceElement(element, msgId) }
+                        .getOrNull()
+                        ?.let { info ->
+                            parts.add(
+                                ChatPart(
+                                    kind = ChatPartKind.IMAGE,
+                                    imagePath = info.imagePath,
+                                    imageWidth = info.imageWidth,
+                                    imageHeight = info.imageHeight,
+                                    emojiImage = true,
+                                    elementId = info.elementId,
+                                ),
+                            )
+                        }
+                }
+                ELEMENT_TYPE_PIC -> {
+                    flushText()
+                    // 单张图片解析失败不应让整条消息丢失：异常时跳过该图片。
+                    runCatching { resolvePicPart(element, msgId) }
+                        .getOrNull()
+                        ?.let { parts.add(it) }
+                }
+                ELEMENT_TYPE_REPLY -> Unit // 引用元素不参与正文
+                else -> return describeElements(elements, msgId) to emptyList()
+            }
+        }
+        flushText()
+        if (parts.isEmpty()) return describeElements(elements, msgId) to emptyList()
+        if (parts.size == 1) {
+            // 单元素消息：与原 describeElements 输出保持一致（不引入 parts 渲染路径）。
+            val part = parts[0]
+            return when (part.kind) {
+                ChatPartKind.TEXT -> ElementInfo(ChatMessageType.TEXT, part.text)
+                ChatPartKind.IMAGE -> ElementInfo(
+                    type = ChatMessageType.IMAGE,
+                    content = if (part.emojiImage) "[表情]" else "[图片]",
+                    imagePath = part.imagePath,
+                    imageWidth = part.imageWidth,
+                    imageHeight = part.imageHeight,
+                    emojiImage = part.emojiImage,
+                    mediaPath = part.imagePath,
+                )
+            } to emptyList()
+        }
+        val firstImage = parts.firstOrNull { it.kind == ChatPartKind.IMAGE }
+        val textContent = buildString {
+            parts.forEach { part ->
+                when (part.kind) {
+                    ChatPartKind.TEXT -> append(part.text)
+                    ChatPartKind.IMAGE -> append(if (part.emojiImage) "[表情]" else "[图片]")
+                }
+            }
+        }
+        val primary = ElementInfo(
+            type = if (firstImage != null && parts.none { it.kind == ChatPartKind.TEXT }) {
+                ChatMessageType.IMAGE
+            } else {
+                ChatMessageType.TEXT
+            },
+            content = textContent,
+            imagePath = firstImage?.imagePath,
+            imageWidth = firstImage?.imageWidth ?: 0,
+            imageHeight = firstImage?.imageHeight ?: 0,
+            emojiImage = firstImage?.emojiImage ?: false,
+            mediaPath = firstImage?.imagePath,
+            elementId = firstImage?.elementId ?: 0L,
+        )
+        Log.i(
+            TAG,
+            "multiPart msg=$msgId parts=${parts.size} types=${parts.map { it.kind }} " +
+                "text=${primary.content.take(40)}",
+        )
+        return primary to parts
+    }
+
+    private fun describeElements(elements: List<*>, msgId: Long): ElementInfo {
+        for ((index, element) in elements.withIndex()) {
+            if (element == null) continue
+            // 聊天记录（合并转发）：elementType 不固定，直接用 multiForwardMsgElement 判断
+            val multiForward = invokeGetter(element, "getMultiForwardMsgElement")
+            if (multiForward != null) {
+                val xml = (invokeGetter(multiForward, "getXmlContent") as? String).orEmpty()
+                Log.i(TAG, "chat record xml: ${xml.take(1200)}")
+                val elementId = (invokeGetter(element, "getElementId") as? Number)?.toLong() ?: 0L
+                val allTitles = Regex("<title[^>]*>(.*?)</title>", RegexOption.DOT_MATCHES_ALL)
+                    .findAll(xml)
+                    .map { unescapeXml(it.groupValues[1]).trim() }
+                    .filter { it.isNotBlank() }
+                    .toList()
+                val title = allTitles.firstOrNull() ?: "聊天记录"
+                // 预览行：优先 <item> 里的 title（每条被转发消息一行），其次 summary
+                val previewLines = allTitles.drop(1).take(3)
+                val summary = if (previewLines.isNotEmpty()) {
+                    previewLines
+                } else {
+                    Regex("<summary[^>]*>(.*?)</summary>", RegexOption.DOT_MATCHES_ALL)
+                        .find(xml)
+                        ?.groupValues?.getOrNull(1)
+                        ?.let { unescapeXml(it) }
+                        ?.split('\n')
+                        ?.map { it.trim() }
+                        ?.filter { it.isNotBlank() }
+                        ?.filterNot { it.contains("转发消息") || it.contains("条消息") }
+                        ?.take(4)
+                        .orEmpty()
+                }
+                val count = Regex("tSum=\"(\\d+)\"").find(xml)
+                    ?.groupValues?.getOrNull(1)?.toIntOrNull()
+                    ?: summary.size
+                return ElementInfo(
+                    type = ChatMessageType.CHAT_RECORD,
+                    content = title,
+                    recordTitle = title,
+                    recordSummary = summary,
+                    recordElementId = elementId,
+                    recordCount = count,
+                )
+            }
+            when ((invokeGetter(element, "getElementType") as? Number)?.toInt()) {
+                ELEMENT_TYPE_TEXT -> {
+                    val text = invokeGetter(element, "getTextElement")
+                    val content = text?.let { invokeGetter(it, "getContent") as? String }
+                    if (!content.isNullOrBlank()) {
+                        // NT 内核会把「@某人 + 正文」拆成多个 TextElement（@x 一个、正文一个），
+                        // 这里把后续连续的文本/表情元素合并回一条，避免只显示 @ 而丢掉正文。
+                        val merged = StringBuilder(content)
+                        var next = index + 1
+                        while (next < elements.size) {
+                            val candidate = elements[next]
+                            if (candidate == null) {
+                                next++
+                                continue
+                            }
+                            val nextType =
+                                (invokeGetter(candidate, "getElementType") as? Number)?.toInt() ?: 0
+                            when (nextType) {
+                                ELEMENT_TYPE_REPLY -> next++ // 引用元素不参与正文
+                                ELEMENT_TYPE_TEXT -> {
+                                    val part = invokeGetter(candidate, "getTextElement")
+                                        ?.let { invokeGetter(it, "getContent") as? String }
+                                    if (part != null) merged.append(part)
+                                    next++
+                                }
+                                ELEMENT_TYPE_FACE -> {
+                                    merged.append("[表情]")
+                                    next++
+                                }
+                                ELEMENT_TYPE_MARKET_FACE -> break
+                                else -> break
+                            }
+                        }
+                        return ElementInfo(ChatMessageType.TEXT, merged.toString())
+                    }
+                }
+                ELEMENT_TYPE_PIC -> {
+                    val part = resolvePicPart(element, msgId)
+                    return ElementInfo(
+                        type = ChatMessageType.IMAGE,
+                        content = if (part.emojiImage) "[表情]" else "[图片]",
+                        imagePath = part.imagePath,
+                        imageWidth = part.imageWidth,
+                        imageHeight = part.imageHeight,
+                        emojiImage = part.emojiImage,
+                        mediaPath = part.imagePath,
+                    )
+                }
+                ELEMENT_TYPE_PTT -> {
+                    val ptt = invokeGetter(element, "getPttElement")
+                    val pttElementId = (invokeGetter(element, "getElementId") as? Number)?.toLong() ?: 0L
+                    // PttElement.duration 单位是**秒**（TIM AIOPttUtil.b(int) 用 duration/60 + duration%60 格式化），
+                    // 之前误按毫秒 /1000，真机所有语音都只显示 1s。
+                    val rawSeconds = (ptt?.let { invokeGetter(it, "getDuration") } as? Number)?.toInt() ?: 0
+                    val seconds = rawSeconds.coerceAtLeast(1)
+                    val pttPath = (ptt?.let { invokeGetter(it, "getFilePath") } as? String)
+                        ?.takeIf { it.isNotBlank() }
+                    val pttMd5 = (ptt?.let { invokeGetter(it, "getMd5HexStr") } as? String)
+                        ?.takeIf { it.isNotBlank() }
+                    val pttUuid = (ptt?.let { invokeGetter(it, "getFileUuid") } as? String)
+                        ?.takeIf { it.isNotBlank() }
+                    val pttName = (ptt?.let { invokeGetter(it, "getFileName") } as? String)
+                        ?.takeIf { it.isNotBlank() }
+                    val path = pttPath?.takeIf { pathUsable(it) }
+                        ?: listOfNotNull(pttMd5, pttUuid, pttName)
+                            .firstNotNullOfOrNull { key ->
+                                sentVoiceLocalPaths[key]?.takeIf { pathUsable(it) }
+                            }
+                        ?: downloadedMediaByElement[pttElementId]?.takeIf { pathUsable(it) }
+                        ?: pttPath
+                    Log.i(
+                        TAG,
+                        "voice map: elem=$pttElementId pttPath=${pttPath?.take(80)} " +
+                            "md5=$pttMd5 uuid=$pttUuid name=$pttName mapped=${path?.take(80)} " +
+                            "knownKeys=${sentVoiceLocalPaths.size}",
+                    )
+                    return ElementInfo(
+                        type = ChatMessageType.VOICE,
+                        content = "",
+                        voiceSeconds = seconds,
+                        mediaPath = path,
+                        elementId = pttElementId,
+                    )
+                }
+                ELEMENT_TYPE_FILE -> {
+                    val file = invokeGetter(element, "getFileElement")
+                    val name = (file?.let { invokeGetter(it, "getFileName") } as? String) ?: "[文件]"
+                    val size = (file?.let { invokeGetter(it, "getFileSize") } as? Number)?.toLong() ?: 0L
+                    val fileElementId = (invokeGetter(element, "getElementId") as? Number)?.toLong() ?: 0L
+                    // FileElement.filePath 只有下载后才有；未下载时用 richmedia 下载完成回调写入的路径。
+                    val path = (file?.let { invokeGetter(it, "getFilePath") } as? String)
+                        ?.takeIf { it.isNotBlank() }
+                        ?: downloadedMediaByElement[fileElementId]?.takeIf { pathUsable(it) }
+                    val progress = (file?.let { invokeGetter(it, "getProgress") } as? Number)
+                        ?.toInt() ?: -1
+                    val transferStatus =
+                        (file?.let { invokeGetter(it, "getTransferStatus") } as? Number)?.toInt() ?: -1
+                    return ElementInfo(
+                        type = ChatMessageType.FILE,
+                        content = name,
+                        fileSize = formatFileSize(size),
+                        mediaPath = path,
+                        elementId = fileElementId,
+                        downloadProgress = progress,
+                        transferStatus = transferStatus,
+                    )
+                }
+                ELEMENT_TYPE_WALLET -> {
+                    val walletElementId = (invokeGetter(element, "getElementId") as? Number)?.toLong() ?: 0L
+                    val wallet = invokeGetter(element, "getWalletElement")
+                    val walletInfo = wallet?.let { describeWalletElement(it, msgId, walletElementId) }
+                    if (walletInfo != null) return walletInfo
+                    // 解析失败不吞消息：继续遍历（最终回退 [消息]）。
+                    Log.w(
+                        TAG,
+                        "wallet element: parse failed msg=$msgId elem=$walletElementId; fallback [消息]",
+                    )
+                }
+
+                ELEMENT_TYPE_ARK -> {
+                    val arkElementId = (invokeGetter(element, "getElementId") as? Number)?.toLong() ?: 0L
+                    val ark = invokeGetter(element, "getArkElement")
+                    val arkInfo = ark?.let { describeArkElement(it, msgId, arkElementId) }
+                    if (arkInfo != null) return arkInfo
+                    // 解析失败不吞消息：继续遍历（最终回退 [消息]）。
+                    Log.w(
+                        TAG,
+                        "ark element: parse failed msg=$msgId elem=$arkElementId; fallback [消息]",
+                    )
+                }
+
+                ELEMENT_TYPE_GRAY_TIP ->
+                    return ElementInfo(
+                        ChatMessageType.SYSTEM,
+                        grayTipText(invokeGetter(element, "getGrayTipElement")),
+                    )
+
+                ELEMENT_TYPE_MARKET_FACE -> return describeMarketFaceElement(element, msgId)
+
+                ELEMENT_TYPE_FACE -> return ElementInfo(ChatMessageType.TEXT, "[表情]")
+
+                ELEMENT_TYPE_VIDEO -> {
+                    val video = invokeGetter(element, "getVideoElement")
+                    val videoElementId = (invokeGetter(element, "getElementId") as? Number)?.toLong() ?: 0L
+                    val videoFileName = (video?.let { invokeGetter(it, "getFileName") } as? String).orEmpty()
+                    val videoMd5 = (video?.let { invokeGetter(it, "getVideoMd5") } as? String).orEmpty()
+                    val fileUuid = (video?.let { invokeGetter(it, "getFileUuid") } as? String).orEmpty()
+                    val importRichMediaContext =
+                        video?.let { invokeGetter(it, "getImportRichMediaContext") } as? ByteArray
+                    val fileSize = (video?.let { invokeGetter(it, "getFileSize") } as? Number)?.toLong() ?: 0L
+                    @Suppress("UNCHECKED_CAST")
+                    val thumbs = video?.let { invokeGetter(it, "getThumbPath") } as? Map<*, *>
+                    val mapThumb = thumbs.orEmpty().entries
+                        .sortedByDescending { (it.key as? Number)?.toInt() ?: 0 }
+                        .mapNotNull { (it.value as? String)?.takeIf { path -> pathUsable(path) } }
+                        .firstOrNull()
+                    // 接收消息的 VideoElement.filePath/thumbPath 常为空：用内核
+                    // assembleMobileQQRichMediaFilePath（TIM aio/utils/v.e/f 同款）拼真实缓存路径。
+                    val assembledThumb = assembleRichMediaPath(
+                        elementType = 5,
+                        elementSubType = 0,
+                        md5HexStr = videoMd5,
+                        fileName = videoFileName,
+                        downloadType = 2,
+                        thumbSize = 0,
+                        importRichMediaContext = importRichMediaContext,
+                        fileUuid = fileUuid,
+                        needCreate = false,
+                    )?.takeIf { isImageFilePath(it) && pathUsable(it) }
+                    val cachedThumb = downloadedMediaByElement[videoElementId]
+                        ?.takeIf { isImageFilePath(it) && pathUsable(it) }
+                    val videoFilePath = (video?.let { invokeGetter(it, "getFilePath") } as? String)
+                        ?.takeIf { pathUsable(it) }
+                        ?: assembleRichMediaPath(
+                            elementType = 5,
+                            elementSubType = 0,
+                            md5HexStr = videoMd5,
+                            fileName = videoFileName,
+                            downloadType = 1,
+                            thumbSize = 0,
+                            importRichMediaContext = importRichMediaContext,
+                            fileUuid = fileUuid,
+                            needCreate = false,
+                        )?.takeIf { pathUsable(it) }
+                        ?: downloadedMediaByElement[videoElementId]
+                            ?.takeIf { isVideoFilePath(it) && pathUsable(it) }
+                        ?: findTimShortVideoFile(videoMd5, videoFileName, fileSize)
+                    // 自己刚发出的视频：服务端消息元素常无 filePath/thumb/duration，按 fileSize 回填
+                    // 发送时记录的 sentVideoMeta（TTL 10 分钟）。
+                    val sentMeta = sentVideoMetaFor(fileSize)
+                    val sentVideoPath = sentMeta?.filePath?.takeIf { pathUsable(it) }
+                    val sentThumb = sentMeta?.thumbPath?.takeIf { isImageFilePath(it) && pathUsable(it) }
+                    val finalVideoPath = videoFilePath ?: sentVideoPath
+                    var thumbPath = mapThumb ?: assembledThumb ?: cachedThumb ?: sentThumb
+                    if (thumbPath == null && finalVideoPath != null) {
+                        // RichMedia 缩略图拿不到时：用已下载视频截首帧兜底。
+                        thumbPath = videoFrameThumb(videoElementId, finalVideoPath)
+                    }
+                    val thumbWidthRaw =
+                        (video?.let { invokeGetter(it, "getThumbWidth") } as? Number)?.toInt() ?: 0
+                    val thumbHeightRaw =
+                        (video?.let { invokeGetter(it, "getThumbHeight") } as? Number)?.toInt() ?: 0
+                    var thumbWidth = thumbWidthRaw
+                    var thumbHeight = thumbHeightRaw
+                    if ((thumbWidth <= 0 || thumbHeight <= 0) && thumbPath != null) {
+                        runCatching {
+                            val opts = android.graphics.BitmapFactory.Options()
+                            android.graphics.BitmapFactory.decodeFile(thumbPath, opts)
+                            if (opts.outWidth > 0) thumbWidth = opts.outWidth
+                            if (opts.outHeight > 0) thumbHeight = opts.outHeight
+                        }
+                    }
+                    if (thumbWidth <= 0 && sentMeta != null) thumbWidth = sentMeta.width
+                    if (thumbHeight <= 0 && sentMeta != null) thumbHeight = sentMeta.height
+                    var duration = (video?.let { invokeGetter(it, "getFileTime") } as? Number)?.toInt() ?: 0
+                    if (duration <= 0 && sentMeta != null) duration = sentMeta.durationSeconds
+                    Log.i(
+                        TAG,
+                        "video element: msg=$msgId elem=$videoElementId " +
+                            "path=${finalVideoPath?.take(80)} thumb=${thumbPath?.take(80)} " +
+                            "dur=$duration ${thumbWidth}x$thumbHeight size=$fileSize " +
+                            "md5=${videoMd5.take(12)} uuid=${fileUuid.take(12)} " +
+                            "sentMeta=${sentMeta != null}",
+                    )
+                    return ElementInfo(
+                        type = ChatMessageType.VIDEO,
+                        content = "[视频]",
+                        fileSize = formatFileSize(fileSize),
+                        imagePath = thumbPath,
+                        imageWidth = thumbWidth,
+                        imageHeight = thumbHeight,
+                        mediaPath = finalVideoPath,
+                        videoSeconds = duration,
+                        elementId = videoElementId,
+                    )
+                }
+
+                else -> {
+                    val elementType = (invokeGetter(element, "getElementType") as? Number)?.toInt()
+                    if (elementType != null && elementType !in unknownElementLogged) {
+                        unknownElementLogged.add(elementType)
+                        Log.w(TAG, "unsupported msg element type=$elementType")
+                    }
+                }
+            }
+        }
+        return ElementInfo(ChatMessageType.TEXT, "[消息]")
+    }
+
+    /** dump PicElement 的所有非空字段（诊断聊天记录内跨会话图片为何不下载）。 */
+    private fun picElementFieldDump(pic: Any): String {
+        val getters = listOf(
+            "getPicSubType", "getFileName", "getFileSize", "getPicWidth", "getPicHeight",
+            "getOriginal", "getMd5HexStr", "getSourcePath", "getThumbPath", "getTransferStatus",
+            "getProgress", "getPicType", "getInvalidState", "getFileUuid", "getFileSubId",
+            "getThumbFileSize", "getFileBizId", "getDownloadIndex", "getSummary", "getEmojiFrom",
+            "getEmojiWebUrl", "getEmojiAd", "getEmojiMall", "getEmojiZplan", "getOriginImageMd5",
+            "getOriginImageUrl", "getIsFlashPic", "getStoreID",
+        )
+        return buildString {
+            for (name in getters) {
+                val value = runCatching { invokeGetter(pic, name) }.getOrNull() ?: continue
+                val text = when (value) {
+                    is String -> value.take(160)
+                    is ByteArray -> "<bytes:${value.size}>"
+                    is Map<*, *> -> "<map:${value.size}>"
+                    else -> value.toString()
+                }
+                if (text.isNotBlank() && text != "null" && text != "[]" && text != "0") {
+                    if (isNotEmpty()) append(',')
+                    append(name.removePrefix("get")).append('=').append(text)
+                }
+            }
+        }.ifBlank { "<empty>" }
+    }
+
+    /** HTTP 下载图片到本地（聊天记录内图片内核不响应 richmedia 时兜底）。 */
+    private fun downloadChatRecordImageUrl(url: String, target: java.io.File): Boolean {
+        if (target.isFile && target.length() > 0L && isImageContentFile(target.absolutePath)) return true
+        return runCatching {
+            val connection = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+            connection.connectTimeout = 3_000
+            connection.readTimeout = 6_000
+            connection.instanceFollowRedirects = true
+            connection.setRequestProperty(
+                "User-Agent",
+                "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 (KHTML, like Gecko) " +
+                    "Version/4.0 Chrome/126.0 Mobile Safari/537.36",
+            )
+            val status = connection.responseCode
+            if (status !in 200..299) {
+                Log.i(TAG, "chatRecordImage http status=$status url=${url.take(120)}")
+                connection.disconnect()
+                return@runCatching false
+            }
+            val tmp = java.io.File(target.parentFile, target.name + ".tmp")
+            var bytes = 0L
+            connection.inputStream.use { input ->
+                tmp.outputStream().use { output -> bytes = input.copyTo(output) }
+            }
+            connection.disconnect()
+            if (bytes > 0L && tmp.isFile) {
+                if (target.exists()) target.delete()
+                tmp.renameTo(target)
+            } else {
+                tmp.delete()
+            }
+            val ok = target.isFile && target.length() > 0L && isImageContentFile(target.absolutePath)
+            Log.i(
+                TAG,
+                "chatRecordImage http url=${url.take(120)} status=$status bytes=$bytes " +
+                    "path=${target.absolutePath.take(120)} ok=$ok",
+            )
+            ok
+        }.getOrElse { t ->
+            Log.w(
+                TAG,
+                "chatRecordImage http failed url=${url.take(120)}: " +
+                    "${t.javaClass.simpleName} ${t.message}",
+            )
+            false
+        }
+    }
+
+    /**
+     * 聊天记录内图片 HTTP 兜底：C2C 私聊转发进群聊的内层消息，内核 richmedia 可能不响应
+     * （msgId/peer 属于另一会话上下文），这里用 PicElement.originImageUrl / emojiWebUrl /
+     * md5 构造 QQ 图片 CDN 地址下载到 cacheDir/m3tim_richmedia，写 downloadedMediaByElement。
+     */
+    private fun scheduleChatRecordImageHttpFallback(
+        msgId: Long,
+        elementId: Long,
+        pic: Any,
+        rootMsgId: Long,
+    ) {
+        if (elementId == 0L) return
+        if (downloadedMediaByElement[elementId]?.let { pathUsable(it) } == true) return
+        val outputDir = appContext()?.cacheDir?.let { java.io.File(it, "m3tim_richmedia") }
+            ?: return
+        val md5 = (invokeGetter(pic, "getMd5HexStr") as? String)?.takeIf { it.isNotBlank() }
+        val uuid = (invokeGetter(pic, "getFileUuid") as? String)?.takeIf { it.isNotBlank() }
+        val originUrl = (invokeGetter(pic, "getOriginImageUrl") as? String)
+            ?.takeIf { it.startsWith("http", ignoreCase = true) }
+        val emojiUrl = (invokeGetter(pic, "getEmojiWebUrl") as? String)
+            ?.takeIf { it.startsWith("http", ignoreCase = true) }
+        logOnceRecordMedia("imageFallbackProbe:$msgId:$elementId") {
+            "chatRecordImage fallback probe msg=$msgId root=$rootMsgId elem=$elementId " +
+                "fields=${picElementFieldDump(pic)}"
+        }
+        val urls = LinkedHashSet<String>()
+        originUrl?.let { urls.add(it) }
+        emojiUrl?.let { urls.add(it) }
+        if (urls.isEmpty() && (md5 != null || uuid != null)) {
+            // QQ 图片 CDN 旧规则：gchatpic_new/0/0-0-<md5|uuid>/0（大写/小写各试一次）。
+            val key = md5 ?: uuid!!
+            urls.add("https://gchat.qpic.cn/gchatpic_new/0/0-0-${key.uppercase()}/0")
+            urls.add("https://gchat.qpic.cn/gchatpic_new/0/0-0-${key.lowercase()}/0")
+            uuid?.let { urls.add("https://gchat.qpic.cn/gchatpic_new/0/0-0-${it.uppercase()}/0") }
+        }
+        if (urls.isEmpty()) {
+            Log.w(
+                TAG,
+                "chatRecordImage fallback skip msg=$msgId elem=$elementId (no url/md5/uuid)",
+            )
+            return
+        }
+        val requestKey = "http:$elementId"
+        if (!imageDownloadRequested.add(requestKey)) return
+        val target = runCatching { outputDir.mkdirs() }.let {
+            java.io.File(outputDir, "chatrecord_${elementId}.jpg")
+        }
+        chatRecordImageExecutor.execute {
+            runCatching {
+                for (url in urls) {
+                    if (downloadChatRecordImageUrl(url, target)) {
+                        downloadedMediaByElement[elementId] = target.absolutePath
+                        pendingRichMediaPaths["$msgId:$elementId"] = target.absolutePath
+                        if (rootMsgId != 0L) {
+                            pendingRichMediaPaths["$rootMsgId:$elementId"] = target.absolutePath
+                        }
+                        Log.i(
+                            TAG,
+                            "chatRecordImage fallback ok msg=$msgId elem=$elementId " +
+                                "path=${target.absolutePath.take(120)}",
+                        )
+                        return@execute
+                    }
+                }
+                Log.w(
+                    TAG,
+                    "chatRecordImage fallback failed msg=$msgId elem=$elementId urls=${urls.size}",
+                )
+                imageDownloadRequested.remove(requestKey)
+            }.onFailure { t ->
+                Log.w(
+                    TAG,
+                    "chatRecordImage fallback error msg=$msgId elem=$elementId: " +
+                        "${t.javaClass.simpleName} ${t.message}",
+                )
+                imageDownloadRequested.remove(requestKey)
+            }
+        }
+    }
+
+    /** dump VideoElement 的所有非空字段（诊断聊天记录内跨会话视频为何不下缩略图）。 */
+    private fun videoElementFieldDump(video: Any): String {
+        val getters = listOf(
+            "getThumbPath", "getFilePath", "getFileUuid", "getVideoMd5", "getFileName",
+            "getFileSize", "getFileTime", "getFileWidth", "getFileHeight", "getThumbWidth",
+            "getThumbHeight", "getFileFormat", "getImportRichMediaContext", "getVideoCodecFormat",
+            "getTransferStatus", "getProgress", "getFileSubId", "getFileBizId",
+        )
+        return buildString {
+            for (name in getters) {
+                val value = runCatching { invokeGetter(video, name) }.getOrNull() ?: continue
+                val text = when (value) {
+                    is String -> value.take(160)
+                    is ByteArray -> "<bytes:${value.size}>"
+                    is Map<*, *> -> "<map:${value.size}>"
+                    else -> value.toString()
+                }
+                if (text.isNotBlank() && text != "null" && text != "[]" && text != "0") {
+                    if (isNotEmpty()) append(',')
+                    append(name.removePrefix("get")).append('=').append(text)
+                }
+            }
+        }.ifBlank { "<empty>" }
+    }
+
+    /**
+     * 聊天记录内视频缩略图兜底：缩略图 richmedia 无回调时，用 downloadType=1 触发视频文件下载，
+     * 下载完成后用 MediaMetadataRetriever 抽首帧（videoFrameThumb 已有实现），下次轮询显示封面。
+     */
+    private fun scheduleChatRecordVideoFileAndFrame(
+        service: Any,
+        requestMethod: java.lang.reflect.Method,
+        rootMsgId: Long,
+        innerMsgId: Long,
+        elementId: Long,
+        candidateMsgIds: Set<Long>,
+        peerCandidates: Set<Pair<String, Int>>,
+        recordPeerUid: String,
+        recordChatType: Int,
+        cl: ClassLoader,
+    ) {
+        if (elementId == 0L) return
+        if (downloadedMediaByElement[elementId]?.let { pathUsable(it) } == true) return
+        val key = "videoFile:$innerMsgId:$elementId"
+        if (!videoFileDownloadStarted.add(key)) return
+        var requestedFile = false
+        for (candidateMsgId in candidateMsgIds) {
+            for ((peer, peerChatType) in peerCandidates) {
+                val pairLabel = if (peer == recordPeerUid && peerChatType == recordChatType) {
+                    "inner"
+                } else {
+                    "root"
+                }
+                val request = buildRichMediaElementGetReq(
+                    cl,
+                    peerUid = peer,
+                    chatType = peerChatType,
+                    msgId = candidateMsgId,
+                    elementId = elementId,
+                    downloadType = 1,
+                    thumbSize = 0,
+                    downSourceType = 1,
+                    triggerType = 1,
+                ) ?: continue
+                val ok = runCatching {
+                    requestMethod.invoke(service, request)
+                    true
+                }.getOrElse { t ->
+                    Log.w(
+                        TAG,
+                        "video file request exception pair=$pairLabel msg=$candidateMsgId " +
+                            "elem=$elementId: ${t.javaClass.simpleName} ${t.message}",
+                    )
+                    false
+                }
+                if (ok) requestedFile = true
+                Log.i(
+                    TAG,
+                    "video file request: pair=$pairLabel msg=$candidateMsgId elem=$elementId " +
+                        "peer=$peer chatType=$peerChatType dl=1 ok=$ok",
+                )
+            }
+        }
+        if (!requestedFile) {
+            videoFileDownloadStarted.remove(key)
+            Log.w(TAG, "video file request skipped elem=$elementId (all pairs already requested/failed)")
+            return
+        }
+        chatRecordImageExecutor.execute {
+            val started = perfUptime()
+            val deadline = started + 20_000L
+            try {
+                while (perfUptime() < deadline) {
+                    val path = downloadedMediaByElement[elementId]?.takeIf { pathUsable(it) }
+                    if (path != null) {
+                        if (isImageFilePath(path)) {
+                            Log.i(TAG, "video file fallback: elem=$elementId thumb already ready path=$path")
+                            return@execute
+                        }
+                        val size = runCatching { java.io.File(path).length() }.getOrDefault(0L)
+                        if (size > 0L) {
+                            val frame = videoFrameThumb(elementId, path)
+                            Log.i(
+                                TAG,
+                                "video file fallback: elem=$elementId path=${path.take(100)} " +
+                                    "size=$size frame=${frame?.take(100)} " +
+                                    "ms=${perfUptime() - started}",
+                            )
+                            if (frame != null) return@execute
+                        }
+                    }
+                    Thread.sleep(400L)
+                }
+                Log.w(TAG, "video file fallback timeout elem=$elementId ms=${perfUptime() - started}")
+                videoFileDownloadStarted.remove(key)
+            } catch (t: Throwable) {
+                videoFileDownloadStarted.remove(key)
+                Log.w(
+                    TAG,
+                    "video file fallback failed: ${t.javaClass.simpleName} ${t.message}",
+                )
+            }
+        }
+    }
+
+    /** 聊天记录媒体请求类型（图片缩略图 / 视频缩略图 / 视频文件下载）。 */
+    private enum class RecordRichMediaKind { PIC_THUMB, VIDEO_THUMB, VIDEO_FILE }
+
+    /** 记录内媒体诊断日志每元素只打一次（进程内），避免聊天记录轮询刷新时刷屏。 */
+    private val recordMediaProbeLogged = ConcurrentHashMap.newKeySet<String>()
+
+    private fun logOnceRecordMedia(key: String, message: () -> String) {
+        if (recordMediaProbeLogged.size > 2_000) recordMediaProbeLogged.clear()
+        if (recordMediaProbeLogged.add(key)) Log.i(TAG, message())
+    }
+
+    /**
+     * 历史消息里的图片/视频缩略图通常没有本地文件（sourcePath/thumbPath 为空），
+     * 这里用 RichMediaService 的 getRichMediaElement 触发内核下载；
+     * 下载完成后 ChatDetailScreen 会轮询重新拉取消息，元素就会带上本地路径。
+     *
+     * 记录（合并转发/嵌套）里的媒体属于**内部记录自己的 msgId/peer**，与图片/视频文件下载统一走
+     * [requestRecordRichMedia]：msgId ∈ {inner, root} × peer ∈ {inner record peer, outer chat peer}
+     * × downloadType 变体；图片保留 qpic HTTP 兜底、视频保留文件下载+抽帧兜底。
+     */
+    private fun triggerMissingImageDownloads(
+        chatId: String,
+        records: List<Any?>,
+        rootMsgIdOverride: Long? = null,
+    ) {
+        val service = msgService ?: return
+        val meta = chatMeta[chatId] ?: return
+        val requestMethod = service.javaClass.methods.firstOrNull {
+            it.name == "getRichMediaElement" && it.parameterCount == 1
+        }
+        if (requestMethod == null) {
+            Log.w(TAG, "getRichMediaElement method not found")
+            return
+        }
+        val cl = hostClassLoader() ?: return
+        var picCount = 0
+        var requested = 0
+
+        /** 统一的记录内媒体请求：配对候选 + downloadType 变体 + 去重 key 全在这里。 */
+        fun requestRecordRichMedia(record: Any, element: Any, kind: RecordRichMediaKind) {
+            val msgId = (invokeGetter(record, "getMsgId") as? Number)?.toLong() ?: 0L
+            // 合并转发里的消息属于原始会话：peer 必须用 record 自己的，不能用外层 chat 的
+            val recordPeerUid = (invokeGetter(record, "getPeerUid") as? String)
+                ?.takeIf { it.isNotBlank() } ?: meta.peerUid
+            val recordChatType = (invokeGetter(record, "getChatType") as? Number)?.toInt()
+                ?: meta.chatType
+            val elementId = (invokeGetter(element, "getElementId") as? Number)?.toLong() ?: 0L
+            if (elementId == 0L) return
+            val candidateMsgIds = LinkedHashSet<Long>().apply {
+                if (msgId != 0L) add(msgId)
+                val root = rootMsgIdOverride ?: 0L
+                if (root != 0L && root != msgId) add(root)
+            }
+            if (candidateMsgIds.isEmpty()) return
+            val peerCandidates = LinkedHashSet<Pair<String, Int>>().apply {
+                if (recordPeerUid.isNotBlank()) add(recordPeerUid to recordChatType)
+                if (meta.peerUid.isNotBlank()) add(meta.peerUid to meta.chatType)
+            }
+            val isChatRecordMedia = rootMsgIdOverride != null && rootMsgIdOverride != msgId
+
+            fun pairLabel(peer: String, peerChatType: Int): String =
+                if (peer == recordPeerUid && peerChatType == recordChatType) "inner" else "root"
+
+            fun invokeRichMedia(
+                peer: String,
+                peerChatType: Int,
+                candidateMsgId: Long,
+                downloadType: Int,
+                thumbSize: Int,
+                logPrefix: String,
+                variant: String,
+            ): Boolean {
+                val request = buildRichMediaElementGetReq(
+                    cl,
+                    peerUid = peer,
+                    chatType = peerChatType,
+                    msgId = candidateMsgId,
+                    elementId = elementId,
+                    downloadType = downloadType,
+                    thumbSize = thumbSize,
+                    downSourceType = 1,
+                    triggerType = 1,
+                ) ?: run {
+                    Log.w(TAG, "$logPrefix build req failed msg=$candidateMsgId elem=$elementId")
+                    return false
+                }
+                val ok = runCatching {
+                    requestMethod.invoke(service, request)
+                    true
+                }.getOrElse { t ->
+                    Log.w(
+                        TAG,
+                        "$logPrefix exception pair=${pairLabel(peer, peerChatType)} variant=$variant " +
+                            "msg=$candidateMsgId elem=$elementId: ${t.javaClass.simpleName} ${t.message}",
+                    )
+                    false
+                }
+                Log.i(
+                    TAG,
+                    "$logPrefix: pair=${pairLabel(peer, peerChatType)} variant=$variant " +
+                        "msg=$candidateMsgId elem=$elementId dl=$downloadType thumb=$thumbSize " +
+                        "peer=$peer chatType=$peerChatType ok=$ok",
+                )
+                return ok
+            }
+
+            when (kind) {
+                RecordRichMediaKind.VIDEO_THUMB -> {
+                    val video = invokeGetter(element, "getVideoElement") ?: return
+                    @Suppress("UNCHECKED_CAST")
+                    val videoThumbs = invokeGetter(video, "getThumbPath") as? Map<*, *>
+                    if (videoThumbs.orEmpty().values.any { pathUsable(it as? String) }) return
+                    logOnceRecordMedia("videoProbe:$msgId:$elementId") {
+                        "videoRecord probe: msg=$msgId root=${rootMsgIdOverride ?: 0L} " +
+                            "elem=$elementId fields=${videoElementFieldDump(video)}"
+                    }
+                    // 普通聊天保持单变体不回归；聊天记录内跨会话视频才多试变体。
+                    val thumbVariants = if (isChatRecordMedia) {
+                        listOf(
+                            Triple(2, 0, "thumb0"),
+                            Triple(2, 198, "thumb198"),
+                        )
+                    } else {
+                        listOf(Triple(2, 0, "thumb0"))
+                    }
+                    for (candidateMsgId in candidateMsgIds) {
+                        for ((peer, peerChatType) in peerCandidates) {
+                            for ((downloadType, thumbSize, variant) in thumbVariants) {
+                                val key =
+                                    "video:${pairLabel(peer, peerChatType)}:$candidateMsgId:" +
+                                        "$peer:$elementId:$variant"
+                                if (!imageDownloadRequested.add(key)) continue
+                                if (invokeRichMedia(
+                                        peer, peerChatType, candidateMsgId, downloadType, thumbSize,
+                                        "video thumb request", variant,
+                                    )
+                                ) {
+                                    requested++
+                                }
+                            }
+                        }
+                    }
+                }
+
+                RecordRichMediaKind.VIDEO_FILE -> {
+                    // 缩略图拿不到时：仅聊天记录内视频触发视频文件下载（downloadType=1）+ 抽首帧，
+                    // 普通聊天不自动下载视频本体（避免流量/行为回归）。
+                    if (!isChatRecordMedia) return
+                    scheduleChatRecordVideoFileAndFrame(
+                        service = service,
+                        requestMethod = requestMethod,
+                        rootMsgId = rootMsgIdOverride ?: 0L,
+                        innerMsgId = msgId,
+                        elementId = elementId,
+                        candidateMsgIds = candidateMsgIds,
+                        peerCandidates = peerCandidates,
+                        recordPeerUid = recordPeerUid,
+                        recordChatType = recordChatType,
+                        cl = cl,
+                    )
+                }
+
+                RecordRichMediaKind.PIC_THUMB -> {
+                    val pic = invokeGetter(element, "getPicElement") ?: return
+                    val sourcePath = invokeGetter(pic, "getSourcePath") as? String
+                    @Suppress("UNCHECKED_CAST")
+                    val thumbs = invokeGetter(pic, "getThumbPath") as? Map<*, *>
+                    if (pathUsable(sourcePath) || thumbs.orEmpty().values.any { pathUsable(it as? String) }) {
+                        return
+                    }
+                    val fileName = (invokeGetter(pic, "getFileName") as? String)
+                        ?.substringAfterLast('/')?.substringAfterLast('.', "jpg")
+                        ?.takeIf { it.length in 1..5 } ?: "jpg"
+                    val targetPath = appContext()?.cacheDir?.let { cacheDir ->
+                        java.io.File(cacheDir, "m3tim_richmedia/${msgId}_${elementId}.$fileName")
+                            .apply { parentFile?.mkdirs() }
+                            .absolutePath
+                    }
+                    // 组合尝试：msgId ∈ {innerMsgId, rootMsgId} × peer ∈ {inner record peer, root chat peer}。
+                    // 真机现象：C2C 私聊转发进群聊的图片，用 inner msgId+inner peer 请求全部 ok 但内核不回
+                    // richmedia complete；需要验证内核实际按哪个会话上下文绑定（root 群 peer 往往才是会话本体）。
+                    val variants = listOf(
+                        Triple(2, 720, "thumb720"),
+                        Triple(2, 198, "thumb198"),
+                        Triple(1, 0, "origin"),
+                    )
+                    var anyRequested = false
+                    for (candidateMsgId in candidateMsgIds) {
+                        if (targetPath != null) {
+                            pendingRichMediaPaths["$candidateMsgId:$elementId"] = targetPath
+                        }
+                        for ((peer, peerChatType) in peerCandidates) {
+                            for ((downloadType, thumbSize, variant) in variants) {
+                                val reqKey =
+                                    "pic:${pairLabel(peer, peerChatType)}:$candidateMsgId:" +
+                                        "$peer:$elementId:$variant"
+                                if (!imageDownloadRequested.add(reqKey)) continue
+                                if (invokeRichMedia(
+                                        peer, peerChatType, candidateMsgId, downloadType, thumbSize,
+                                        "richmedia request", variant,
+                                    )
+                                ) {
+                                    requested++
+                                    anyRequested = true
+                                }
+                            }
+                        }
+                    }
+                    // 内核 richmedia 多次不响应时（聊天记录内跨会话图片常见）补 HTTP 兜底。
+                    scheduleChatRecordImageHttpFallback(
+                        msgId = msgId,
+                        elementId = elementId,
+                        pic = pic,
+                        rootMsgId = rootMsgIdOverride ?: 0L,
+                    )
+                    if (!anyRequested) {
+                        logOnceRecordMedia("richSkip:$msgId:$elementId") {
+                            "richmedia request skipped msg=$msgId elem=$elementId " +
+                                "(all pairs/variants already requested or failed)"
+                        }
+                    }
+                }
+            }
+        }
+
+        records.forEach { record ->
+            if (record == null) return@forEach
+            val elements = invokeGetter(record, "getElements") as? List<*> ?: return@forEach
+            elements.forEach { element ->
+                if (element == null) return@forEach
+                val elementType = (invokeGetter(element, "getElementType") as? Number)?.toInt() ?: 0
+                when (elementType) {
+                    ELEMENT_TYPE_VIDEO -> {
+                        if (invokeGetter(element, "getVideoElement") == null) return@forEach
+                        requestRecordRichMedia(record, element, RecordRichMediaKind.VIDEO_THUMB)
+                        requestRecordRichMedia(record, element, RecordRichMediaKind.VIDEO_FILE)
+                    }
+                    ELEMENT_TYPE_PIC -> {
+                        picCount++
+                        if (invokeGetter(element, "getPicElement") == null) return@forEach
+                        requestRecordRichMedia(record, element, RecordRichMediaKind.PIC_THUMB)
+                    }
+                }
+            }
+        }
+        if (requested > 0) {
+            Log.i(TAG, "image download: pics=$picCount requested=$requested chat=$chatId")
+        }
+    }
+
+    private fun formatSeparator(timeMillis: Long): String {
+        val label = formatChatTimeLabel(if (timeMillis < 10_000_000_000L) timeMillis else timeMillis / 1000L)
+        val clock = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(timeMillis))
+        return when {
+            label == clock -> "今天 $clock"
+            label == "昨天" -> "昨天 $clock"
+            else -> "$label $clock"
+        }
+    }
+
+    private fun formatFileSize(bytes: Long): String = when {
+        bytes <= 0L -> ""
+        bytes < 1024L -> "$bytes B"
+        bytes < 1024L * 1024L -> String.format(Locale.getDefault(), "%.1f KB", bytes / 1024.0)
+        bytes < 1024L * 1024L * 1024L ->
+            String.format(Locale.getDefault(), "%.1f MB", bytes / (1024.0 * 1024.0))
+        else -> String.format(Locale.getDefault(), "%.1f GB", bytes / (1024.0 * 1024.0 * 1024.0))
+    }
+
+    private fun pathUsable(path: String?): Boolean =
+        !path.isNullOrBlank() && runCatching { java.io.File(path).exists() }.getOrDefault(false)
+
+    private fun invokeGetter(target: Any, name: String): Any? = runCatching {
+        target.javaClass.getMethod(name).invoke(target)
+    }.getOrNull()
+
+    /** 反射 Proxy 的默认返回值：基本类型不能返回 null。 */
+    private fun defaultValueFor(type: Class<*>): Any? = when (type) {
+        java.lang.Boolean.TYPE -> false
+        java.lang.Byte.TYPE -> 0.toByte()
+        java.lang.Short.TYPE -> 0.toShort()
+        java.lang.Integer.TYPE -> 0
+        java.lang.Long.TYPE -> 0L
+        java.lang.Float.TYPE -> 0f
+        java.lang.Double.TYPE -> 0.0
+        java.lang.Character.TYPE -> '\u0000'
+        else -> null
+    }
+
+    // TIM NT 的消息元素类型（MsgElement.elementType）
+    private const val ELEMENT_TYPE_TEXT = 1
+    private const val ELEMENT_TYPE_PIC = 2
+    private const val ELEMENT_TYPE_FILE = 3
+    private const val ELEMENT_TYPE_PTT = 4
+    private const val ELEMENT_TYPE_VIDEO = 5
+    private const val ELEMENT_TYPE_REPLY = 7
+    private const val ELEMENT_TYPE_FACE = 6
+    private const val ELEMENT_TYPE_GRAY_TIP = 8
+    private const val ELEMENT_TYPE_MARKET_FACE = 11
+    private const val ELEMENT_TYPE_WALLET = 9
+    private const val ELEMENT_TYPE_ARK = 10
+
+    // ---------------------------------------------------------------------
+    // 聊天信息页：群资料 / 群成员 / 单聊资料
+    // ---------------------------------------------------------------------
+
+    private data class CachedChatInfo(val data: ChatInfoData, val at: Long)
+
+    private val chatInfoCache = ConcurrentHashMap<String, CachedChatInfo>()
+
+    // ---- 快慢拆分：缓存 + 后台刷新（loadChatInfoFast / DataUpdate） ----
+
+    private const val CHAT_INFO_CACHE_TTL_MS = 60_000L
+    private const val GROUP_NOTICE_CACHE_TTL_MS = 5 * 60_000L
+    private const val GROUP_MEMBERS_CACHE_TTL_MS = 5 * 60_000L
+    private const val GROUP_MEMO_CACHE_TTL_MS = 5 * 60_000L
+
+    /** 群成员缓存（groupCode -> members）：loadChatInfo 快路径直接读，后台 getAllMemberListV2 刷新。 */
+    private data class CachedGroupMembers(val list: List<ChatMember>, val at: Long)
+    private val groupMembersCache = ConcurrentHashMap<Long, CachedGroupMembers>()
+    private val groupMembersRefreshInFlight = ConcurrentHashMap.newKeySet<Long>()
+
+    /** 最新公告 memo 缓存（groupCode -> text）：避免每次 loadChatInfo 同步等 6s SSO 轮询。 */
+    private data class CachedMemo(val text: String, val at: Long)
+    private val groupMemoCache = ConcurrentHashMap<Long, CachedMemo>()
+    private val groupMemoRefreshInFlight = ConcurrentHashMap.newKeySet<Long>()
+
+    /** 群公告网络刷新去重（同 chat 同时只跑一个后台刷新）。 */
+    private val groupNoticeRefreshInFlight = ConcurrentHashMap.newKeySet<String>()
+
+    /** 群详情缓存（batchQueryCachedGroupDetailInfo 结果；网络补全放后台）。 */
+    private val groupDetailCache = ConcurrentHashMap<Long, Any>()
+    private val groupDetailRefreshInFlight = ConcurrentHashMap.newKeySet<Long>()
+
+    /** 群免打扰（cmdUinMsgMask）缓存：groupCode -> muted，TTL 60s；通知/最近会话共用。 */
+    private data class CachedGroupMute(val muted: Boolean, val maskName: String, val at: Long)
+
+    private val groupMuteCache = ConcurrentHashMap<Long, CachedGroupMute>()
+    private const val GROUP_MUTE_CACHE_TTL_MS = 60_000L
+    private const val GROUP_MUTE_QUERY_TIMEOUT_MS = 2_000L
+
+    /** 最近会话快照：fast 路径不触发 loadRecentChats 的等待/重试。 */
+    @Volatile
+    private var recentChatsCache: List<ChatItem> = emptyList()
+
+    /** 后台刷新线程（成员/公告/群详情/最新 memo 串行执行，避免并发打满内核）。 */
+    private val perfRefreshExecutor =
+        java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, "m3tim-refresher").apply { isDaemon = true }
+        }
+
+    /** groupCode → chatId（用于后台刷新完成后 emit DataUpdate / 清 chatInfoCache）。 */
+    private fun chatIdForGroupCode(groupCode: Long): String =
+        chatMeta.entries.firstOrNull { it.value.isGroup && it.value.groupCode == groupCode }?.key
+            ?: "tim_2_$groupCode"
+
+    private fun perfUptime(): Long = android.os.SystemClock.uptimeMillis()
+
+    // ---- 好友管理 / 新的朋友（内核 BuddyService） ----
+    @Volatile
+    private var buddyReqListenerRegistered = false
+
+    @Volatile
+    private var cachedBuddyReqs: List<Any?> = emptyList()
+
+    @Volatile
+    private var buddyReqLatch: java.util.concurrent.CountDownLatch? = null
+
+    /** uid -> 好友申请 reqTime（同意/拒绝时需要回传） */
+    private val buddyReqTimeByUid = ConcurrentHashMap<String, Long>()
+
+    /** 是否已经触发过一次 TIM 风控/过滤通知列表拉取（OidbSvc.0xd69）。 */
+    @Volatile
+    private var suspiciousFetchedOnce = false
+
+    /** 阻塞加载聊天信息页数据（群资料+群成员列表 / 单聊资料）；失败返回 null。 */
+    /** 清掉某会话的群资料/成员列表缓存，下一次 loadChatInfo 会重新拉取。 */
+    fun invalidateChatInfoCache(chatId: String) {
+        chatInfoCache.remove(chatId)
+        Log.i(TAG, "chatInfo: invalidate cache chat=$chatId")
+    }
+
+    fun loadChatInfo(chatId: String): ChatInfoData? {
+        if (!isHost) return null
+        val started = perfUptime()
+        chatInfoCache[chatId]?.let { cached ->
+            if (perfUptime() - cached.at < CHAT_INFO_CACHE_TTL_MS) {
+                Log.i(TAG, "perf: loadChatInfo cache chat=$chatId ms=${perfUptime() - started}")
+                return cached.data
+            }
+        }
+        if (!ensureServices()) return null
+        // 优先最近会话快照，避免冷启动时 loadRecentChats 的重试等待阻塞资料页（现 ≤2s）。
+        val chat = recentChatsCache.firstOrNull { it.id == chatId }
+            ?: loadRecentChats()?.firstOrNull { it.id == chatId }
+            ?: buildFallbackChat(chatId)
+            ?: return null
+        val meta = chatMeta[chatId]
+        val data = if (chat.isGroup) {
+            loadGroupChatInfo(chat, meta, chatId)
+        } else {
+            loadUserChatInfo(chat, meta, chatId)
+        }
+        chatInfoCache[chatId] = CachedChatInfo(data, perfUptime())
+        Log.i(
+            TAG,
+            "perf: loadChatInfo chat=$chatId group=${chat.isGroup} members=${data.members.size} " +
+                "notice=${data.notice.length}ch ms=${perfUptime() - started}",
+        )
+        return data
+    }
+
+    /**
+     * 毫秒级快速路径：缓存优先；没有缓存则用最近会话快照/chatMeta 合成（不等内核列表/网络/SSO），
+     * 群成员/公告/群详情由后台刷新，完成后通过 LiveEvents.dataUpdates 通知 UI 局部刷新。
+     */
+    fun loadChatInfoFast(chatId: String): ChatInfoData? {
+        if (!isHost) return null
+        val started = perfUptime()
+        chatInfoCache[chatId]?.let { cached ->
+            if (perfUptime() - cached.at < CHAT_INFO_CACHE_TTL_MS) {
+                Log.i(TAG, "perf: loadChatInfoFast cache chat=$chatId ms=${perfUptime() - started}")
+                return cached.data
+            }
+        }
+        val chat = recentChatsCache.firstOrNull { it.id == chatId }
+            ?: buildFallbackChat(chatId)
+            ?: return null
+        if (!ensureServices()) return null
+        val meta = chatMeta[chatId]
+        val data = if (chat.isGroup) {
+            loadGroupChatInfo(chat, meta, chatId)
+        } else {
+            loadUserChatInfo(chat, meta, chatId)
+        }
+        chatInfoCache[chatId] = CachedChatInfo(data, perfUptime())
+        Log.i(
+            TAG,
+            "perf: loadChatInfoFast chat=$chatId group=${chat.isGroup} members=${data.members.size} " +
+                "ms=${perfUptime() - started}",
+        )
+        return data
+    }
+
+    /** 最近会话里还没有该会话时（如刚创建的群），用本地 chatMeta 合成一个最小 ChatItem 供资料页使用。 */
+    private fun buildFallbackChat(chatId: String): ChatItem? {
+        val meta = chatMeta[chatId] ?: ensureChatContext(chatId) ?: return null
+        return ChatItem(
+            id = chatId,
+            name = meta.name,
+            lastMessage = "",
+            timeLabel = "",
+            avatarSeed = (meta.peerUin.shr(0).toInt() xor meta.peerUid.hashCode()),
+            isGroup = meta.isGroup,
+        )
+    }
+
+    /** 快路径群详情：只读 batch 缓存（不触发网络等待）；缺失时后台刷新。 */
+    private fun cachedGroupDetail(groupCode: Long): Any? {
+        if (groupCode == 0L) return null
+        val cached = groupDetailCache[groupCode]
+        if (cached == null) scheduleGroupDetailRefresh(groupCode)
+        return cached
+    }
+
+    private fun scheduleGroupDetailRefresh(groupCode: Long) {
+        if (groupCode == 0L) return
+        if (!groupDetailRefreshInFlight.add(groupCode)) return
+        perfRefreshExecutor.execute {
+            val started = perfUptime()
+            try {
+                val cl = hostClassLoader() ?: return@execute
+                val detail = queryGroupDetail(cl, groupCode)
+                if (detail != null) {
+                    groupDetailCache[groupCode] = detail
+                    val chatId = chatIdForGroupCode(groupCode)
+                    chatInfoCache.remove(chatId)
+                    Log.i(
+                        TAG,
+                        "perf: groupDetail refresh group=$groupCode chat=$chatId " +
+                            "ms=${perfUptime() - started}",
+                    )
+                    LiveEvents.emitDataUpdate(
+                        DataUpdate(chatId = chatId, kind = DataUpdate.Kind.CHAT_INFO),
+                    )
+                } else {
+                    Log.i(
+                        TAG,
+                        "perf: groupDetail refresh group=$groupCode empty " +
+                            "ms=${perfUptime() - started}",
+                    )
+                }
+            } catch (t: Throwable) {
+                Log.w(
+                    TAG,
+                    "perf: groupDetail refresh failed group=$groupCode: " +
+                        "${t.javaClass.simpleName} ${t.message}",
+                )
+            } finally {
+                groupDetailRefreshInFlight.remove(groupCode)
+            }
+        }
+    }
+
+    private fun loadGroupChatInfo(
+        chat: ChatItem,
+        meta: ChatMeta?,
+        chatId: String,
+    ): ChatInfoData {
+        val started = perfUptime()
+        val groupCode = meta?.groupCode
+            ?: chatId.split('_').getOrNull(2)?.toLongOrNull()
+            ?: 0L
+        // 群详情：只读 batch 缓存；缺失/过期由后台补全（可能走网络），不阻塞首屏。
+        val detail = if (groupCode != 0L) cachedGroupDetail(groupCode) else null
+        val description = if (detail != null) {
+            listOf("getFingerMemo", "getRichFingerMemo")
+                .mapNotNull { invokeGetter(detail, it) as? String }
+                .firstOrNull { it.isNotBlank() }
+                .orEmpty()
+        } else {
+            ""
+        }
+        // 群公告：groupMemo 是截断预览；最新 memo 先读内存/本地 DB，0x8f9_14 SSO 刷新放后台。
+        val memoNotice = if (detail != null) {
+            (invokeGetter(detail, "getGroupMemo") as? String)
+                ?.takeIf { it.isNotBlank() }
+                .orEmpty()
+        } else {
+            ""
+        }
+        val notice = cleanNoticeText(latestMemoCached(groupCode))
+            .ifBlank { cleanNoticeText(memoNotice) }
+        val detailCount = (detail?.let { invokeGetter(it, "getMemberNum") } as? Number)?.toInt() ?: 0
+        // 群成员：缓存优先（缺失/过期 → 后台 getAllMemberListV2 刷新并 emit MEMBERS）。
+        val members = groupMembersFast(groupCode)
+        val memberCount = when {
+            detailCount > 0 -> detailCount
+            chat.memberCount > 0 -> chat.memberCount
+            else -> members.size
+        }
+        // 群头像：缓存命中直接填，未命中后台下载（scheduleGroupAvatarDownload，不阻塞）。
+        val avatar = chat.avatarPath ?: meta?.let { scheduleGroupAvatarDownload(it, groupCode) }
+        val infoChat = if (avatar != null && avatar != chat.avatarPath) {
+            chat.copy(avatarPath = avatar)
+        } else {
+            chat
+        }
+        Log.i(
+            TAG,
+            "perf: loadGroupChatInfo chat=$chatId group=$groupCode members=${members.size} " +
+                "notice=${notice.length}ch detail=${detail != null} ms=${perfUptime() - started}",
+        )
+        return ChatInfoData(
+            chat = infoChat,
+            members = members,
+            notice = notice,
+            timId = if (groupCode != 0L) groupCode.toString() else "",
+            description = description,
+            memberCount = memberCount,
+        )
+    }
+
+    private fun loadUserChatInfo(chat: ChatItem, meta: ChatMeta?, chatId: String): ChatInfoData {
+        val uid = meta?.peerUid?.takeIf { it.isNotBlank() }
+            ?: chatId.removePrefix("tim_friend_")
+        var uin = meta?.peerUin ?: 0L
+        if (uin == 0L) uin = uinForUid(uid)
+        var signature: String? = null
+        runCatching {
+            val service = profileService ?: return@runCatching
+            @Suppress("UNCHECKED_CAST")
+            val infos = service.javaClass
+                .getMethod("getCoreAndBaseInfo", String::class.java, ArrayList::class.java)
+                .invoke(service, "", ArrayList<String>().apply { add(uid) }) as? Map<*, *>
+            val info = infos?.get(uid) ?: return@runCatching
+            val core = invokeGetter(info, "getCoreInfo")
+            if (core != null) {
+                val coreUin = (invokeGetter(core, "getUin") as? Number)?.toLong() ?: 0L
+                if (uin == 0L && coreUin != 0L) uin = coreUin
+            }
+            val base = invokeGetter(info, "getBaseInfo")
+            if (base != null) signature = invokeGetter(base, "getLongNick") as? String
+        }
+        val timId = if (uin != 0L) uin.toString() else uid
+        val avatar = chat.avatarPath ?: userAvatarPath(uid, uin)
+        val infoChat = if (avatar != null && avatar != chat.avatarPath) {
+            chat.copy(avatarPath = avatar)
+        } else {
+            chat
+        }
+        return ChatInfoData(
+            chat = infoChat,
+            members = emptyList(),
+            notice = "",
+            timId = timId,
+            description = signature.orEmpty(),
+            memberCount = 1,
+        )
+    }
+
+    /** 群资料：先读缓存，缓存没有就向服务器拉一次再读。 */
+    private fun queryGroupDetail(cl: ClassLoader, groupCode: Long): Any? {
+        val service = kernelService?.let { invokeGetter(it, "getGroupService") } ?: return null
+        batchGroupDetail(cl, service, groupCode)?.let { return it }
+        runCatching {
+            val sourceClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.GroupInfoSource",
+                false,
+                cl,
+            )
+            val source = sourceClass.enumConstants
+                ?.firstOrNull { (it as? Enum<*>)?.name == "KAIO" }
+                ?: sourceClass.enumConstants?.firstOrNull()
+                ?: return@runCatching
+            val method = service.javaClass.methods.firstOrNull {
+                it.name == "getGroupDetailInfo" && it.parameterCount == 3
+            } ?: return@runCatching
+            awaitCallback(
+                cl,
+                "com.tencent.qqnt.kernel.nativeinterface.IOperateCallback",
+                6_000L,
+            ) { proxy -> method.invoke(service, groupCode, source, proxy) }
+        }
+        return batchGroupDetail(cl, service, groupCode)
+    }
+
+    private fun batchGroupDetail(cl: ClassLoader, service: Any, groupCode: Long): Any? {
+        val reqClass = runCatching {
+            Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.BatchQueryCachedGroupDetailInfoReq",
+                false,
+                cl,
+            )
+        }.getOrNull() ?: return null
+        val request = runCatching { reqClass.getConstructor().newInstance() }.getOrNull() ?: return null
+        @Suppress("UNCHECKED_CAST")
+        val codes = runCatching { reqClass.getField("groupCodes").get(request) as? ArrayList<Long> }
+            .getOrNull() ?: return null
+        codes.add(groupCode)
+        val method = service.javaClass.methods.firstOrNull {
+            it.name == "batchQueryCachedGroupDetailInfo" && it.parameterCount == 2
+        } ?: return null
+        val args = awaitCallback(
+            cl,
+            "com.tencent.qqnt.kernel.nativeinterface.IBatchQueryCachedGroupDetailInfoCallback",
+            3_000L,
+        ) { proxy -> method.invoke(service, request, proxy) } ?: return null
+        val list = args.getOrNull(0) as? List<*> ?: return null
+        val details = list.filterNotNull()
+        val found = details.firstOrNull {
+            (invokeGetter(it, "getGroupCode") as? Number)?.toLong() == groupCode
+        } ?: details.firstOrNull()
+        if (found != null) groupDetailCache[groupCode] = found
+        return found
+    }
+
+    private fun appRuntime(): Any? = runCatching {
+        val cl = hostClassLoader() ?: return null
+        val mobileQQClass = Class.forName("mqq.app.MobileQQ", false, cl)
+        val mobileQQ = mobileQQClass.getField("sMobileQQ").get(null) ?: return null
+        mobileQQClass.getMethod("peekAppRuntime").invoke(mobileQQ)
+    }.getOrNull()
+
+    /**
+     * 通过 TIM 自己的 SSO 通道（TroopAnnouncementHandler.S → OidbSvc.0x8f9_14
+     * getLatestTroopMemo）拉取最新群公告的**完整正文**，
+     * 结果会写回 TroopInfo.latestMemo（群资料里的 groupMemo 只是截断版）。
+     */
+    private fun latestAnnouncementFromTim(groupCode: Long): String? {
+        val cl = hostClassLoader() ?: return null
+        val runtime = appRuntime() ?: return null
+        val handler = runCatching {
+            val nameApiClass = Class.forName("com.tencent.mobileqq.troop.api.ITroopHandlerNameApi", false, cl)
+            val qroute = Class.forName("com.tencent.mobileqq.qroute.QRoute", false, cl)
+            val api = qroute.getMethod("api", Class::class.java).invoke(null, nameApiClass)
+                ?: return null
+            val handlerName = nameApiClass
+                .getMethod("getTroopAnnouncementHandlerName")
+                .invoke(api) as? String ?: return null
+            runtime.javaClass
+                .getMethod("getBusinessHandler", String::class.java)
+                .invoke(runtime, handlerName)
+        }.getOrNull() ?: return null
+        runCatching {
+            handler.javaClass.getMethod("S", String::class.java)
+                .invoke(handler, groupCode.toString())
+            Log.i(TAG, "requested latest memo via SSO: $groupCode")
+        }.onFailure {
+            Log.w(TAG, "request latest memo failed: ${it.javaClass.simpleName} ${it.message}")
+            return null
+        }
+        val troopService = runCatching {
+            val troopServiceClass = Class.forName(
+                "com.tencent.mobileqq.troop.api.ITroopInfoService", false, cl,
+            )
+            runtime.javaClass
+                .getMethod("getRuntimeService", Class::class.java, String::class.java)
+                .invoke(runtime, troopServiceClass, "")
+        }.getOrNull() ?: return null
+        // SSO 结果会异步写回 TroopInfo.latestMemo：先读本地值，短轮询等更长版本；
+        // 有本地值时最多再等 1.2s，没有时最多 2s（原固定 6s，用户打开公告页会白等）。
+        val ssoStarted = perfUptime()
+        val localMemo = latestMemoLocal(groupCode)
+        var longest = localMemo.orEmpty()
+        val waitBudgetMs = if (longest.isNotBlank()) 1_200L else 2_000L
+        val deadline = android.os.SystemClock.uptimeMillis() + waitBudgetMs
+        while (android.os.SystemClock.uptimeMillis() < deadline) {
+            val memo = runCatching {
+                val info = troopService.javaClass
+                    .getMethod("getTroopInfo", String::class.java)
+                    .invoke(troopService, groupCode.toString()) ?: return@runCatching null
+                info.javaClass.getMethod("getLatestMemo").invoke(info) as? String
+            }.getOrNull()
+            if (!memo.isNullOrBlank() && memo.length > longest.length) {
+                longest = memo
+            }
+            Thread.sleep(120L)
+        }
+        if (longest.isNotBlank()) {
+            Log.i(
+                TAG,
+                "perf: latest memo via SSO len=${longest.length} " +
+                    "waitMs=${perfUptime() - ssoStarted}",
+            )
+        }
+        return longest.takeIf { it.isNotBlank() }
+    }
+
+    /** 同步本地读 TIM TroopInfo.getLatestMemo()（不发 SSO 请求，通常几 ms）。 */
+    private fun latestMemoLocal(groupCode: Long): String? {
+        if (groupCode == 0L) return null
+        val cl = hostClassLoader() ?: return null
+        val runtime = appRuntime() ?: return null
+        return runCatching {
+            val troopServiceClass = Class.forName(
+                "com.tencent.mobileqq.troop.api.ITroopInfoService", false, cl,
+            )
+            val troopService = runtime.javaClass
+                .getMethod("getRuntimeService", Class::class.java, String::class.java)
+                .invoke(runtime, troopServiceClass, "") ?: return@runCatching null
+            val info = troopService.javaClass
+                .getMethod("getTroopInfo", String::class.java)
+                .invoke(troopService, groupCode.toString()) ?: return@runCatching null
+            (info.javaClass.getMethod("getLatestMemo").invoke(info) as? String)
+                ?.takeIf { it.isNotBlank() }
+        }.getOrNull()
+    }
+
+    /** 快路径拿最新公告 memo：内存缓存 → 本地 DB；过期/缺失把 SSO 刷新放后台。 */
+    private fun latestMemoCached(groupCode: Long): String {
+        if (groupCode == 0L) return ""
+        val now = perfUptime()
+        groupMemoCache[groupCode]?.let { cached ->
+            if (now - cached.at >= GROUP_MEMO_CACHE_TTL_MS) scheduleGroupMemoRefresh(groupCode)
+            if (cached.text.isNotBlank()) return cached.text
+        }
+        val local = runCatching { latestMemoLocal(groupCode) }.getOrNull().orEmpty()
+        if (local.isNotBlank()) {
+            groupMemoCache[groupCode] = CachedMemo(local, now)
+            return local
+        }
+        scheduleGroupMemoRefresh(groupCode)
+        return ""
+    }
+
+    private fun scheduleGroupMemoRefresh(groupCode: Long) {
+        if (groupCode == 0L) return
+        if (!groupMemoRefreshInFlight.add(groupCode)) return
+        perfRefreshExecutor.execute {
+            val started = perfUptime()
+            try {
+                val memo = latestAnnouncementFromTim(groupCode)
+                val chatId = chatIdForGroupCode(groupCode)
+                if (!memo.isNullOrBlank()) {
+                    groupMemoCache[groupCode] = CachedMemo(memo, perfUptime())
+                    chatInfoCache.remove(chatId)
+                    Log.i(
+                        TAG,
+                        "perf: memo refresh group=$groupCode chat=$chatId len=${memo.length} " +
+                            "ms=${perfUptime() - started}",
+                    )
+                    LiveEvents.emitDataUpdate(
+                        DataUpdate(chatId = chatId, kind = DataUpdate.Kind.CHAT_INFO),
+                    )
+                } else {
+                    groupMemoCache[groupCode] = CachedMemo("", perfUptime())
+                    Log.i(
+                        TAG,
+                        "perf: memo refresh group=$groupCode chat=$chatId empty " +
+                            "ms=${perfUptime() - started}",
+                    )
+                }
+            } catch (t: Throwable) {
+                Log.w(
+                    TAG,
+                    "perf: memo refresh failed group=$groupCode: " +
+                        "${t.javaClass.simpleName} ${t.message}",
+                )
+            } finally {
+                groupMemoRefreshInFlight.remove(groupCode)
+            }
+        }
+    }
+
+    /** 解析群头像：先查缓存，取不到就强制下载一次再查。 */
+    private fun ensureGroupAvatar(meta: ChatMeta?, groupCode: Long): String? {
+        if (meta == null || groupCode == 0L) return null
+        chatAvatarPath(meta, big = true)?.let { return it }
+        chatAvatarPath(meta, big = false)?.let { return it }
+        val service = avatarService ?: return null
+        val sizeClass = avatarSizeClass ?: return null
+        val size = avatarSizeSmall ?: return null
+        val cl = hostClassLoader() ?: return null
+        runCatching {
+            val method = service.javaClass.methods.firstOrNull {
+                it.name == "forceDownloadGroupAvatar" && it.parameterCount == 3
+            } ?: return@runCatching
+            awaitCallback(
+                cl,
+                "com.tencent.qqnt.kernel.nativeinterface.IOperateCallback",
+                4_000L,
+            ) { proxy -> method.invoke(service, groupCode, size, proxy) }
+        }
+        chatAvatarPath(meta, big = true)?.let { return it }
+        chatAvatarPath(meta, big = false)?.let { return it }
+        return runCatching {
+            service.javaClass
+                .getMethod("getGroupAvatarPath", Long::class.javaPrimitiveType, sizeClass)
+                .invoke(service, groupCode, size) as? String
+        }.getOrNull()?.takeIf { it.isNotBlank() }
+    }
+
+    /**
+     * 最近会话群头像：只做「同步查缓存」，未命中则把 [ensureGroupAvatar] 的下载等待放后台 executor，
+     * 完成后 refreshChatsSoon() 让 LiveChats 重新拉取（下一轮 loadRecentChats 就能回填 avatarPath）。
+     * 同群下载去重；日志 chatAvatar: group=<code> cached=true/false download=queued/ok/failed。
+     */
+    private fun scheduleGroupAvatarDownload(meta: ChatMeta, groupCode: Long): String? {
+        if (groupCode == 0L) return null
+        chatAvatarPath(meta, big = true)?.let { path ->
+            if (groupAvatarLogged.add("cached:$groupCode")) {
+                Log.i(TAG, "chatAvatar: group=$groupCode cached=true path=${path.take(80)}")
+            }
+            return path
+        }
+        chatAvatarPath(meta, big = false)?.let { path ->
+            if (groupAvatarLogged.add("cached:$groupCode")) {
+                Log.i(TAG, "chatAvatar: group=$groupCode cached=true path=${path.take(80)}")
+            }
+            return path
+        }
+        if (avatarService == null || avatarSizeClass == null || avatarSizeSmall == null) {
+            if (groupAvatarLogged.add("skip:$groupCode")) {
+                Log.i(TAG, "chatAvatar: group=$groupCode cached=false download=skipped (avatar service not ready)")
+            }
+            return null
+        }
+        if (!groupAvatarDownloadRequested.add(groupCode)) return null
+        if (groupAvatarLogged.add("queued:$groupCode")) {
+            Log.i(TAG, "chatAvatar: group=$groupCode cached=false download=queued")
+        }
+        groupAvatarExecutor.execute {
+            val path = runCatching { ensureGroupAvatar(meta, groupCode) }
+                .onFailure {
+                    Log.w(
+                        TAG,
+                        "chatAvatar: group=$groupCode download failed: " +
+                            "${it.javaClass.simpleName} ${it.message}",
+                    )
+                }
+                .getOrNull()
+            if (path != null) {
+                groupAvatarLogged.remove("queued:$groupCode")
+                if (groupAvatarLogged.add("ok:$groupCode")) {
+                    Log.i(TAG, "chatAvatar: group=$groupCode cached=false download=ok path=${path.take(80)}")
+                }
+                groupAvatarDownloadRequested.remove(groupCode)
+                refreshChatsSoon()
+            } else {
+                if (groupAvatarLogged.add("failed:$groupCode")) {
+                    Log.i(TAG, "chatAvatar: group=$groupCode cached=false download=failed")
+                }
+                // 失败 60s 后允许重试（避免一直占着去重标记）。
+                mainHandler.postDelayed({
+                    groupAvatarDownloadRequested.remove(groupCode)
+                }, 60_000L)
+            }
+        }
+        return null
+    }
+
+    /** 群成员列表（getAllMemberListV2，一次拉全量）。 */
+    private fun queryGroupMembersBlocking(
+        cl: ClassLoader,
+        groupCode: Long,
+        ownerUin: Long,
+        ownerUid: String,
+    ): List<ChatMember> {
+        val started = perfUptime()
+        val service = kernelService?.let { invokeGetter(it, "getGroupService") } ?: return emptyList()
+        val method = service.javaClass.methods.firstOrNull {
+            it.name == "getAllMemberListV2" && it.parameterCount == 3
+        } ?: return emptyList()
+        val args = runCatching {
+            awaitCallback(
+                cl,
+                "com.tencent.qqnt.kernel.nativeinterface.IGroupMemberListCallback",
+                8_000L,
+            ) { proxy -> method.invoke(service, groupCode, true, proxy) }
+        }.getOrNull() ?: return emptyList()
+        val listResult = args.getOrNull(2) ?: return emptyList()
+        @Suppress("UNCHECKED_CAST")
+        val infos = invokeGetter(listResult, "getInfos") as? Map<*, *> ?: return emptyList()
+        val roleCounts = LinkedHashMap<String, Int>()
+        val members = infos.values.mapNotNull { info ->
+            if (info == null) return@mapNotNull null
+            val uid = invokeGetter(info, "getUid") as? String ?: ""
+            val uin = (invokeGetter(info, "getUin") as? Number)?.toLong() ?: 0L
+            if (uid.isBlank() && uin == 0L) return@mapNotNull null
+            val card = (invokeGetter(info, "getCardName") as? String)?.takeIf { it.isNotBlank() }
+            val nick = (invokeGetter(info, "getNick") as? String)?.takeIf { it.isNotBlank() }
+            val remark = (invokeGetter(info, "getRemark") as? String)?.takeIf { it.isNotBlank() }
+            val name = card ?: remark ?: nick ?: (if (uin != 0L) uin.toString() else uid)
+            val flag = (invokeGetter(info, "getMemberFlag") as? Number)?.toInt() ?: 0
+            // 角色唯一可靠来源：MemberInfo.role（MemberRole：UNSPECIFIED=0/STRANGER=1/MEMBER=2/ADMIN=3/OWNER=4）。
+            // memberFlag 位在真机上不可靠（管理员也置位），不再用 flag 猜测 owner/admin。
+            val roleRaw = invokeGetter(info, "getRole")
+            val roleObj = roleRaw as? Enum<*>
+            val roleOrdinal = roleObj?.ordinal ?: -1
+            val roleName = (roleObj?.name ?: roleRaw?.toString().orEmpty()).uppercase()
+            val roleKnown = roleName.isNotBlank() && roleName != "UNSPECIFIED"
+            roleCounts[roleName.ifBlank { "UNKNOWN" }] =
+                (roleCounts[roleName.ifBlank { "UNKNOWN" }] ?: 0) + 1
+            var isOwner = roleKnown && (roleName == "OWNER" || roleOrdinal == 4)
+            val isAdmin = !isOwner && roleKnown && (roleName == "ADMIN" || roleOrdinal == 3)
+            if (!roleKnown) {
+                // 仅 role 未知时用「可靠的 owner uin/uid」兜底（调用方通常传空 → 按普通成员）。
+                isOwner = (ownerUin != 0L && uin == ownerUin) ||
+                    (ownerUid.isNotBlank() && uid == ownerUid)
+                if (!isOwner) {
+                    Log.w(
+                        TAG,
+                        "groupRole: unknown role uid=$uid uin=$uin role=$roleRaw memberFlag=$flag",
+                    )
+                }
+            }
+            if (uid == myUid) {
+                groupMemberSelfRoleByGroupCode[groupCode] = when {
+                    isOwner -> "OWNER"
+                    isAdmin -> "ADMIN"
+                    roleKnown -> roleName
+                    else -> "MEMBER"
+                }
+            }
+            val avatar = memberAvatarPath(uid, uin)
+                ?: (invokeGetter(info, "getAvatarPath") as? String)?.takeIf { pathUsable(it) }
+                ?: userAvatarPath(uid, uin)
+            ChatMember(
+                name = name,
+                avatarSeed = seedFor(uin, uid.hashCode() and 0x7fffffff),
+                isOwner = isOwner,
+                avatarPath = avatar,
+                uin = if (uin != 0L) uin.toString() else "",
+                uid = uid,
+                isAdmin = isAdmin,
+                isMe = uid == myUid,
+            )
+        }
+        if (roleCounts.isNotEmpty()) {
+            Log.i(
+                TAG,
+                "groupRole: group=$groupCode total=${members.size} " +
+                    "owner=${members.count { it.isOwner }} admin=${members.count { it.isAdmin }} " +
+                    "roles=$roleCounts selfRole=${groupMemberSelfRoleByGroupCode[groupCode]}",
+            )
+        }
+        val ordered = members.sortedWith(
+            compareBy({ !it.isOwner }, { !it.isAdmin }, { !it.isMe }, { it.name }),
+        )
+        groupMembersCache[groupCode] = CachedGroupMembers(ordered, perfUptime())
+        Log.i(
+            TAG,
+            "perf: members fetched group=$groupCode size=${ordered.size} " +
+                "ms=${perfUptime() - started}",
+        )
+        return ordered
+    }
+
+    /** 群成员快路径：缓存优先；缺失/过期时后台 getAllMemberListV2 刷新（emit DataUpdate.MEMBERS）。 */
+    private fun groupMembersFast(groupCode: Long): List<ChatMember> {
+        if (groupCode == 0L) return emptyList()
+        val cached = groupMembersCache[groupCode]
+        if (cached == null || perfUptime() - cached.at >= GROUP_MEMBERS_CACHE_TTL_MS) {
+            scheduleGroupMembersRefresh(groupCode)
+        }
+        return cached?.list.orEmpty()
+    }
+
+    private fun scheduleGroupMembersRefresh(groupCode: Long) {
+        if (groupCode == 0L) return
+        if (!groupMembersRefreshInFlight.add(groupCode)) return
+        perfRefreshExecutor.execute {
+            val started = perfUptime()
+            try {
+                val cl = hostClassLoader()
+                val members = if (cl != null) {
+                    queryGroupMembersBlocking(cl, groupCode, 0L, "")
+                } else {
+                    emptyList()
+                }
+                val chatId = chatIdForGroupCode(groupCode)
+                chatInfoCache.remove(chatId)
+                Log.i(
+                    TAG,
+                    "perf: members refresh group=$groupCode chat=$chatId " +
+                        "size=${members.size} ms=${perfUptime() - started}",
+                )
+                LiveEvents.emitDataUpdate(DataUpdate(chatId = chatId, kind = DataUpdate.Kind.MEMBERS))
+            } catch (t: Throwable) {
+                Log.w(
+                    TAG,
+                    "perf: members refresh failed group=$groupCode: " +
+                        "${t.javaClass.simpleName} ${t.message}",
+                )
+            } finally {
+                groupMembersRefreshInFlight.remove(groupCode)
+            }
+        }
+    }
+
+    /**
+     * @ 面板用：阻塞强制拉取群全量成员（内核 `getAllMemberListV2`，≤8s），不读缓存直接拉，
+     * 成功写 [groupMembersCache] 并广播 LiveEvents.DataUpdate(MEMBERS)，UI/@ 面板可立即刷新。
+     * IO 线程调用；失败返回 null。
+     */
+    fun loadGroupMembers(chatId: String): List<ChatMember>? {
+        if (!isHost) return null
+        if (!ensureServices()) return null
+        val started = perfUptime()
+        val groupCode = groupCodeFor(chatId)
+            ?: chatMeta[chatId]?.groupCode
+            ?: chatId.split('_').getOrNull(2)?.toLongOrNull()
+            ?: 0L
+        if (groupCode == 0L) {
+            Log.w(TAG, "at: loadGroupMembers failed chat=$chatId (not a group)")
+            return null
+        }
+        val cl = hostClassLoader() ?: run {
+            Log.w(TAG, "at: loadGroupMembers failed chat=$chatId (classloader)")
+            return null
+        }
+        return try {
+            val members = queryGroupMembersBlocking(cl, groupCode, 0L, "")
+            val ms = perfUptime() - started
+            if (members.isEmpty()) {
+                Log.w(
+                    TAG,
+                    "at: loadGroupMembers failed chat=$chatId group=$groupCode count=0 ms=$ms",
+                )
+                null
+            } else {
+                Log.i(
+                    TAG,
+                    "at: loadGroupMembers chat=$chatId group=$groupCode " +
+                        "count=${members.size} ms=$ms",
+                )
+                // 成员已变异步刷新，资料页缓存作废并通知订阅方（@ 面板/成员页）刷新
+                chatInfoCache.remove(chatId)
+                LiveEvents.emitDataUpdate(
+                    DataUpdate(chatId = chatId, kind = DataUpdate.Kind.MEMBERS),
+                )
+                members
+            }
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "at: loadGroupMembers failed chat=$chatId: " +
+                    "${t.javaClass.simpleName} ${t.message}",
+            )
+            null
+        }
+    }
+
+    /** 管理操作需要「我的角色」：缓存优先，没有则同步查一次内核（保留原有功能语义）。 */
+    private fun ensureGroupMembersForManage(chatId: String): List<ChatMember> {
+        val groupCode = groupCodeFor(chatId) ?: return emptyList()
+        groupMembersCache[groupCode]?.list?.takeIf { it.isNotEmpty() }?.let { return it }
+        val cl = hostClassLoader() ?: return emptyList()
+        val started = perfUptime()
+        val members = runCatching { queryGroupMembersBlocking(cl, groupCode, 0L, "") }
+            .getOrDefault(emptyList())
+        Log.i(
+            TAG,
+            "perf: members blocking(manage) chat=$chatId group=$groupCode " +
+                "size=${members.size} ms=${perfUptime() - started}",
+        )
+        return members
+    }
+
+    /** 用反射 Proxy 承接内核回调，阻塞等待 onResult。 */
+    private fun awaitCallback(
+        cl: ClassLoader,
+        interfaceName: String,
+        timeoutMs: Long,
+        invoke: (Any) -> Unit,
+    ): Array<Any?>? {
+        val iface = runCatching { Class.forName(interfaceName, false, cl) }.getOrNull() ?: return null
+        val latch = java.util.concurrent.CountDownLatch(1)
+        var result: Array<Any?>? = null
+        val proxy = java.lang.reflect.Proxy.newProxyInstance(cl, arrayOf(iface)) { _, method, methodArgs ->
+            if (method.name == "onResult") {
+                result = methodArgs
+                latch.countDown()
+            }
+            defaultValueFor(method.returnType)
+        }
+        runCatching { invoke(proxy) }.onFailure {
+            Log.w(TAG, "awaitCallback invoke failed: ${it.javaClass.simpleName} ${it.message}")
+            return null
+        }
+        val ok = runCatching {
+            latch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        }.getOrDefault(false)
+        return if (ok) result else {
+            Log.w(TAG, "callback timeout: $interfaceName")
+            null
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 群公告：读 TIM 的 TroopNotificationCache（群公告 feeds 历史）
+    // ---------------------------------------------------------------------
+
+    private data class CachedNotices(val list: List<GroupNotice>, val at: Long)
+
+    private val groupNoticeCache = ConcurrentHashMap<String, CachedNotices>()
+
+    /** 已记录过的脏公告文本（byte[].toString() 形如 `[B@eb028a9`），每条只打一次日志。 */
+    private val noticeDirtyTextLogged = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * 公告正文/标题统一清洗：
+     * - null/空白 → ""
+     * - Java `byte[].toString()` 脏数据（形如 `[B@eb028a9`，且后续全是 hex）→ 丢弃并打日志；
+     * - 去掉控制字符（保留换行/制表），trim。
+     */
+    private fun cleanNoticeText(raw: String?): String {
+        val value = raw.orEmpty()
+        if (value.isBlank()) return ""
+        val trimmed = value.trim()
+        if (trimmed.startsWith("[B@")) {
+            val rest = trimmed.removePrefix("[B@")
+            if (rest.isNotEmpty() && rest.all { it.isDigit() || it.lowercaseChar() in 'a'..'f' }) {
+                if (noticeDirtyTextLogged.add(trimmed)) {
+                    Log.w(TAG, "notice: filtered dirty byte[]-toString value=${trimmed.take(40)}")
+                }
+                return ""
+            }
+        }
+        return trimmed
+            .filter { it.code >= 0x20 || it == '\n' || it == '\t' }
+            .trim()
+    }
+
+
+    /** 阻塞加载群公告历史（按发布时间倒序）。 */
+    fun loadGroupNotices(chatId: String): List<GroupNotice>? {
+        if (!isHost) return null
+        if (!ensureServices()) return null
+        val started = perfUptime()
+        groupNoticeCache[chatId]?.let { cached ->
+            if (perfUptime() - cached.at >= GROUP_NOTICE_CACHE_TTL_MS) {
+                scheduleGroupNoticesRefresh(chatId)
+            }
+            Log.i(
+                TAG,
+                "perf: loadGroupNotices cache chat=$chatId size=${cached.list.size} " +
+                    "age=${perfUptime() - cached.at}ms ms=${perfUptime() - started}",
+            )
+            return cached.list
+        }
+        val fast = runCatching { loadGroupNoticesFast(chatId) }.getOrElse { t ->
+            Log.w(
+                TAG,
+                "perf: loadGroupNoticesFast failed chat=$chatId: " +
+                    "${t.javaClass.simpleName} ${t.message}",
+            )
+            emptyList()
+        }
+        groupNoticeCache[chatId] = CachedNotices(fast, perfUptime())
+        scheduleGroupNoticesRefresh(chatId)
+        Log.i(
+            TAG,
+            "perf: loadGroupNotices fast chat=$chatId size=${fast.size} " +
+                "ms=${perfUptime() - started}",
+        )
+        return fast
+    }
+
+    private fun groupCodeForNotice(chatId: String): Long =
+        chatMeta[chatId]?.groupCode
+            ?: chatId.split('_').getOrNull(2)?.toLongOrNull()
+            ?: 0L
+
+    /** 快路径：只读 hook 捕获 / 本地 DB / 历史消息 / memo 缓存，不发起 H5/SSO 网络等待。 */
+    private fun loadGroupNoticesFast(chatId: String): List<GroupNotice> {
+        val groupCode = groupCodeForNotice(chatId)
+        if (groupCode == 0L) return emptyList()
+        val started = perfUptime()
+        val captured = takeCapturedNotices().orEmpty()
+        val rows = runCatching { queryNoticeRows(groupCode) }.getOrNull().orEmpty()
+        val notices = rows
+            .mapNotNull { blob -> runCatching { parseNoticeBlob(blob) }.getOrNull() }
+            .filter { it.content.isNotBlank() || it.title.isNotBlank() }
+            .distinctBy { it.id }
+            .sortedByDescending { it.timeMillis }
+        val info = runCatching { loadChatInfoFast(chatId) }.getOrNull()
+        val result = when {
+            captured.isNotEmpty() -> captured
+            notices.isNotEmpty() -> notices
+            else -> {
+                // 历史消息扫描（scanChatAnnouncements）要 loadMessages，放后台慢路径；快路径只用 memo。
+                val latest = cleanNoticeText(info?.notice)
+                if (latest.isNotBlank()) {
+                    listOf(GroupNotice(id = "memo", title = "群公告", content = latest, timeMillis = 0L))
+                } else {
+                    emptyList()
+                }
+            }
+        }
+        val cleaned = cleanNotices(result)
+        Log.i(
+            TAG,
+            "perf: notices fast chat=$chatId group=$groupCode dbRows=${rows.size} " +
+                "captured=${captured.size} size=${cleaned.size} ms=${perfUptime() - started}",
+        )
+        return mergeNoticeHistory(groupCode, cleaned)
+    }
+
+    private fun cleanNotices(items: List<GroupNotice>): List<GroupNotice> = items.mapNotNull { notice ->
+        val title = cleanNoticeText(notice.title)
+        val content = cleanNoticeText(notice.content)
+        if (title.isBlank() && content.isBlank()) return@mapNotNull null
+        notice.copy(title = title.ifBlank { "群公告" }, content = content)
+    }
+
+    /** 慢路径（后台）：H5 API + 0x852_48 SSO + hook 捕获 + 本地 DB/历史，完成后写缓存并 emit NOTICES。 */
+    private fun refreshGroupNoticesBlocking(chatId: String): List<GroupNotice> {
+        val groupCode = groupCodeForNotice(chatId)
+        if (groupCode == 0L) return emptyList()
+        var noticeHistoryRows = 0
+        // info 现在是快路径（只读缓存 memo），不会阻塞；hook 到的响应里可能带全部公告 feeds。
+        val info = runCatching { loadChatInfo(chatId) }.getOrNull()
+        val captured = takeCapturedNotices().orEmpty()
+        val raw = runCatching { queryNoticeRows(groupCode) }.getOrNull().orEmpty()
+            .also { noticeHistoryRows = it.size }
+        val notices = raw
+            .mapNotNull { blob -> runCatching { parseNoticeBlob(blob) }.getOrNull() }
+            .filter { it.content.isNotBlank() || it.title.isNotBlank() }
+            .distinctBy { it.id }
+            .sortedByDescending { it.timeMillis }
+        val fromWeb = runCatching { fetchNoticesFromWeb(groupCode) }.getOrNull().orEmpty()
+        val from48 = if (fromWeb.isEmpty() && captured.isEmpty()) {
+            runCatching { requestNoticeList48(groupCode) }.getOrNull().orEmpty()
+        } else {
+            emptyList()
+        }
+        val result = when {
+            fromWeb.isNotEmpty() -> fromWeb
+            from48.isNotEmpty() -> from48
+            captured.isNotEmpty() -> captured
+            notices.isEmpty() -> {
+                val fromHistory = runCatching { scanChatAnnouncements(chatId) }
+                    .getOrDefault(emptyList())
+                val latest = cleanNoticeText(info?.notice)
+                buildList {
+                    addAll(fromHistory)
+                    if (latest.isNotBlank()) {
+                        add(
+                            GroupNotice(
+                                id = "memo",
+                                title = "群公告",
+                                content = latest,
+                                timeMillis = 0L,
+                            ),
+                        )
+                    }
+                }
+            }
+            else -> notices
+        }
+        val cleaned = cleanNotices(result)
+        Log.i(
+            TAG,
+            "refreshGroupNotices($groupCode): ${cleaned.size} notices (dbRows=$noticeHistoryRows " +
+                "web=${fromWeb.size} 48=${from48.size} captured=${captured.size} raw=${notices.size})",
+        )
+        return mergeNoticeHistory(groupCode, cleaned)
+    }
+
+    private fun scheduleGroupNoticesRefresh(chatId: String) {
+        if (!groupNoticeRefreshInFlight.add(chatId)) return
+        perfRefreshExecutor.execute {
+            val started = perfUptime()
+            try {
+                val notices = refreshGroupNoticesBlocking(chatId)
+                groupNoticeCache[chatId] = CachedNotices(notices, perfUptime())
+                Log.i(
+                    TAG,
+                    "perf: notices refresh chat=$chatId size=${notices.size} " +
+                        "ms=${perfUptime() - started}",
+                )
+                LiveEvents.emitDataUpdate(
+                    DataUpdate(chatId = chatId, kind = DataUpdate.Kind.NOTICES),
+                )
+            } catch (t: Throwable) {
+                Log.w(
+                    TAG,
+                    "perf: notices refresh failed chat=$chatId: " +
+                        "${t.javaClass.simpleName} ${t.message}",
+                )
+            } finally {
+                groupNoticeRefreshInFlight.remove(chatId)
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 群公告：拦截 TIM 0x8f9_14 响应，解析全部 feeds 记录    // ---------------------------------------------------------------------
+    // 群公告：拦截 TIM 0x8f9_14 响应，解析全部 feeds 记录
+    // ---------------------------------------------------------------------
+
+    @Volatile
+    private var capturedNoticeList: List<GroupNotice>? = null
+
+    /** 从 TIM 的 0x8f9_14 响应（OIDBSSOPkg → RspBody → rpt_feeds_recored）里解析公告列表。 */
+    fun captureFeedsResponse(wup: ByteArray) {
+        runCatching {
+            Log.i(TAG, "captureFeedsResponse: ${wup.size}B fields=${readProtoFields(wup).map { it.number }}")
+            val pkgFields = readProtoFields(wup)
+            val body = pkgFields.firstOrNull { it.number == 4 && it.wireType == 2 }?.bytes
+                ?: return@runCatching
+            val rspFields = readProtoFields(body)
+            Log.i(TAG, "rspBody: ${body.size}B fields=${rspFields.map { it.number }}")
+            val recordBytesList = rspFields
+                .filter { it.number == 3 && it.wireType == 2 }
+                .mapNotNull { it.bytes }
+            recordBytesList.forEachIndexed { index, recordBytes ->
+                Log.i(
+                    TAG,
+                    "rsp record[$index] ${recordBytes.size}B fields=" +
+                        readProtoFields(recordBytes).map { it.number },
+                )
+            }
+            val notices = recordBytesList.mapNotNull { recordBytes ->
+                val record = readProtoFields(recordBytes)
+                val feedsId = record.firstOrNull { it.number == 4 && it.wireType == 2 }
+                    ?.bytes?.toString(Charsets.UTF_8).orEmpty()
+                val createTime = record.firstOrNull { it.number == 6 && it.wireType == 0 }?.value ?: 0L
+                val contentBytes = record.firstOrNull { it.number == 11 && it.wireType == 2 }
+                    ?.bytes ?: return@mapNotNull null
+                decodeFeedsMessage(contentBytes, feedsId, createTime)
+            }.sortedByDescending { it.timeMillis }
+            if (notices.isNotEmpty()) {
+                capturedNoticeList = notices
+                Log.i(TAG, "captured feeds response: ${notices.size} notices")
+            }
+        }.onFailure { Log.w(TAG, "captureFeedsResponse failed: ${it.javaClass.simpleName} ${it.message}") }
+    }
+
+    private fun takeCapturedNotices(): List<GroupNotice>? =
+        capturedNoticeList.also { capturedNoticeList = null }
+
+
+    // ---------------------------------------------------------------------
+    // 群公告列表：走 TIM 的 OidbSvc.0x852_48（群公告列表流）
+    // ---------------------------------------------------------------------
+
+    @Volatile
+    private var captured48: List<GroupNotice>? = null
+
+    @Volatile
+    private var announcementTag: String? = null
+
+    /** 从 TIM 的请求里记下 announcement handler 的 REQ_TAG（响应分发需要）。 */
+    fun rememberAnnouncementTag(toServiceMsg: Any?) {
+        runCatching {
+            val cl = toServiceMsg?.javaClass ?: return
+            val extra = cl.getField("extraData").get(toServiceMsg) as? android.os.Bundle
+            extra?.getString("REQ_TAG")?.takeIf { it.isNotBlank() }?.let {
+                announcementTag = it
+                Log.i(TAG, "announcement tag: $it")
+            }
+        }
+    }
+
+    /** 解析 0x852_48 响应：OIDBSSOPkg.bytes_bodybuffer 是 TIM 私有二进制流。 */
+    fun capture48Response(wup: ByteArray) {
+        runCatching {
+            Log.i(TAG, "capture48Response: ${wup.size}B fields=${readProtoFields(wup).map { it.number }}")
+            val pkgFields = readProtoFields(wup)
+            val body = pkgFields.firstOrNull { it.number == 4 && it.wireType == 2 }?.bytes
+                ?: return@runCatching
+            Log.i(TAG, "0x852_48 body: ${body.size}B hex=${body.joinToString("") { "%02x".format(it) }}")
+            val notices = parseNoticeStream(body)
+            if (notices.isNotEmpty()) {
+                captured48 = notices
+                Log.i(TAG, "captured 0x852_48: ${notices.size} notices")
+            } else {
+                Log.i(TAG, "captured 0x852_48 but parsed 0 notices (${body.size}B)")
+            }
+        }.onFailure {
+            Log.w(TAG, "capture48Response failed: ${it.javaClass.simpleName} ${it.message}")
+        }
+    }
+
+    /**
+     * 0x852_48 响应流格式（逆向自 TroopAnnouncementHandler + g.e）：
+     * int, int, short(count), short, 然后连续 count 个 H 格式公告记录。
+     */
+    private fun parseNoticeStream(body: ByteArray): List<GroupNotice> {
+        val din = java.io.DataInputStream(java.io.ByteArrayInputStream(body))
+        din.readInt()          // troopCode/groupCode
+        din.readInt()          // userUin
+        din.readShort()        // feedType
+        din.readShort()        // 标志位
+        // 随后是若干条 H 格式公告记录，一直读到流末尾
+        val notices = mutableListOf<GroupNotice>()
+        while (din.available() > 16) {
+            val notice = runCatching { parseHRecord(din) }.getOrNull() ?: break
+            if (notice.content.isNotBlank() || notice.title.isNotBlank()) notices.add(notice)
+        }
+        return notices
+    }
+
+    /** 发 0x852_48 请求，向服务器要群公告列表（reqNum=20）。 */
+    private fun requestNoticeList48(groupCode: Long): List<GroupNotice>? {
+        captured48 = null
+        val noticeStarted = perfUptime()
+        val cl = hostClassLoader() ?: return null
+        val runtime = appRuntime() ?: return null
+        val handler = runCatching {
+            val nameApiClass = Class.forName("com.tencent.mobileqq.troop.api.ITroopHandlerNameApi", false, cl)
+            val qroute = Class.forName("com.tencent.mobileqq.qroute.QRoute", false, cl)
+            val api = qroute.getMethod("api", Class::class.java).invoke(null, nameApiClass) ?: return null
+            fun name(method: String): String? = runCatching {
+                nameApiClass.getMethod(method).invoke(api) as? String
+            }.getOrNull()
+            val announceName = name("getTroopAnnouncementHandlerName") ?: return null
+            val troopInfoName = name("getTroopInfoHandlerName") ?: return null
+            runtime.javaClass.getMethod("getBusinessHandler", String::class.java)
+                .invoke(runtime, announceName) to
+                runtime.javaClass.getMethod("getBusinessHandler", String::class.java)
+                    .invoke(runtime, troopInfoName)
+        }.getOrNull() ?: return null
+        val announceHandler = handler.first ?: return null
+        val troopInfoHandler = handler.second ?: return null
+        // 群公告鉴权串（TroopInfoHandler.m0(groupCode)）
+        val candidates = troopInfoHandler.javaClass.methods.filter { method ->
+            method.returnType == ByteArray::class.java && method.parameterCount == 1 &&
+                (method.parameterTypes[0] == Long::class.javaPrimitiveType ||
+                    method.parameterTypes[0] == java.lang.Long::class.java ||
+                    method.parameterTypes[0] == String::class.java)
+        }
+        Log.i(TAG, "auth candidates: ${candidates.map { it.name + "(" + it.parameterTypes[0].simpleName + ")" }}")
+        // 没有鉴权串时，先触发 TIM 拉一次「群公告鉴权」
+        val existing = candidates.firstOrNull { it.name == "m0" }?.let { method ->
+            runCatching { method.invoke(troopInfoHandler, groupCode) as? ByteArray }.getOrNull()
+        }
+        if (existing == null || existing.isEmpty()) {
+            val trigger = troopInfoHandler.javaClass.methods.firstOrNull { method ->
+                method.name == "t0" && method.parameterCount == 2 &&
+                    method.parameterTypes[0] == Long::class.javaPrimitiveType &&
+                    method.parameterTypes[1] == String::class.java
+            }
+            runCatching {
+                trigger?.invoke(troopInfoHandler, groupCode, "SUBCMD_GET_TROOP_AUTH_FOR_ANNOUNCEMENT")
+                Log.i(TAG, "requested troop auth for announcement")
+            }
+            val deadline = android.os.SystemClock.uptimeMillis() + 1_500L
+            while (android.os.SystemClock.uptimeMillis() < deadline) {
+                val value = candidates.firstOrNull { it.name == "m0" }?.let { method ->
+                    runCatching { method.invoke(troopInfoHandler, groupCode) as? ByteArray }.getOrNull()
+                }
+                if (value != null && value.isNotEmpty()) break
+                Thread.sleep(120L)
+            }
+        }
+        var auth: ByteArray? = null
+        for (method in candidates.sortedByDescending { it.name == "m0" }) {
+            val arg = when (method.parameterTypes[0]) {
+                Long::class.javaPrimitiveType, java.lang.Long::class.java -> groupCode as Any
+                else -> groupCode.toString()
+            }
+            val value = runCatching { method.invoke(troopInfoHandler, arg) as? ByteArray }.getOrNull()
+            if (value != null && value.isNotEmpty()) {
+                auth = value
+                Log.i(TAG, "auth via ${method.name}: ${value.size}B")
+                break
+            }
+        }
+        val authBytes = auth ?: run {
+            Log.w(TAG, "0x852_48 no auth bytes")
+            return null
+        }
+        val uin = (myUin?.toLongOrNull() ?: 0L) and 0xffffffffL
+        val now = (System.currentTimeMillis() / 1000L).toInt()
+        val feedType = 23
+        val stream = java.io.ByteArrayOutputStream()
+        java.io.DataOutputStream(stream).use { out ->
+            val totalLen = 47 + authBytes.size
+            out.writeInt(totalLen)
+            out.write(1)
+            out.writeShort(totalLen)
+            out.writeInt(groupCode.toInt())
+            out.writeInt(uin.toInt())
+            out.writeShort(feedType)
+            out.writeInt(-1)
+            out.writeInt(20)
+            out.writeInt(now)
+            out.writeInt(now)
+            out.writeShort(authBytes.size)
+            out.write(authBytes)
+            out.write(ByteArray(16))
+        }
+        val body = stream.toByteArray()
+        val pkg = java.io.ByteArrayOutputStream()
+        java.io.DataOutputStream(pkg).use { out ->
+            out.write(byteArrayOf(0x08))           // field1: uint32_command
+            writeVarint(out, 2130L)
+            out.write(byteArrayOf(0x10))           // field2: uint32_service_type
+            writeVarint(out, 48L)
+            out.write(byteArrayOf(0x18))           // field3: uint32_result
+            writeVarint(out, 0L)
+            out.write(byteArrayOf(0x22))           // field4: bytes_bodybuffer
+            writeVarint(out, body.size.toLong())
+            out.write(body)
+        }
+        val result = runCatching {
+            val toServiceMsgClass = Class.forName(
+                "com.tencent.qphone.base.remote.ToServiceMsg", false, cl,
+            )
+            val currentUin = (myUin ?: "").ifBlank { "" }
+            val msg = toServiceMsgClass
+                .getConstructor(String::class.java, String::class.java, String::class.java)
+                .newInstance("mobileqq.service", currentUin, "OidbSvc.0x852_48")
+            toServiceMsgClass.getMethod("putWupBuffer", ByteArray::class.java)
+                .invoke(msg, pkg.toByteArray())
+            runCatching {
+                val attrKey = Class.forName("com.tencent.mobileqq.service.MobileQQServiceBase", false, cl)
+                    .getField("REQ_PB_PROTOCOL_FLAG").get(null) as? String
+                if (attrKey != null) {
+                    toServiceMsgClass.getMethod(
+                        "addAttribute", String::class.java, Any::class.java,
+                    ).invoke(msg, attrKey, java.lang.Boolean.TRUE)
+                    Log.i(TAG, "0x852_48 pb attribute set")
+                }
+            }.onFailure { Log.w(TAG, "set pb attribute failed: ${it.message}") }
+            val extra = toServiceMsgClass.getField("extraData").get(msg) as? android.os.Bundle
+            extra?.apply {
+                putInt("appId", 0)
+                putLong("troop_uin", groupCode)
+                putLong("troop_code", groupCode)
+                putInt("feedType", feedType)
+                putBoolean("aioRequest", true)
+                putString("from", "probeAll")
+                var tag = announcementTag
+                if (tag.isNullOrBlank()) {
+                    // 先触发一次 TIM 自己的公告请求，hook 里会记下 REQ_TAG
+                    runCatching {
+                        announceHandler.javaClass
+                            .getMethod("S", String::class.java)
+                            .invoke(announceHandler, groupCode.toString())
+                    }
+                    val tagDeadline = android.os.SystemClock.uptimeMillis() + 1_000L
+                    while (tag.isNullOrBlank() && android.os.SystemClock.uptimeMillis() < tagDeadline) {
+                        Thread.sleep(100L)
+                        tag = announcementTag
+                    }
+                }
+                putString("REQ_TAG", tag)
+            }
+            runtime.javaClass.getMethod("sendToService", toServiceMsgClass)
+                .invoke(runtime, msg)
+        }
+        if (result.isFailure) {
+            Log.w(TAG, "0x852_48 send failed: ${result.exceptionOrNull()?.message}")
+            return null
+        }
+        val deadline = android.os.SystemClock.uptimeMillis() + 2_000L
+        while (android.os.SystemClock.uptimeMillis() < deadline) {
+            captured48?.let {
+                Log.i(TAG, "perf: requestNoticeList48 waitMs=${perfUptime() - noticeStarted} notices=${it.size}")
+                return it
+            }
+            Thread.sleep(120L)
+        }
+        Log.w(TAG, "perf: requestNoticeList48 timeout waitMs=${perfUptime() - noticeStarted}")
+        return captured48
+    }
+
+    private fun writeVarint(out: java.io.DataOutputStream, value: Long) {
+        var v = value
+        while (true) {
+            if (v and 0x7fL.inv() == 0L) {
+                out.write(v.toInt())
+                return
+            }
+            out.write(((v and 0x7fL) or 0x80L).toInt())
+            v = v ushr 7
+        }
+    }
+
+    /** 从 H 格式流里读一条公告记录。 */
+    private fun parseHRecord(din: java.io.DataInputStream): GroupNotice? {
+        din.read()
+        din.readShort()
+        din.readShort()
+        din.readInt()
+        din.readInt()
+        val idBytes = ByteArray(32)
+        din.readFully(idBytes)
+        var idx = 0
+        while (idx < idBytes.size && idBytes[idx].toInt() != 0) idx++
+        val feedsId = String(idBytes, 0, idx, Charsets.UTF_8)
+        din.readInt()
+        din.readInt()
+        din.readInt()
+        val timeSec = din.readInt().toLong() and 0xffffffffL
+        repeat(4) { din.readInt() }
+        val skipLen = din.readShort().toInt() * 5
+        din.skip(skipLen.toLong())
+        din.skip(16L)
+        val pbLen = din.readInt()
+        if (pbLen <= 0 || pbLen > 1_000_000) return null
+        val protobuf = ByteArray(pbLen)
+        din.readFully(protobuf)
+        return decodeFeedsMessage(protobuf, feedsId, timeSec)
+    }
+
+
+    // ---------------------------------------------------------------------
+    // 群公告：走 TIM 的 H5 通道（web.qun.qq.com/cgi-bin/announce/list_announce）
+    // ---------------------------------------------------------------------
+
+    /** 拿到 web.qun.qq.com 的 Cookie 和 skey 候选（系统 WebView Cookie → pskey/skey 兜底）。 */
+    private fun resolveMannounceAuth(): List<Pair<String, String>> {
+        val result = mutableListOf<Pair<String, String>>()
+        // 优先：TIM 自己的 H5 cookie 注入逻辑（getCookie4WebSoOrSonic）
+        runCatching {
+            val cl = hostClassLoader() ?: return@runCatching
+            val monsterClass = Class.forName(
+                "com.tencent.mobileqq.webview.swift.component.SwiftBrowserCookieMonster",
+                false,
+                cl,
+            )
+            // 先让 TIM 自己预注入一次 cookie（SwiftBrowserCookieMonster.O(AppRuntime)）
+            runCatching {
+                val runtime = appRuntime() ?: return@runCatching
+                val preload = monsterClass.methods.firstOrNull {
+                    it.name == "O" && it.parameterCount == 1 && java.lang.reflect.Modifier.isStatic(it.modifiers)
+                }
+                if (preload != null) {
+                    preload.invoke(null, runtime)
+                    Log.i(TAG, "SwiftBrowserCookieMonster.O preload invoked")
+                    Thread.sleep(600L)
+                } else {
+                    Log.w(TAG, "SwiftBrowserCookieMonster.O not found")
+                }
+            }
+            val method = monsterClass.methods.firstOrNull {
+                it.name == "r" && it.parameterCount == 1 &&
+                    it.parameterTypes[0] == String::class.java &&
+                    it.returnType == String::class.java &&
+                    java.lang.reflect.Modifier.isStatic(it.modifiers)
+            } ?: return@runCatching
+            for (url in listOf(
+                "https://web.qun.qq.com/mannounce/index.html",
+                "https://qun.qq.com/",
+                "https://web.qun.qq.com/",
+            )) {
+                val cookie = runCatching { method.invoke(null, url) as? String }
+                    .onFailure { Log.w(TAG, "cookie monster r() failed: ${it.message}") }
+                    .getOrNull().orEmpty()
+                Log.i(TAG, "cookie monster r($url): len=${cookie.length} hasSkey=${cookie.contains("skey=")}")
+                if (cookie.contains("skey=") || cookie.contains("p_skey=")) {
+                    val skey = cookieValue(cookie, "skey") ?: cookieValue(cookie, "p_skey")
+                    if (!skey.isNullOrBlank()) {
+                        Log.i(
+                            TAG,
+                            "mannounce cookie via SwiftBrowserCookieMonster[$url] " +
+                                "len=${cookie.length} keys=${cookie.split(';').map { it.trim().substringBefore('=') }}",
+                        )
+                        result.add(cookie to skey)
+                        break
+                    }
+                }
+            }
+        }
+        runCatching {
+            val cookieManager = android.webkit.CookieManager.getInstance()
+            for (url in listOf("https://web.qun.qq.com", "https://qun.qq.com", "https://qq.com")) {
+                val cookie = cookieManager.getCookie(url).orEmpty()
+                if (cookie.contains("skey=") || cookie.contains("p_skey=")) {
+                    val skey = cookieValue(cookie, "skey")
+                        ?: cookieValue(cookie, "p_skey")
+                        ?: continue
+                    Log.i(TAG, "mannounce cookie via CookieManager[$url]")
+                    result.add(cookie to skey)
+                }
+            }
+        }
+        // 兜底 1：X5/TBS CookieManager（TIM H5 用的是 X5 内核，cookie 在它自己的 store 里）
+        runCatching {
+            val cl = hostClassLoader() ?: return@runCatching
+            for (className in listOf(
+                "com.tencent.smtt.sdk.CookieManager",
+                "com.tencent.smtt.sdk.CookieManagerImpl",
+            )) {
+                val cmClass = runCatching { Class.forName(className, false, cl) }.getOrNull()
+                    ?: continue
+                val instance = runCatching {
+                    cmClass.getMethod("getInstance").invoke(null)
+                }.getOrNull() ?: continue
+                for (method in cmClass.methods.filter {
+                    it.name == "getCookie" && it.parameterCount == 1 &&
+                        it.parameterTypes[0] == String::class.java
+                }) {
+                    val cookie = runCatching {
+                        method.invoke(instance, "https://web.qun.qq.com") as? String
+                    }.getOrNull()
+                    if (!cookie.isNullOrBlank() && (cookie.contains("skey=") || cookie.contains("p_skey="))) {
+                        val skey = cookieValue(cookie, "skey") ?: cookieValue(cookie, "p_skey")
+                        if (!skey.isNullOrBlank()) {
+                            Log.i(TAG, "mannounce cookie via $className")
+                            result.add(cookie to skey)
+                        }
+                    }
+                }
+            }
+        }
+        // 兜底 2：TIM CookieUtils（com.tencent.mobileqq.webview.swift.cookie.e）
+        runCatching {
+            val cl = hostClassLoader() ?: return@runCatching
+            val cookieClass = Class.forName("com.tencent.mobileqq.webview.swift.cookie.e", false, cl)
+            for (method in cookieClass.methods) {
+                if (method.parameterCount !in 1..3) continue
+                val args = Array<Any?>(method.parameterCount) { index ->
+                    if (method.parameterTypes[index] == String::class.java) "qun.qq.com" else null
+                }
+                val value = runCatching { method.invoke(null, *args) as? String }.getOrNull()
+                if (!value.isNullOrBlank() && (value.contains("skey=") || value.contains("p_skey="))) {
+                    val skey = cookieValue(value, "skey") ?: cookieValue(value, "p_skey")
+                    if (!skey.isNullOrBlank()) {
+                        Log.i(TAG, "mannounce cookie via CookieUtils.${method.name}")
+                        result.add(value to skey)
+                    }
+                }
+            }
+        }
+        // 兜底 3：TicketManager.getSkey（qq.com 域 skey，H5 的 bkn 用它算）
+        val cl = hostClassLoader() ?: return result
+        val runtime = appRuntime() ?: return result
+        val uin = myUin ?: ""
+        runCatching {
+            val ticketManager = runtime.javaClass
+                .getMethod("getManager", Int::class.javaPrimitiveType)
+                .invoke(runtime, 2) ?: return@runCatching
+            listOf("getRealSkey", "getSkey").forEach { methodName ->
+                val skey = runCatching {
+                    ticketManager.javaClass
+                        .getMethod(methodName, String::class.java)
+                        .invoke(ticketManager, uin) as? String
+                }.getOrNull()
+                if (!skey.isNullOrBlank()) {
+                    Log.i(TAG, "mannounce cookie via TicketManager.$methodName len=${skey.length}")
+                    result.add("uin=o$uin; p_uin=o$uin; skey=$skey" to skey)
+                }
+            }
+        }
+        val pskey = runCatching {
+            val managerClass = Class.forName(
+                "com.tencent.mobileqq.pskey.api.IPskeyManager", false, cl,
+            )
+            val service = runtime.javaClass
+                .getMethod("getRuntimeService", Class::class.java, String::class.java)
+                .invoke(runtime, managerClass, "")
+            val callbackClass = Class.forName("com.tencent.mobileqq.pskey.api.a", false, cl)
+            val latch = CountDownLatch(1)
+            val result = java.util.concurrent.atomic.AtomicReference<String?>()
+            val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, method, args ->
+                if (method.name == "onSuccess") {
+                    val map = args?.getOrNull(0) as? Map<*, *>
+                    result.set(
+                        map?.entries
+                            ?.mapNotNull { entry -> entry.value as? String }
+                            ?.firstOrNull { it.isNotBlank() },
+                    )
+                    latch.countDown()
+                } else if (method.name == "onFail") {
+                    latch.countDown()
+                }
+                defaultValueFor(method.returnType)
+            }
+            val domains = arrayOf("qun.qq.com", "web.qun.qq.com", "qq.com")
+            service.javaClass.methods
+                .firstOrNull { it.name == "getPskey" && it.parameterCount == 2 }
+                ?.invoke(service, domains, callback)
+            latch.await(6, TimeUnit.SECONDS)
+            result.get()
+        }.getOrNull()
+        if (!pskey.isNullOrBlank()) {
+            val cookie = "uin=o$uin; p_uin=o$uin; skey=$pskey; p_skey=$pskey"
+            Log.i(TAG, "mannounce cookie via pskey service (len=${pskey.length})")
+            result.add(cookie to pskey)
+        }
+        if (result.isEmpty()) Log.w(TAG, "mannounce pskey not found")
+        return result
+    }
+
+    /** QQ bkn 算法（5283 & 0x7fffffff）。 */
+    private fun bknFromSkey(skey: String): String {
+        var hash = 5381
+        for (ch in skey) {
+            hash += (hash shl 5) + ch.code
+        }
+        return (hash and 0x7fffffff).toString()
+    }
+
+    private fun cookieValue(cookie: String, name: String): String? {
+        val prefix = "$name="
+        cookie.split(';').forEach { part ->
+            val trimmed = part.trim()
+            if (trimmed.startsWith(prefix)) {
+                return runCatching {
+                    java.net.URLDecoder.decode(trimmed.substring(prefix.length), "UTF-8")
+                }.getOrDefault(trimmed.substring(prefix.length))
+            }
+        }
+        return null
+    }
+
+    /** 直接请求 TIM 群公告 H5 CGI，拿到全部公告历史。 */
+    private fun fetchNoticesFromWeb(groupCode: Long): List<GroupNotice>? {
+        val authCandidates = resolveMannounceAuth()
+        if (authCandidates.isEmpty()) {
+            Log.w(TAG, "mannounce auth not found")
+            return null
+        }
+        var cookie = ""
+        var bkn = ""
+        var loggedIn = false
+        val uin = myUin ?: ""
+        for ((baseCookie, key) in authCandidates) {
+            val plain = key.removePrefix("@")
+            // 服务端 bkn 可能基于 cookie 里的 skey 值，尝试多种 cookie/key 组合
+            val combos = buildList {
+                add("uin=o$uin; p_uin=o$uin; skey=$plain" to plain)
+                add("uin=o$uin; p_uin=o$uin; skey=@$plain" to "@$plain")
+                add("uin=o$uin; p_uin=o$uin; p_skey=$plain" to plain)
+                add("uin=o$uin; p_uin=o$uin; p_skey=@$plain" to "@$plain")
+                add(baseCookie to key)
+            }.distinct()
+            for ((testCookie, bknKey) in combos) {
+                val variant = bknFromSkey(bknKey)
+                val testForm = "qid=$groupCode&bkn=$variant&ft=23&s=-1&n=10&i=1"
+                val testBody = postForm(
+                    "https://web.qun.qq.com/cgi-bin/announce/list_announce",
+                    testForm,
+                    testCookie,
+                )
+                val testEc = runCatching {
+                    org.json.JSONObject(testBody.orEmpty()).optInt("ec", -1)
+                }.getOrDefault(-1)
+                Log.i(
+                    TAG,
+                    "mannounce try cookie=${testCookie.take(40)} bknKey=${bknKey.take(16)} " +
+                        "bkn=$variant ec=$testEc",
+                )
+                if (testEc == 0) {
+                    cookie = testCookie
+                    bkn = variant
+                    loggedIn = true
+                    break
+                }
+            }
+            if (loggedIn) break
+        }
+        if (!loggedIn) return null
+        val notices = mutableListOf<GroupNotice>()
+        val seenFids = mutableSetOf<String>()
+        var startIndex = "-1"
+        var firstPage = true
+        var pages = 0
+        while (pages < 6) {
+            pages++
+            val form = buildString {
+                append("qid=").append(groupCode)
+                append("&bkn=").append(bkn)
+                append("&ft=23&s=").append(startIndex).append("&n=10&i=1")
+                if (firstPage) append("&ni=1")
+            }
+            val body = postForm(
+                "https://web.qun.qq.com/cgi-bin/announce/list_announce",
+                form,
+                cookie,
+            ) ?: break
+            val root = runCatching { org.json.JSONObject(body) }.getOrNull() ?: break
+            val ec = root.optInt("ec", -1)
+            if (ec != 0) {
+                Log.w(TAG, "mannounce list ec=$ec body=${body.take(200)}")
+                break
+            }
+            Log.i(TAG, "mannounce body: ${body.take(300)}")
+            // 响应根节点直接带 feeds / inst（不是 getList 下面）
+            val listSource = root.optJSONObject("getList") ?: root
+            val feeds = listSource.optJSONArray("feeds") ?: org.json.JSONArray()
+            val inst = listSource.optJSONArray("inst") ?: org.json.JSONArray()
+            for (array in listOf(feeds, inst)) {
+                for (index in 0 until array.length()) {
+                    val item = array.optJSONObject(index) ?: continue
+                    val fid = item.optString("fid")
+                    if (fid.isNotBlank() && !seenFids.add(fid)) continue
+                    val parsed = parseWebFeed(item)
+                    if (parsed != null) notices.add(parsed)
+                }
+            }
+            Log.i(
+                TAG,
+                "mannounce page: feeds=${feeds.length()} inst=${inst.length()} " +
+                    "next_index=${listSource.optString("next_index")} sta=${listSource.optString("sta")}",
+            )
+            val ni = listSource.optString("next_index")
+            firstPage = false
+            val next = ni.toIntOrNull()
+            if (next == null || next == 0 || ni == "null" || ni.isBlank()) break
+            if (next.toString() == startIndex) break
+            startIndex = next.toString()
+            if (notices.size >= 200) break
+        }
+        Log.i(TAG, "mannounce web notices: ${notices.size} (pages=$pages)")
+        return notices.ifEmpty { null }
+    }
+
+    private fun parseWebFeed(item: org.json.JSONObject): GroupNotice? {
+        val fid = item.optString("fid").takeIf { it.isNotBlank() } ?: return null
+        val pubt = item.optLong("pubt", 0L)
+        val msg = item.optJSONObject("msg")
+        val text = msg?.optString("text").orEmpty()
+        val textFace = msg?.optString("text_face").orEmpty()
+        val content = cleanNoticeText(decodeAnnounceText(text, textFace))
+        if (content.isBlank()) return null
+        val title = cleanNoticeText(msg?.optString("title"))
+        return GroupNotice(
+            id = "web_$fid",
+            title = title.ifBlank { "群公告" },
+            content = content,
+            timeMillis = if (pubt > 10_000_000_000L) pubt else pubt * 1000L,
+        )
+    }
+
+    /** H5 公告正文里表情占位符基本可以忽略，这里只做 HTML 反转义 + 控制字符清理。 */
+    private fun decodeAnnounceText(text: String, textFace: String): String {
+        var value = text.replace("&amp;", "&")
+        value = Regex("&#(\\d+);").replace(value) { match ->
+            match.groupValues[1].toIntOrNull()?.toChar()?.toString() ?: match.value
+        }
+        value = value
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&#39;", "'")
+            .replace("&#96;", "`")
+            .replace("&nbsp;", " ")
+        // 去掉 \u0001 之类的表情控制字符
+        value = value.filter { it.code >= 0x20 || it == '\n' || it == '\t' }
+        return value.trim()
+    }
+
+    private fun postForm(url: String, form: String, cookie: String): String? = runCatching {
+        val connection = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+        connection.requestMethod = "POST"
+        connection.doOutput = true
+        connection.connectTimeout = 8_000
+        connection.readTimeout = 8_000
+        connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
+        connection.setRequestProperty("Cookie", cookie)
+        connection.setRequestProperty(
+            "User-Agent",
+            "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 (KHTML, like Gecko) " +
+                "Version/4.0 Chrome/126.0 Mobile Safari/537.36 MQQBrowser/6.2",
+        )
+        connection.setRequestProperty("Referer", "https://web.qun.qq.com/mannounce/index.html")
+        connection.outputStream.use { it.write(form.toByteArray(Charsets.UTF_8)) }
+        val code = connection.responseCode
+        val stream = if (code in 200..299) connection.inputStream else connection.errorStream
+        val body = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+        Log.i(TAG, "mannounce post $code ${body.length}B")
+        body.takeIf { code in 200..299 && it.isNotBlank() }
+    }.onFailure {
+        Log.w(TAG, "mannounce post failed: ${it.javaClass.simpleName} ${it.message}")
+    }.getOrNull()
+
+    /** 从群聊历史消息里找「群公告」卡片消息（serviceID=27 的 XML），补足历史公告列表。 */
+    private fun scanChatAnnouncements(chatId: String): List<GroupNotice> {
+        val result = mutableListOf<GroupNotice>()
+        val contact = contacts[chatId] ?: return result
+        val service = msgService ?: return result
+        val cl = hostClassLoader() ?: return result
+        if (loadMessages(chatId) == null) return result
+        var nextSeq = olderStates[chatId]?.nextSeq ?: return result
+        if (nextSeq <= 0L) return result
+        repeat(6) {
+            if (nextSeq <= 1L) return@repeat
+            val records = runCatching {
+                fetchRecordPage(cl, service, contact, nextSeq, 40)
+            }.getOrNull() ?: return@repeat
+            if (records.isEmpty()) return@repeat
+            records.forEach { record ->
+                if (record == null) return@forEach
+                val msgId = (invokeGetter(record, "getMsgId") as? Number)?.toLong() ?: 0L
+                val msgTime = (invokeGetter(record, "getMsgTime") as? Number)?.toLong() ?: 0L
+                val timeMillis = if (msgTime < 10_000_000_000L) msgTime * 1000L else msgTime
+                val elements = invokeGetter(record, "getElements") as? List<*> ?: return@forEach
+                elements.forEach { element ->
+                    if (element == null) return@forEach
+                    val xml = runCatching {
+                        val text = invokeGetter(element, "getTextElement")
+                        (text?.let { invokeGetter(it, "getContent") } as? String)
+                            ?: (invokeGetter(element, "getArkElement")
+                                ?.let { invokeGetter(it, "getBytesData") } as? String)
+                            ?: (invokeGetter(element, "getExtraInfo") as? String)
+                    }.getOrNull().orEmpty()
+                    if (!xml.contains("serviceID=\"27\"") && !xml.contains("serviceID='27'")) {
+                        return@forEach
+                    }
+                    val title = Regex("<title[^>]*>([^<]*)</title>")
+                        .findAll(xml)
+                        .map { it.groupValues[1].trim() }
+                        .firstOrNull { it.contains("公告") }
+                        .orEmpty()
+                    val summary = Regex("<summary[^>]*>([^<]*)</summary>")
+                        .findAll(xml)
+                        .map { it.groupValues[1].trim().replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&") }
+                        .firstOrNull { it.isNotBlank() }
+                        .orEmpty()
+                    val body = cleanNoticeText(summary)
+                    val cleanTitle2 = cleanNoticeText(title)
+                    if (body.isNotBlank() || cleanTitle2.isNotBlank()) {
+                        result.add(
+                            GroupNotice(
+                                id = "msg_$msgId",
+                                title = cleanTitle2.ifBlank { "群公告" },
+                                content = body,
+                                timeMillis = timeMillis,
+                            ),
+                        )
+                    }
+                }
+            }
+            val minSeq = records.mapNotNull {
+                (invokeGetter(it ?: return@mapNotNull null, "getMsgSeq") as? Number)?.toLong()
+            }.minOrNull() ?: return@repeat
+            nextSeq = minSeq
+        }
+        return result
+    }
+
+    private fun fetchRecordPage(
+        cl: ClassLoader,
+        service: Any,
+        contact: Any,
+        seq: Long,
+        count: Int,
+    ): List<Any?> {
+        val callbackClass = Class.forName(
+            "com.tencent.qqnt.kernel.nativeinterface.IMsgOperateCallback", false, cl,
+        )
+        val latch = CountDownLatch(1)
+        var records: List<Any?> = emptyList()
+        val callback = java.lang.reflect.Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, method, args ->
+            if (method.name == "onResult" && args != null) {
+                val list = args.getOrNull(1) as? List<*>
+                if (list != null) records = list
+                latch.countDown()
+            }
+            defaultValueFor(method.returnType)
+        }
+        service.javaClass.methods
+            .firstOrNull { it.name == "getMsgsBySeqAndCount" && it.parameterCount == 5 }
+            ?.invoke(service, contact, seq, count, true, callback)
+        latch.await(6, TimeUnit.SECONDS)
+        return records
+    }
+
+    /** 本地累积群公告历史（仅远端不可用时兜底；远端成功时以远端为准，清掉旧的截断缓存）。 */
+    private fun mergeNoticeHistory(groupCode: Long, remote: List<GroupNotice>): List<GroupNotice> {
+        val context = appContext() ?: return remote
+        val dir = java.io.File(context.filesDir, "m3tim_notices").apply { mkdirs() }
+        val file = java.io.File(dir, "$groupCode.json")
+        fun normalize(value: String): String = value
+            .replace("&amp;", "&")
+            .replace("&#10;", "")
+            .replace("&nbsp;", "")
+            .replace(Regex("\\s+"), "")
+            .take(300)
+        if (remote.isNotEmpty()) {
+            // 远端（H5/SSO）已经拿到完整公告：本地旧缓存大多是被 groupMemo 截断的旧数据，
+            // 直接以远端为准，避免重复 + 截断条目。
+            val cleaned = remote
+                .sortedByDescending { it.timeMillis }
+                .distinctBy { normalize(it.content) }
+                .take(100)
+            runCatching {
+                val array = org.json.JSONArray()
+                cleaned.forEach { notice ->
+                    array.put(
+                        org.json.JSONObject().apply {
+                            put("id", notice.id)
+                            put("title", notice.title)
+                            put("content", notice.content)
+                            put("time", notice.timeMillis)
+                        },
+                    )
+                }
+                file.writeText(
+                    org.json.JSONObject().apply {
+                        put("v", 2)
+                        put("list", array)
+                    }.toString(),
+                )
+            }
+            return cleaned
+        }
+        // 远端失败：读 v2 本地缓存兜底；旧格式（截断数据）直接丢弃并清理
+        val stored = runCatching {
+            val root = org.json.JSONObject(file.readText())
+            if (root.optInt("v", 0) != 2) {
+                file.delete()
+                return@runCatching emptyList()
+            }
+            val array = root.optJSONArray("list") ?: return@runCatching emptyList()
+            (0 until array.length()).mapNotNull { index ->
+                val obj = array.optJSONObject(index) ?: return@mapNotNull null
+                val title = cleanNoticeText(obj.optString("title"))
+                val content = cleanNoticeText(obj.optString("content"))
+                if (title.isBlank() && content.isBlank()) return@mapNotNull null
+                GroupNotice(
+                    id = obj.optString("id"),
+                    title = title,
+                    content = content,
+                    timeMillis = obj.optLong("time"),
+                )
+            }
+        }.getOrDefault(emptyList())
+        return stored.sortedByDescending { it.timeMillis }
+    }
+
+
+
+    /** 从 TIM 主数据库 TroopNotificationCache 里取某群的公告 feeds 原始数据。 */
+    private fun queryNoticeRows(groupCode: Long): List<ByteArray> {
+        val context = appContext() ?: return emptyList()
+        val uin = myUin ?: return emptyList()
+        val dbFile = context.getDatabasePath("$uin.db")
+        if (!dbFile.isFile) return emptyList()
+        var db: android.database.sqlite.SQLiteDatabase? = null
+        var tempCopy: java.io.File? = null
+        try {
+            db = android.database.sqlite.SQLiteDatabase.openDatabase(
+                dbFile.absolutePath,
+                null,
+                android.database.sqlite.SQLiteDatabase.OPEN_READONLY,
+            )
+        } catch (t: Throwable) {
+            // WAL 模式下只读打开可能失败：复制一份到 cache 再读。
+            runCatching {
+                val dir = java.io.File(context.cacheDir, "notice_db").apply { mkdirs() }
+                val copy = java.io.File(dir, "$uin.db")
+                dbFile.inputStream().use { input ->
+                    copy.outputStream().use { output -> input.copyTo(output) }
+                }
+                java.io.File(dbFile.absolutePath + "-wal")?.takeIf { it.isFile }?.let { wal ->
+                    java.io.File(copy.absolutePath + "-wal").outputStream().use { out ->
+                        wal.inputStream().use { it.copyTo(out) }
+                    }
+                }
+                tempCopy = copy
+                db = android.database.sqlite.SQLiteDatabase.openDatabase(
+                    copy.absolutePath,
+                    null,
+                    android.database.sqlite.SQLiteDatabase.OPEN_READONLY,
+                )
+            }.onFailure {
+                Log.w(TAG, "open notice db failed: ${it.javaClass.simpleName} ${it.message}")
+                return emptyList()
+            }
+        }
+        val database = db ?: return emptyList()
+        val rows = mutableListOf<ByteArray>()
+        try {
+            database.rawQuery(
+                "SELECT xmlBytes FROM TroopNotificationCache WHERE troopUin=? " +
+                    "AND xmlBytes IS NOT NULL ORDER BY time DESC LIMIT 200",
+                arrayOf(groupCode.toString()),
+            ).use { cursor ->
+                while (cursor.moveToNext()) {
+                    cursor.getBlob(0)?.let { rows.add(it) }
+                }
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "query notice db failed: ${t.javaClass.simpleName} ${t.message}")
+        } finally {
+            runCatching { database.close() }
+            tempCopy?.delete()
+        }
+        return rows
+    }
+
+    private fun appContext(): android.content.Context? = runCatching {
+        val cl = hostClassLoader() ?: return null
+        val mobileQQClass = Class.forName("mqq.app.MobileQQ", false, cl)
+        mobileQQClass.getField("sMobileQQ").get(null) as? android.content.Context
+    }.getOrNull()
+
+    /**
+     * 解析 TroopAnnouncementHandler.H() 使用的二进制流：
+     * 固定头（32 字节 feedsId + 若干 int，其中第 10 个 int 是发布时间）
+     * + 长度前缀的 group_feeds.GroupFeedsMessage protobuf。
+     */
+    private fun parseNoticeBlob(blob: ByteArray): GroupNotice? =
+        parseHRecord(java.io.DataInputStream(java.io.ByteArrayInputStream(blob)))
+
+    private data class ProtoField(val number: Int, val wireType: Int, val value: Long, val bytes: ByteArray?)
+
+    private fun readVarint(data: ByteArray, start: Int): Pair<Long, Int> {
+        var result = 0L
+        var shift = 0
+        var i = start
+        while (i < data.size) {
+            val b = data[i].toInt() and 0xff
+            i++
+            result = result or ((b and 0x7f).toLong() shl shift)
+            if (b and 0x80 == 0) return result to i
+            shift += 7
+            if (shift > 63) break
+        }
+        return result to i
+    }
+
+    private fun readProtoFields(data: ByteArray): List<ProtoField> {
+        val out = mutableListOf<ProtoField>()
+        var i = 0
+        while (i < data.size) {
+            val (key, next) = readVarint(data, i)
+            i = next
+            val number = (key ushr 3).toInt()
+            when (val wireType = (key and 7L).toInt()) {
+                0 -> {
+                    val (value, nextValue) = readVarint(data, i)
+                    i = nextValue
+                    out.add(ProtoField(number, wireType, value, null))
+                }
+                2 -> {
+                    val (len, nextLen) = readVarint(data, i)
+                    i = nextLen
+                    val end = i + len.toInt()
+                    if (end > data.size || end < i) break
+                    out.add(ProtoField(number, wireType, len, data.copyOfRange(i, end)))
+                    i = end
+                }
+                5 -> {
+                    if (i + 4 > data.size) break
+                    i += 4
+                }
+                1 -> {
+                    if (i + 8 > data.size) break
+                    i += 8
+                }
+                else -> break
+            }
+        }
+        return out
+    }
+
+    private fun decodeFeedsMessage(protobuf: ByteArray, feedsId: String, timeSec: Long): GroupNotice? {
+        val fields = readProtoFields(protobuf)
+        val feedsType = (fields.firstOrNull { it.number == 1 && it.wireType == 0 }?.value ?: 0L)
+        if (feedsType != 5L && feedsType != 19L && feedsType != 22L && feedsType != 0L) return null
+        var title = ""
+        val body = StringBuilder()
+        fields.filter { it.number == 2 && it.wireType == 2 }.forEach { contentField ->
+            val content = contentField.bytes ?: return@forEach
+            val contentFields = readProtoFields(content)
+            val contentType = contentFields
+                .firstOrNull { it.number == 1 && it.wireType == 0 }?.value?.toInt() ?: 0
+            val valueBytes = contentFields
+                .firstOrNull { it.number == 2 && it.wireType == 2 }?.bytes
+            when (contentType) {
+                0 -> valueBytes?.let { body.append(String(it, Charsets.UTF_8)) }
+                10 -> valueBytes?.let { title = String(it, Charsets.UTF_8) }
+                2 -> body.append("[表情]")
+                1 -> valueBytes?.let { body.append(String(it, Charsets.UTF_8)) }
+            }
+        }
+        val cleanTitle = cleanNoticeText(title)
+        val cleanContent = cleanNoticeText(body.toString())
+        if (cleanTitle.isBlank() && cleanContent.isBlank()) return null
+        return GroupNotice(
+            id = if (feedsId.isNotBlank()) feedsId else "notice_${timeSec}",
+            title = cleanTitle.ifBlank { "群公告" },
+            content = cleanContent,
+            timeMillis = timeSec * 1000L,
+        )
+    }
+
+    /** 构造内核 Contact(chatType, peerUid, guildId)（TIM ShortVideoMsgItem 同款）。 */
+    private fun buildKernelContact(cl: ClassLoader, chatType: Int, peerUid: String): Any? = runCatching {
+        val contactClass = Class.forName(
+            "com.tencent.qqnt.kernelpublic.nativeinterface.Contact", false, cl,
+        )
+        contactClass.getConstructor(
+            Int::class.javaPrimitiveType,
+            String::class.java,
+            String::class.java,
+        ).newInstance(chatType, peerUid, "")
+    }.getOrNull()
+
+    /** 从 VideoPlayUrlResult 解析可用 URL（domainUrl/v4IpUrl/v6IpUrl 依次）。 */
+    private fun parseVideoPlayResult(result: Any?): String? {
+        result ?: return null
+        for (key in listOf("getDomainUrl", "getV4IpUrl", "getV6IpUrl")) {
+            @Suppress("UNCHECKED_CAST")
+            val list = invokeGetter(result, key) as? List<*> ?: continue
+            for (info in list) {
+                info ?: continue
+                val url = (invokeGetter(info, "getUrl") as? String)?.takeIf { it.isNotBlank() }
+                    ?: (invokeGetter(info, "getHttpsDomain") as? String)?.takeIf { it.isNotBlank() }
+                if (url != null) return url
+            }
+        }
+        return null
+    }
+
+    /** VideoPlayUrl 回调参数：code / msg / url。 */
+    private data class VideoUrlAttempt(val code: Int, val url: String?, val via: String)
+
+    /**
+     * V2 API：`IKernelRichMediaService.getVideoPlayUrlV2(contact, msgId, elementId,
+     * VideoCodecFormatType, RMReqExParams, IVideoPlayUrlCallback)`（TIM ShortVideoMsgItem 同款）。
+     */
+    private fun videoPlayUrlV2Attempt(
+        service: Any,
+        cl: ClassLoader,
+        contact: Any,
+        msgId: Long,
+        elementId: Long,
+        label: String,
+    ): VideoUrlAttempt? {
+        val target = resolveKernelMethod(service, "getVideoPlayUrlV2", 6) ?: return null
+        return runCatching {
+            val callbackClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.IVideoPlayUrlCallback", false, cl,
+            )
+            val codecClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.VideoCodecFormatType", false, cl,
+            )
+            val codec = codecClass.enumConstants?.firstOrNull() ?: return@runCatching null
+            val req = runCatching {
+                val reqClass = Class.forName(
+                    "com.tencent.qqnt.kernel.nativeinterface.RMReqExParams", false, cl,
+                )
+                runCatching {
+                    reqClass.getConstructor(
+                        Int::class.javaPrimitiveType,
+                        Int::class.javaPrimitiveType,
+                    ).newInstance(0, 1)
+                }.getOrElse {
+                    reqClass.getConstructor().newInstance().also { r ->
+                        runCatching { reqClass.getField("downSourceType").setInt(r, 0) }
+                        runCatching { reqClass.getField("triggerType").setInt(r, 1) }
+                    }
+                }
+            }.getOrNull() ?: return@runCatching null
+            val latch = CountDownLatch(1)
+            var code = -1
+            var url: String? = null
+            val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, m, args ->
+                if (m.name == "onResult" && args != null) {
+                    code = (args.getOrNull(0) as? Number)?.toInt() ?: -1
+                    url = parseVideoPlayResult(args.getOrNull(2))
+                    latch.countDown()
+                }
+                defaultValueFor(m.returnType)
+            }
+            target.second.invoke(target.first, contact, msgId, elementId, codec, req, callback)
+            latch.await(8, TimeUnit.SECONDS)
+            Log.i(
+                TAG,
+                "videoPlayUrl ctx=$label contactPeer=${invokeGetter(contact, "getPeerUid")} " +
+                    "chatType=${invokeGetter(contact, "getChatType")} api=v2 " +
+                    "code=$code url=${url?.take(80)}",
+            )
+            VideoUrlAttempt(code, url, "v2")
+        }.getOrElse { t ->
+            Log.w(
+                TAG,
+                "videoPlayUrl ctx=$label api=v2 failed: ${t.javaClass.simpleName} ${t.message}",
+            )
+            null
+        }
+    }
+
+    /** 旧 API 回退：`getVideoPlayUrl(contact, a, b, codec, VideoRequestWay, callback)`（内联 TIM 逻辑）。 */
+    private fun videoPlayUrlLegacyAttempt(
+        service: Any,
+        cl: ClassLoader,
+        contact: Any,
+        msgId: Long,
+        elementId: Long,
+        label: String,
+    ): VideoUrlAttempt? {
+        val target = resolveKernelMethod(service, "getVideoPlayUrl", 6) ?: return null
+        return runCatching {
+            val callbackClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.IVideoPlayUrlCallback", false, cl,
+            )
+            val codecClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.VideoCodecFormatType", false, cl,
+            )
+            val wayClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.VideoRequestWay", false, cl,
+            )
+            val codec = codecClass.enumConstants?.firstOrNull() ?: return@runCatching null
+            @Suppress("UNCHECKED_CAST")
+            val ways = (wayClass.enumConstants.orEmpty().toList() as List<Any?>).sortedBy { enum ->
+                when ((enum as? Enum<*>)?.name) {
+                    "KHAND" -> 0
+                    "KAUTO" -> 1
+                    else -> 2
+                }
+            }
+            var last = VideoUrlAttempt(-1, null, "old")
+            outer@ for (way in ways) {
+                for ((first, second) in listOf(msgId to elementId, elementId to msgId)) {
+                    val latch = CountDownLatch(1)
+                    var code = -1
+                    var url: String? = null
+                    val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, m, args ->
+                        if (m.name == "onResult" && args != null) {
+                            code = (args.getOrNull(0) as? Number)?.toInt() ?: -1
+                            url = parseVideoPlayResult(args.getOrNull(2))
+                            latch.countDown()
+                        }
+                        defaultValueFor(m.returnType)
+                    }
+                    target.second.invoke(target.first, contact, first, second, codec, way, callback)
+                    latch.await(6, TimeUnit.SECONDS)
+                    last = VideoUrlAttempt(code, url, "old")
+                    Log.i(
+                        TAG,
+                        "videoPlayUrl ctx=$label api=old way=${(way as? Enum<*>)?.name} " +
+                            "args=$first,$second code=$code url=${url?.take(80)}",
+                    )
+                    if (!url.isNullOrBlank()) break@outer
+                }
+            }
+            last
+        }.getOrElse { t ->
+            Log.w(
+                TAG,
+                "videoPlayUrl ctx=$label api=old failed: ${t.javaClass.simpleName} ${t.message}",
+            )
+            null
+        }
+    }
+
+    /**
+     * 获取视频在线播放地址：合并转发/嵌套记录里的视频用**该视频消息所属会话的内层 peer** 构造 Contact
+     * （context 由 mapMsgRecord 缓存），优先 V2 API，失败回退旧 getVideoPlayUrl；普通聊天联系人是同一个。
+     */
+    fun videoPlayUrl(chatId: String, msgId: Long, elementId: Long): String? {
+        if (!isHost) return null
+        if (!ensureServices()) return null
+        val rootContact = contacts[chatId] ?: return null
+        val cl = hostClassLoader() ?: return null
+        val service = kernelService?.let { invokeGetter(it, "getRichMediaService") } ?: run {
+            Log.w(TAG, "videoPlayUrl: richMediaService null")
+            return null
+        }
+        // 内层上下文（聊天记录内跨会话视频）优先，根会话 contact 兜底。
+        val ctx = videoPlayContextByMsg[msgId]
+            ?.takeIf { perfUptime() - it.at < 10 * 60_000L }
+        val candidates = ArrayList<Pair<String, Any>>(2)
+        if (ctx != null) {
+            buildKernelContact(cl, ctx.chatType, ctx.peerUid)?.let { candidates.add("inner" to it) }
+        }
+        if (candidates.none { it.second === rootContact || it.second == rootContact }) {
+            candidates.add("root" to rootContact)
+        }
+        // 1) V2 API（TIM 原生通道）
+        for ((label, contact) in candidates) {
+            val attempt = videoPlayUrlV2Attempt(service, cl, contact, msgId, elementId, label)
+            if (attempt != null && !attempt.url.isNullOrBlank()) {
+                Log.i(
+                    TAG,
+                    "videoPlayUrl ok ctx=$label api=v2 code=${attempt.code} url=${attempt.url.take(120)}",
+                )
+                return attempt.url
+            }
+        }
+        // V2 方法不存在时打印可用方法清单，便于真机核对签名。
+        if (resolveKernelMethod(service, "getVideoPlayUrlV2", 6) == null) {
+            val methods = runCatching {
+                service.javaClass.methods.filter { it.name.contains("VideoPlay") }
+                    .map { "${it.name}/${it.parameterCount}" }
+                    .distinct()
+                    .take(12)
+            }.getOrDefault(emptyList())
+            Log.w(TAG, "videoPlayUrl V2 not found; service=${service.javaClass.simpleName} methods=$methods")
+        }
+        // 2) 旧 API 回退（同样用内层 contact 优先）
+        for ((label, contact) in candidates) {
+            val attempt = videoPlayUrlLegacyAttempt(service, cl, contact, msgId, elementId, label)
+            if (attempt != null && !attempt.url.isNullOrBlank()) {
+                Log.i(
+                    TAG,
+                    "videoPlayUrl ok ctx=$label api=old code=${attempt.code} url=${attempt.url.take(120)}",
+                )
+                return attempt.url
+            }
+        }
+        Log.w(TAG, "videoPlayUrl failed chat=$chatId msg=$msgId elem=$elementId ctx=${ctx != null}")
+        return null
+    }
+
+    /**
+     * TIM 内核 `getMultiMsg(contact, rootMsgId, parentMsgId, callback)` 参数组合（集中管理）：
+     * - 第 2 参 rootMsgId = **最外层**记录消息 id；第 3 参 parentMsgId = **直接外层**记录消息 id；
+     * - 普通/根入口（parent=0）：`(msgId,msgId)` → `(0,msgId)` → 旧兜底（真机 (msgId,msgId) 常瞬时成功）；
+     * - 嵌套（parent/root 非 0）：`(root,msgId)` → `(msgId,root)` → `(parent,msgId)` →
+     *   `(msgId,parent)` → `(parent,0)` → `(0,parent)` → 旧兜底（真机 (root,msgId) 毫秒命中）。
+     */
+    private fun buildChatRecordCombos(
+        msgId: Long,
+        elementId: Long,
+        parentMsgId: Long,
+        rootMsgId: Long,
+    ): List<Pair<Long, Long>> {
+        val combos = LinkedHashSet<Pair<Long, Long>>()
+        if (parentMsgId != 0L) {
+            if (rootMsgId != 0L) {
+                combos.add(rootMsgId to msgId)
+                combos.add(msgId to rootMsgId)
+            }
+            combos.add(parentMsgId to msgId)
+            combos.add(msgId to parentMsgId)
+            combos.add(parentMsgId to 0L)
+            combos.add(0L to parentMsgId)
+        } else {
+            combos.add(msgId to msgId)
+            combos.add(0L to msgId)
+        }
+        // 旧组合兜底（LinkedHashSet 自动去重）
+        combos.add(msgId to 0L)
+        combos.add(msgId to elementId)
+        combos.add(elementId to msgId)
+        combos.add(elementId to 0L)
+        combos.add(msgId to msgId)
+        combos.add(0L to msgId)
+        combos.add(0L to elementId)
+        combos.add(elementId to elementId)
+        return combos.toList()
+    }
+
+    /** tryChatRecordCombo 结果：成功 raw，或预算耗尽标记（主流程据此立即返回 null）。 */
+    private data class ChatRecordComboResult(val raw: List<Any?>?, val budgetExceeded: Boolean)
+
+    /**
+     * 单个组合尝试：一次内核 getMultiMsg 调用 + 解析回调；
+     * code=2（server return failed）仅重试 1 次（等 800ms）；每次尝试前检查 12s 总预算。
+     */
+    private fun tryChatRecordCombo(
+        service: Any,
+        contact: Any,
+        method: java.lang.reflect.Method,
+        cl: ClassLoader,
+        callbackClass: Class<*>,
+        first: Long,
+        second: Long,
+        parentMsgId: Long,
+        rootMsgId: Long,
+        recordStarted: Long,
+        recordBudgetMs: Long,
+        chatId: String,
+        msgId: Long,
+    ): ChatRecordComboResult {
+        retryLoop@ for (attemptNo in 0..1) {
+            val leftMs = recordBudgetMs - (perfUptime() - recordStarted)
+            if (leftMs <= 300L) {
+                Log.w(
+                    TAG,
+                    "loadChatRecord budget exceeded chat=$chatId msgId=$msgId " +
+                        "parent=$parentMsgId root=$rootMsgId usedMs=${perfUptime() - recordStarted} " +
+                        "combo=($first,$second) attempt=$attemptNo",
+                )
+                return ChatRecordComboResult(null, true)
+            }
+            if (attemptNo > 0) {
+                val waitMs = minOf(800L, (leftMs - 200L).coerceAtLeast(0L))
+                Log.i(
+                    TAG,
+                    "loadChatRecord retry combo=($first,$second) attempt=$attemptNo " +
+                        "parent=$parentMsgId root=$rootMsgId waitMs=$waitMs",
+                )
+                Thread.sleep(waitMs)
+            }
+            val attemptLatch = CountDownLatch(1)
+            var attempt: List<Any?>? = null
+            var attemptCode = -1
+            var attemptMsg = ""
+            val attemptCallback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, m, a ->
+                if (m.name == "onResult" && a != null) {
+                    attemptCode = (a.getOrNull(0) as? Number)?.toInt() ?: -1
+                    attemptMsg = a.getOrNull(1) as? String ?: ""
+                    val list = a.getOrNull(2) as? List<*>
+                    if (list != null) attempt = list
+                    attemptLatch.countDown()
+                }
+                defaultValueFor(m.returnType)
+            }
+            runCatching {
+                method.invoke(service, contact, first, second, attemptCallback)
+            }.onFailure { Log.w(TAG, "getMultiMsg invoke failed: ${it.message}") }
+            val waitLeftMs = minOf(
+                6_000L,
+                (recordBudgetMs - (perfUptime() - recordStarted)).coerceAtLeast(300L),
+            )
+            attemptLatch.await(waitLeftMs, TimeUnit.MILLISECONDS)
+            Log.i(
+                TAG,
+                "loadChatRecord try ($first,$second): code=$attemptCode msg=$attemptMsg " +
+                    "size=${attempt?.size ?: -1} attempt=$attemptNo parent=$parentMsgId " +
+                    "root=$rootMsgId budgetLeftMs=${recordBudgetMs - (perfUptime() - recordStarted)}",
+            )
+            if (attempt != null && attempt!!.isNotEmpty()) {
+                return ChatRecordComboResult(attempt, false)
+            }
+            if (attemptCode != 2) break@retryLoop // 只对 code=2 重试
+        }
+        return ChatRecordComboResult(null, false)
+    }
+
+    /** 聊天记录原始 MsgRecord 缓存：重 map 很快且能拿到最新下载路径（图片/视频后续下载可复用）。 */
+    private data class CachedChatRecord(val records: List<Any?>, val at: Long)
+
+    private val chatRecordCache = object : LinkedHashMap<String, CachedChatRecord>(16, 0.75f, true) {
+        override fun removeEldestEntry(
+            eldest: MutableMap.MutableEntry<String, CachedChatRecord>?,
+        ): Boolean = size > 20
+    }
+
+    private const val CHAT_RECORD_CACHE_TTL_MS = 5 * 60_000L
+
+    private fun chatRecordCacheKey(
+        chatId: String,
+        msgId: Long,
+        elementId: Long,
+        parentMsgId: Long,
+        rootMsgId: Long,
+    ): String = "$chatId:$msgId:$elementId:$parentMsgId:$rootMsgId"
+
+    private fun chatRecordCacheGet(key: String): Pair<List<Any?>, Long>? {
+        val now = perfUptime()
+        synchronized(chatRecordCache) {
+            val entry = chatRecordCache[key] ?: return null
+            if (now - entry.at > CHAT_RECORD_CACHE_TTL_MS) {
+                chatRecordCache.remove(key)
+                return null
+            }
+            return entry.records to entry.at
+        }
+    }
+
+    private fun chatRecordCachePut(key: String, records: List<Any?>) {
+        synchronized(chatRecordCache) {
+            chatRecordCache[key] = CachedChatRecord(records.toList(), perfUptime())
+        }
+    }
+
+    /** 原始 MsgRecord → ChatMessage（按时间排序 + 回复预览解析）。 */
+    private fun mapChatRecordMessages(chatId: String, raw: List<Any?>): List<ChatMessage> {
+        val mapped = raw.mapNotNull { record ->
+            mapMsgRecord(chatId, record)?.let { it.timeMillis to it.message }
+        }
+        val ordered = if (mapped.size >= 2 && mapped.first().first > mapped.last().first) {
+            mapped.reversed()
+        } else {
+            mapped
+        }
+        val messages = ordered.map { it.second }
+        Log.i(TAG, "loadChatRecord mapped chat=$chatId count=${messages.size}")
+        return messages
+    }
+
+    /** 阻塞加载一条「聊天记录（合并转发）」的全部消息。 */
+    /** 兼容旧 UI 的三参调用（嵌套聊天记录暂不传 parentMsgId）。 */
+    fun loadChatRecord(chatId: String, msgId: Long, elementId: Long): List<ChatMessage>? =
+        loadChatRecord(chatId, msgId, elementId, parentMsgId = 0L, rootMsgId = 0L)
+
+    /** 兼容 task-181/182 的四参调用（只传外层 parentMsgId）。 */
+    fun loadChatRecord(
+        chatId: String,
+        msgId: Long,
+        elementId: Long,
+        parentMsgId: Long,
+    ): List<ChatMessage>? =
+        loadChatRecord(chatId, msgId, elementId, parentMsgId, rootMsgId = 0L)
+
+    /**
+     * 合并转发聊天记录加载（TIM 内核 `getMultiMsg(peer, rootMsgId, parentMsgId, cb)`）：
+     * - rootMsgId：最外层聊天记录消息 msgId（更深嵌套时由 UI 传入链）；
+     * - parentMsgId：当前记录的直接外层记录 msgId。
+     * 组合尝试 + 总预算 12s，避免服务端抖动导致 30s 卡死。
+     */
+    fun loadChatRecord(
+        chatId: String,
+        msgId: Long,
+        elementId: Long,
+        parentMsgId: Long,
+        rootMsgId: Long,
+    ): List<ChatMessage>? {
+        if (!isHost) return null
+        val cacheKey = chatRecordCacheKey(chatId, msgId, elementId, parentMsgId, rootMsgId)
+        Log.i(
+            TAG,
+            "loadChatRecord enter chat=$chatId msgId=$msgId elementId=$elementId " +
+                "parent=$parentMsgId root=$rootMsgId host=${contacts[chatId] != null} " +
+                "msgService=${msgService != null}",
+        )
+        chatRecordCacheGet(cacheKey)?.let { (cachedRaw, cachedAt) ->
+            val hitStarted = perfUptime()
+            return try {
+                val messages = mapChatRecordMessages(chatId, cachedRaw)
+                resolveReplyPreviews(chatId, messages)
+                Log.i(
+                    TAG,
+                    "loadChatRecord cache hit key=$cacheKey count=${messages.size} " +
+                        "ageMs=${perfUptime() - cachedAt} mapMs=${perfUptime() - hitStarted}",
+                )
+                messages
+            } catch (t: Throwable) {
+                Log.w(
+                    TAG,
+                    "loadChatRecord cache hit failed, fallback kernel: " +
+                        "${t.javaClass.simpleName} ${t.message}",
+                )
+                null
+            }
+        }
+        Log.i(TAG, "loadChatRecord cache miss key=$cacheKey")
+        if (!ensureServices()) {
+            Log.w(TAG, "loadChatRecord abort: ensureServices failed")
+            return null
+        }
+        val contact = contacts[chatId] ?: run {
+            Log.w(TAG, "loadChatRecord abort: contact missing chat=$chatId")
+            return null
+        }
+        val service = msgService ?: run {
+            Log.w(TAG, "loadChatRecord abort: msgService missing")
+            return null
+        }
+        val cl = hostClassLoader() ?: run {
+            Log.w(TAG, "loadChatRecord abort: hostClassLoader missing")
+            return null
+        }
+        return try {
+            val callbackClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.IGetMultiMsgCallback", false, cl,
+            )
+            val method = service.javaClass.methods.firstOrNull {
+                it.name == "getMultiMsg" && it.parameterCount == 4
+            } ?: return null
+            val recordStarted = perfUptime()
+            val recordBudgetMs = 12_000L
+            val combos = buildChatRecordCombos(msgId, elementId, parentMsgId, rootMsgId)
+            var successRaw: List<Any?>? = null
+            var successCombo: Pair<Long, Long>? = null
+            for (combo in combos) {
+                val result = tryChatRecordCombo(
+                    service = service,
+                    contact = contact,
+                    method = method,
+                    cl = cl,
+                    callbackClass = callbackClass,
+                    first = combo.first,
+                    second = combo.second,
+                    parentMsgId = parentMsgId,
+                    rootMsgId = rootMsgId,
+                    recordStarted = recordStarted,
+                    recordBudgetMs = recordBudgetMs,
+                    chatId = chatId,
+                    msgId = msgId,
+                )
+                if (result.budgetExceeded) return null
+                if (result.raw != null) {
+                    successRaw = result.raw
+                    successCombo = combo
+                    break
+                }
+            }
+            val raw = successRaw ?: run {
+                Log.w(
+                    TAG,
+                    "loadChatRecord no result chat=$chatId msgId=$msgId elem=$elementId " +
+                        "parent=$parentMsgId root=$rootMsgId combos=${combos.size} " +
+                        "budgetUsedMs=${perfUptime() - recordStarted}",
+                )
+                return null
+            }
+            Log.i(
+                TAG,
+                "loadChatRecord ok combo=$successCombo size=${raw.size} msgId=$msgId " +
+                    "parent=$parentMsgId root=$rootMsgId usedMs=${perfUptime() - recordStarted}",
+            )
+            runCatching { registerMsgListenerIfReady() }
+            // 合并转发里的媒体属于内部记录自己的 msgId：record-first，失败再退外层 root。
+            runCatching { triggerMissingImageDownloads(chatId, raw, rootMsgIdOverride = msgId) }
+            chatRecordCachePut(cacheKey, raw)
+            val messages = mapChatRecordMessages(chatId, raw)
+            Log.i(TAG, "loadChatRecord cached=true key=$cacheKey count=${messages.size}")
+            resolveReplyPreviews(chatId, messages)
+        } catch (t: Throwable) {
+            Log.w(TAG, "loadChatRecord failed: ${t.javaClass.simpleName} ${t.message}")
+            null
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 会话设置：置顶 / 消息免打扰（IKernelMsgService / IKernelBuddyService / IKernelGroupService）
+    // ---------------------------------------------------------------------
+
+    /** 按方法名 + 参数个数找内核 wrapper 方法（TIM 的接口类名被混淆，只能按方法形状找）。 */
+    private fun reflectMethod(service: Any, name: String, paramCount: Int): java.lang.reflect.Method? =
+        service.javaClass.methods.firstOrNull { it.name == name && it.parameterCount == paramCount }
+
+    /** wrapper（MsgService / BuddyService / GroupService 等）都继承 BaseService：getService() 返回 native 服务。 */
+    private fun nativeServiceOf(service: Any): Any? = runCatching {
+        service.javaClass.getMethod("getService").invoke(service)
+    }.getOrNull()
+
+    /** 先找 wrapper 自身方法，再退回 wrapper.getService() 暴露出来的 native IKernelXxxService。 */
+    private fun resolveKernelMethod(
+        service: Any?,
+        name: String,
+        paramCount: Int,
+    ): Pair<Any, java.lang.reflect.Method>? {
+        if (service == null) return null
+        reflectMethod(service, name, paramCount)?.let { return service to it }
+        val native = nativeServiceOf(service) ?: return null
+        reflectMethod(native, name, paramCount)?.let { return native to it }
+        return null
+    }
+
+    /** 懒加载服务可能晚就绪：在超时内反复 ensureServices 后取服务。 */
+    private fun <T> waitForService(timeoutMs: Long = 1_200L, provider: () -> T?): T? {
+        provider()?.let { return it }
+        val deadline = android.os.SystemClock.uptimeMillis() + timeoutMs
+        while (android.os.SystemClock.uptimeMillis() < deadline) {
+            Thread.sleep(120L)
+            ensureServices()
+            provider()?.let { return it }
+        }
+        Log.w(TAG, "perf: waitForService timeout ${timeoutMs}ms")
+        return null
+    }
+
+    private fun groupKernelService(): Any? = kernelService?.let { kernel ->
+        runCatching { kernel.javaClass.getMethod("getGroupService").invoke(kernel) }.getOrNull()
+    }
+
+    /** 设置类操作成功后延迟刷新会话列表（置顶排序 / 免打扰角标都要重新读最近会话）。 */
+    private fun refreshChatsSoon() {
+        scheduleLiveChatsRefresh()
+    }
+
+    /**
+     * 反射调用「IOperateCallback 形态」的内核 API（最后一个参数是回调），阻塞等待结果。
+     * @return 回调 code；方法不存在 / 调用异常 / 超时返回 -1。
+     */
+    private fun invokeOperateApi(
+        label: String,
+        service: Any,
+        methodName: String,
+        args: List<Any?>,
+        timeoutSec: Long = 6L,
+    ): Int {
+        val cl = hostClassLoader() ?: return -1
+        val callbackClass = runCatching {
+            Class.forName("com.tencent.qqnt.kernel.nativeinterface.IOperateCallback", false, cl)
+        }.getOrNull()
+        if (callbackClass == null) {
+            Log.w(TAG, "chatSetting: $label IOperateCallback class unavailable")
+            return -1
+        }
+        val target = resolveKernelMethod(service, methodName, args.size + 1)
+        if (target == null) {
+            Log.w(
+                TAG,
+                "chatSetting: $label method $methodName(params=${args.size + 1}) not found on " +
+                    service.javaClass.simpleName,
+            )
+            return -1
+        }
+        val latch = CountDownLatch(1)
+        var code = -1
+        var message = ""
+        val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, method, cbArgs ->
+            if (method.name == "onResult") {
+                code = (cbArgs?.getOrNull(0) as? Number)?.toInt() ?: -1
+                message = cbArgs?.getOrNull(1) as? String ?: ""
+                latch.countDown()
+            }
+            defaultValueFor(method.returnType)
+        }
+        return try {
+            val callArgs = (args + callback).toTypedArray()
+            target.second.invoke(target.first, *callArgs)
+            val got = latch.await(timeoutSec, TimeUnit.SECONDS)
+            Log.i(
+                TAG,
+                "chatSetting: $label code=$code msg=$message timeout=${!got} " +
+                    "impl=${target.first.javaClass.simpleName}",
+            )
+            code
+        } catch (t: Throwable) {
+            Log.w(TAG, "chatSetting: $label invoke failed: ${t.javaClass.simpleName} ${t.message}")
+            -1
+        }
+    }
+
+    /** 取会话的 ChatMeta / Contact；缓存缺失时先拉一次最近会话，最后按 chatId 结构兜底还原。 */
+    private fun ensureChatContext(chatId: String): ChatMeta? {
+        chatMeta[chatId]?.let { return it }
+        runCatching { loadRecentChats() }
+        chatMeta[chatId]?.let { return it }
+        // chatId 形如 tim_<chatType>_<peerUid 或 uin>（见 mapRecentContact）。
+        val parts = chatId.removePrefix("tim_").split("_", limit = 2)
+        if (parts.size != 2) return null
+        val chatType = parts[0].toIntOrNull() ?: return null
+        val peer = parts[1]
+        if (peer.isBlank()) return null
+        val meta = ChatMeta(chatType, peer, peer.toLongOrNull() ?: 0L, "会话", chatType == 2)
+        runCatching { cacheContact(chatId, meta) }
+        Log.i(TAG, "chatSetting: rebuilt meta for $chatId chatType=$chatType peer=$peer")
+        return meta
+    }
+
+    /** 在最近会话里找当前会话的 RecentContactInfo（读回置顶 / 免打扰状态用）。 */
+    private fun findRecentContactInfo(chatId: String): Any? {
+        val meta = chatMeta[chatId] ?: return null
+        val service = recentContactService ?: return null
+        val method = service.javaClass.methods.firstOrNull { candidate ->
+            candidate.name == "a" &&
+                candidate.parameterCount == 0 &&
+                java.util.List::class.java.isAssignableFrom(candidate.returnType)
+        } ?: return null
+        @Suppress("UNCHECKED_CAST")
+        val list = runCatching { method.invoke(service) as? List<Any?> }.getOrNull() ?: return null
+        return list.filterNotNull().firstOrNull { info ->
+            val chatType = (invokeGetter(info, "getChatType") as? Number)?.toInt() ?: return@firstOrNull false
+            if (chatType != meta.chatType) return@firstOrNull false
+            val peerUid = invokeGetter(info, "getPeerUid") as? String ?: ""
+            val peerUin = (invokeGetter(info, "getPeerUin") as? Number)?.toLong() ?: 0L
+            (meta.peerUid.isNotBlank() && peerUid == meta.peerUid) ||
+                (meta.peerUin != 0L && peerUin == meta.peerUin)
+        }
+    }
+
+    /** 取/构造 chatId 对应的 kernel Contact（contacts 缓存缺失时按 ChatMeta.peerUid 构造）。 */
+    private fun ensureKernelContact(chatId: String, meta: ChatMeta): Any? {
+        contacts[chatId]?.let { return it }
+        if (meta.peerUid.isBlank()) return null
+        return runCatching {
+            val cl = hostClassLoader() ?: return null
+            val contactClass = Class.forName(
+                "com.tencent.qqnt.kernelpublic.nativeinterface.Contact", false, cl,
+            )
+            val contact = contactClass
+                .getConstructor(Int::class.javaPrimitiveType, String::class.java, String::class.java)
+                .newInstance(meta.chatType, meta.peerUid, "")
+            contacts[chatId] = contact
+            contact
+        }.getOrNull()
+    }
+
+    /** 轮询最近会话状态直到与期望一致或超时；返回最后一次读到的值（读不到返回 null）。 */
+    private fun pollRecentFlag(
+        chatId: String,
+        expected: Boolean,
+        reader: (Any) -> Boolean?,
+        timeoutMs: Long = 2_000L,
+    ): Boolean? {
+        val deadline = android.os.SystemClock.uptimeMillis() + timeoutMs
+        var last: Boolean? = null
+        while (android.os.SystemClock.uptimeMillis() < deadline) {
+            val value = findRecentContactInfo(chatId)?.let(reader)
+            if (value != null) {
+                last = value
+                if (value == expected) return value
+            }
+            Thread.sleep(200L)
+        }
+        return last
+    }
+
+    private fun readPinnedFlag(info: Any): Boolean? {
+        val topFlag = (invokeGetter(info, "getTopFlag") as? Number)?.toInt() ?: 0
+        val topTime = (invokeGetter(info, "getTopFlagTime") as? Number)?.toLong() ?: 0L
+        return topFlag != 0 || topTime > 0L
+    }
+
+    private fun readMutedFlag(info: Any): Boolean? =
+        invokeGetter(info, "getIsMsgDisturb") as? Boolean
+
+    /**
+     * 会话置顶：IKernelMsgService.setContactLocalTop(Contact, boolean, IOperateCallback)。
+     * 阻塞，需在 IO 线程调用；callback code==0 视为成功，随后用 RecentContactInfo.topFlag 读回校验（仅日志）。
+     */
+    fun setChatPinned(chatId: String, pinned: Boolean): Boolean {
+        if (!isHost) return false
+        if (!ensureServices()) return false
+        val meta = ensureChatContext(chatId)
+        val contact = contacts[chatId]
+        val service = waitForService(timeoutMs = 1_500L) { msgService }
+        if (meta == null || contact == null || service == null) {
+            Log.w(
+                TAG,
+                "chatSetting: setChatPinned($chatId) missing meta=${meta != null} " +
+                    "contact=${contact != null} service=${service != null}",
+            )
+            return false
+        }
+        val label = "setChatPinned($chatId, pinned=$pinned)"
+        // TIM 自己的置顶路径（PlatformRecentContactsDataSource）：构造 ContactTopData{$chatType, uin/uid 或 groupCode}
+        // 再调 RecentContactService.setContactListTop(isTop, ArrayList<ContactTopData>, cb)。
+        // 传 Contact 是错的（native 会忽略），此前 code=0 但置顶并未真正生效。
+        val cl = hostClassLoader()
+        val topData = if (cl != null) {
+            runCatching {
+                val dataClass = Class.forName(
+                    "com.tencent.qqnt.kernel.nativeinterface.ContactTopData", false, cl,
+                )
+                val data = dataClass.getConstructor().newInstance()
+                dataClass.getField("chatType").setInt(data, meta.chatType)
+                if (meta.isGroup) {
+                    dataClass.getField("groupCode").setLong(data, meta.groupCode)
+                } else {
+                    dataClass.getField("uin").setLong(data, meta.peerUin)
+                    dataClass.getField("uid").set(data, meta.peerUid)
+                }
+                data
+            }.getOrNull()
+        } else {
+            null
+        }
+        var used = "RecentContactService"
+        var code = -1
+        val recentService = waitForService(timeoutMs = 1_500L) { recentContactService }
+        if (recentService != null && topData != null) {
+            code = invokeOperateApi(
+                label, recentService, "setContactListTop",
+                listOf(pinned, arrayListOf(topData)),
+            )
+        }
+        var ok = code == 0
+        var readback = if (ok) pollRecentFlag(chatId, pinned, ::readPinnedFlag) else null
+        if (!ok) {
+            // 兜底：RecentContactService 不可用时才用 MsgService.setContactLocalTop（TIM 自己的兜底分支）。
+            used = "MsgService"
+            code = invokeOperateApi(label, service, "setContactLocalTop", listOf(contact, pinned))
+            readback = if (code == 0) pollRecentFlag(chatId, pinned, ::readPinnedFlag) else null
+            ok = code == 0 && (readback == null || readback == pinned)
+        }
+        // RecentContactService 的最近会话读回可能滞后（2s 内 topFlag 仍是旧值），以 callback code==0 为准。
+        Log.i(TAG, "chatSetting: $label ok=$ok code=$code readback=$readback impl=$used")
+        if (ok) refreshChatsSoon()
+        return ok
+    }
+
+    /**
+     * 群的 GroupMsgMask（TIM 群设置四项字符串已核对）：
+     * NOTIFY = 接收消息并提醒（正常）；RECEIVE = 接收消息但不提醒（免打扰）；
+     * ASSISTANT = 收进群助手且不提醒；SHIELD = 屏蔽群消息。
+     */
+    private fun groupMsgMask(muted: Boolean): Any? {
+        val cl = hostClassLoader() ?: return null
+        val maskClass = runCatching {
+            Class.forName("com.tencent.qqnt.kernel.nativeinterface.GroupMsgMask", false, cl)
+        }.getOrNull() ?: return null
+        val wanted = if (muted) "RECEIVE" else "NOTIFY"
+        return maskClass.enumConstants?.firstOrNull { (it as? Enum<*>)?.name == wanted }
+    }
+
+    /**
+     * 消息免打扰（单聊 / 群聊分别走两条内核 API，均经 dex 反编译确认）：
+     * - 单聊 IKernelBuddyService.setMsgNotify(String uid, boolean noDisturb, IOperateCallback)
+     * - 群聊 IKernelGroupService.setGroupMsgMask(long groupCode, GroupMsgMask.RECEIVE/NOTIFY, IOperateCallback)
+     * 阻塞，需在 IO 线程调用；callback code==0 视为成功，随后用 RecentContactInfo.isMsgDisturb 读回校验（仅日志）。
+     */
+    fun setChatMuted(chatId: String, muted: Boolean): Boolean {
+        if (!isHost) return false
+        if (!ensureServices()) return false
+        // 群助手伪会话始终免打扰：忽略用户「取消免打扰」操作，读取也恒为 true。
+        if (chatId == "tim_troop_assistant") {
+            Log.i(TAG, "assistant: ignore setChatMuted chat=$chatId muted=$muted (always muted)")
+            return true
+        }
+        val meta = ensureChatContext(chatId) ?: run {
+            Log.w(TAG, "chatSetting: setChatMuted($chatId) meta unavailable")
+            return false
+        }
+        if (meta.chatType == 7 || meta.peerUin == troopAssistantUin) {
+            Log.i(TAG, "assistant: ignore setChatMuted chat=$chatId muted=$muted (always muted)")
+            return true
+        }
+        val label = "setChatMuted($chatId, muted=$muted)"
+        val code: Int
+        if (meta.isGroup) {
+            val groupCode = meta.groupCode
+            if (groupCode == 0L) {
+                Log.w(TAG, "chatSetting: $label no groupCode (peerUid=${meta.peerUid})")
+                return false
+            }
+            val mask = groupMsgMask(muted) ?: run {
+                Log.w(TAG, "chatSetting: $label GroupMsgMask enum unavailable")
+                return false
+            }
+            val service = waitForService(timeoutMs = 1_500L) { groupKernelService() } ?: run {
+                Log.w(TAG, "chatSetting: $label group service unavailable")
+                return false
+            }
+            code = invokeOperateApi(label, service, "setGroupMsgMask", listOf(groupCode, mask))
+        } else {
+            val uid = meta.peerUid
+            if (uid.isBlank()) {
+                Log.w(TAG, "chatSetting: $label no peer uid (peerUin=${meta.peerUin})")
+                return false
+            }
+            val service = waitForService(timeoutMs = 1_500L) { buddyService } ?: run {
+                Log.w(TAG, "chatSetting: $label buddy service unavailable")
+                return false
+            }
+            code = invokeOperateApi(label, service, "setMsgNotify", listOf(uid, muted))
+        }
+        // 群的 isMsgDisturb 读回不可靠（恒 false），群聊以 callback code==0 为准；单聊读回校验。
+        val readback = if (code == 0 && !meta.isGroup) {
+            pollRecentFlag(chatId, muted, ::readMutedFlag)
+        } else {
+            null
+        }
+        Log.i(TAG, "chatSetting: $label ok=${code == 0} code=$code readback=$readback")
+        if (code == 0) refreshChatsSoon()
+        return code == 0
+    }
+
+    /**
+     * 会话「标为未读/已读」（与 TIM 原生一致）：
+     * - 未读：IKernelMsgService.setMarkUnreadFlag(Contact, true)（void；TIM PlatformRecentContactsDataSource 同款）；
+     * - 已读：IKernelMsgService.setMsgRead(Contact, IOperateCallback)（code==0 为准），失败再用
+     *   IKernelRecentContactService.clearMsgUnreadCount(peerUid, cb) 兜底。
+     * 阻塞，需在 IO 线程调用；成功后 refreshChatsSoon() 刷新会话列表。
+     */
+    fun setChatUnread(chatId: String, unread: Boolean): Boolean {
+        if (!isHost) return false
+        if (!ensureServices()) return false
+        val label = "setChatUnread($chatId, unread=$unread)"
+        val meta = ensureChatContext(chatId) ?: run {
+            Log.w(TAG, "chatSetting: $label meta unavailable")
+            return false
+        }
+        val contact = ensureKernelContact(chatId, meta) ?: run {
+            Log.w(TAG, "chatSetting: $label contact unavailable (peerUid=${meta.peerUid})")
+            return false
+        }
+        val service = waitForService(timeoutMs = 1_500L) { msgService } ?: run {
+            Log.w(TAG, "chatSetting: $label msg service unavailable")
+            return false
+        }
+        if (unread) {
+            // 标为未读：setMarkUnreadFlag(Contact, true) 无 callback，invoke 成功即视为成功（TIM 原生同款）。
+            val target = resolveKernelMethod(service, "setMarkUnreadFlag", 2)
+            if (target == null) {
+                Log.w(TAG, "chatSetting: $label setMarkUnreadFlag not found")
+                return false
+            }
+            var code = -1
+            val ok = runCatching {
+                target.second.invoke(target.first, contact, true)
+                code = 0
+                true
+            }.getOrElse { t ->
+                Log.w(TAG, "chatSetting: $label setMarkUnreadFlag failed: ${t.javaClass.simpleName} ${t.message}")
+                false
+            }
+            Log.i(TAG, "chatSetting: $label ok=$ok code=$code impl=MsgService.setMarkUnreadFlag")
+            if (ok) refreshChatsSoon()
+            return ok
+        }
+        // 标为已读：setMsgRead(Contact, IOperateCallback)。
+        var code = invokeOperateApi(label, service, "setMsgRead", listOf(contact))
+        var impl = "MsgService.setMsgRead"
+        if (code != 0) {
+            // 兜底：清未读数（native clearMsgUnreadCount(peerUid, cb)）。
+            val recentService = waitForService(timeoutMs = 1_500L) { recentContactService }
+            if (recentService != null && meta.peerUid.isNotBlank()) {
+                val fallbackCode = invokeOperateApi(
+                    label, recentService, "clearMsgUnreadCount", listOf(meta.peerUid),
+                )
+                if (fallbackCode == 0) {
+                    code = 0
+                    impl = "RecentContactService.clearMsgUnreadCount"
+                }
+            }
+        }
+        val ok = code == 0
+        Log.i(TAG, "chatSetting: $label ok=$ok code=$code impl=$impl")
+        if (ok) refreshChatsSoon()
+        return ok
+    }
+
+    /**
+     * 删除会话（只删最近会话列表条目，不删聊天记录）：
+     * 1) IKernelRecentContactService.deleteRecentContacts(ArrayList<RecentContactInfo>, cb)——用
+     *    findRecentContactInfo 拿到的真实 RecentContactInfo（TIM 原生删除会话同款，native 需要真实 info）；
+     * 2) 兜底 deleteRecentContactsVer2(ArrayList<Contact>, cb)（TIM RelationMsgServiceImpl 的删除路径
+     *    实际也是 Contact 版本建最近会话删除；native 才有该方法名）。
+     * 阻塞，需在 IO 线程调用；code==0 成功，成功后 refreshChatsSoon()。
+     */
+    fun deleteChat(chatId: String): Boolean {
+        if (!isHost) return false
+        if (!ensureServices()) return false
+        val label = "deleteChat($chatId)"
+        val meta = ensureChatContext(chatId) ?: run {
+            Log.w(TAG, "chatSetting: $label meta unavailable")
+            return false
+        }
+        val service = waitForService(timeoutMs = 1_500L) { recentContactService } ?: run {
+            Log.w(TAG, "chatSetting: $label recent contact service unavailable")
+            return false
+        }
+        var code = -1
+        var impl = "none"
+        val info = findRecentContactInfo(chatId)
+        if (info != null) {
+            code = invokeOperateApi(label, service, "deleteRecentContacts", listOf(arrayListOf(info)))
+            impl = "deleteRecentContacts"
+        } else {
+            Log.w(TAG, "chatSetting: $label real RecentContactInfo unavailable")
+        }
+        if (code != 0) {
+            val contact = ensureKernelContact(chatId, meta)
+            if (contact != null) {
+                val fallbackCode = invokeOperateApi(
+                    label, service, "deleteRecentContactsVer2", listOf(arrayListOf(contact)),
+                )
+                if (fallbackCode == 0) {
+                    code = 0
+                    impl = "deleteRecentContactsVer2"
+                }
+            } else {
+                Log.w(TAG, "chatSetting: $label fallback contact unavailable (peerUid=${meta.peerUid})")
+            }
+        }
+        val ok = code == 0
+        Log.i(TAG, "chatSetting: $label ok=$ok code=$code impl=$impl")
+        if (ok) refreshChatsSoon()
+        return ok
+    }
+
+    // ---------------------------------------------------------------------
+    // 聊天记录搜索（IKernelSearchService）
+    // ---------------------------------------------------------------------
+
+    /** 一次聊天记录搜索的等待器：kernel 结果回调可能不止一次（分页）。 */
+    private class SearchAwait(val keyword: String) {
+        @Volatile
+        var searchId: Int = -1
+
+        @Volatile
+        var hasMore: Boolean = false
+
+        @Volatile
+        var callbackCount: Int = 0
+
+        @Volatile
+        var latch: CountDownLatch = CountDownLatch(1)
+
+        val items: MutableList<Any?> = java.util.concurrent.CopyOnWriteArrayList()
+
+        fun reset() {
+            latch = CountDownLatch(1)
+        }
+
+        fun await(seconds: Long): Boolean = latch.await(seconds, TimeUnit.SECONDS)
+    }
+
+    private val searchWaiters = ConcurrentHashMap<Int, SearchAwait>()
+
+    /** 监听回调比 searchChatMsgs 返回值先到时先暂存（searchId -> SearchMsgKeywordsResult）。 */
+    private val unclaimedSearchResults = ConcurrentHashMap<Int, Any>()
+
+    @Volatile
+    private var searchListener: Any? = null
+
+    @Volatile
+    private var searchListenerRegistered = false
+
+    /** wrapper IKernelService.getSearchService()；个别版本退回 wrapperSession.getSearchService()。 */
+    private fun kernelSearchService(): Any? {
+        val kernel = kernelService ?: return null
+        runCatching { kernel.javaClass.getMethod("getSearchService").invoke(kernel) }
+            .getOrNull()?.let { return it }
+        val session = runCatching {
+            kernel.javaClass.getMethod("getWrapperSession").invoke(kernel)
+        }.getOrNull() ?: return null
+        return runCatching { session.javaClass.getMethod("getSearchService").invoke(session) }.getOrNull()
+    }
+
+    /** 全局只注册一次 IKernelSearchListener（TIM 的 search wrapper 没有暴露 remove 接口）。 */
+    private fun ensureSearchListener(service: Any): Boolean {
+        if (searchListenerRegistered) return true
+        synchronized(this) {
+            if (searchListenerRegistered) return true
+            val cl = hostClassLoader() ?: return false
+            val listenerClass = runCatching {
+                Class.forName("com.tencent.qqnt.kernel.nativeinterface.IKernelSearchListener", false, cl)
+            }.getOrNull() ?: return false
+            val proxy = searchListener ?: Proxy.newProxyInstance(
+                cl,
+                arrayOf(listenerClass),
+            ) { _, method, args ->
+                if (method.name == "onSearchMsgKeywordsResult") {
+                    val result = args?.getOrNull(0)
+                    if (result == null) {
+                        Log.i(TAG, "chatSetting: search callback null result")
+                    } else {
+                        onSearchKeywordsResult(result)
+                    }
+                } else {
+                    Log.i(
+                        TAG,
+                        "chatSetting: search listener callback ${method.name} " +
+                            "args=${args?.joinToString { it?.javaClass?.simpleName ?: "null" }}",
+                    )
+                }
+                defaultValueFor(method.returnType)
+            }.also { searchListener = it }
+            val addMethod = reflectMethod(service, "addKernelSearchListener", 1)
+            if (addMethod == null) {
+                Log.w(
+                    TAG,
+                    "chatSetting: addKernelSearchListener not found on ${service.javaClass.simpleName}",
+                )
+                return false
+            }
+            return try {
+                addMethod.invoke(service, proxy)
+                searchListenerRegistered = true
+                Log.i(
+                    TAG,
+                    "chatSetting: search listener registered on ${service.javaClass.simpleName}",
+                )
+                true
+            } catch (t: Throwable) {
+                Log.w(
+                    TAG,
+                    "chatSetting: register search listener failed: ${t.javaClass.simpleName} ${t.message}",
+                )
+                false
+            }
+        }
+    }
+
+    private fun onSearchKeywordsResult(result: Any) {
+        val searchId = (invokeGetter(result, "getSearchId") as? Number)?.toInt() ?: -1
+        val waiter = searchWaiters[searchId]
+        if (waiter == null) {
+            unclaimedSearchResults[searchId] = result
+            Log.i(TAG, "chatSetting: search result unclaimed searchId=$searchId")
+            return
+        }
+        deliverSearchResult(waiter, result)
+    }
+
+    private fun deliverSearchResult(waiter: SearchAwait, result: Any) {
+        @Suppress("UNCHECKED_CAST")
+        val items = invokeGetter(result, "getResultItems") as? List<Any?>
+        if (items != null) waiter.items.addAll(items)
+        waiter.hasMore = invokeGetter(result, "getHasMore") as? Boolean ?: false
+        waiter.callbackCount++
+        Log.i(
+            TAG,
+            "chatSetting: search callback #${waiter.callbackCount} searchId=${waiter.searchId} " +
+                "items=${items?.size ?: 0} hasMore=${waiter.hasMore} total=${waiter.items.size} " +
+                "keyword=${waiter.keyword}",
+        )
+        waiter.latch.countDown()
+    }
+
+    /**
+     * 在指定会话里按关键字搜索聊天记录。
+     *
+     * 调用形态（与 TIM「查找聊天记录」一致，均经 dex 反编译确认）：
+     *   searchChatMsgs(ArrayList<String> keywords, SearchChatMsgsParams, IOperateCallback): int
+     *   SearchChatMsgsParams = ChatInfo(chatType, peerUid) + pageLimit(20) + searchFields(5 = CONTENT|SENDER)
+     * 结果经 IKernelSearchListener.onSearchMsgKeywordsResult(SearchMsgKeywordsResult{searchId,resultItems,hasMore})
+     * 返回，SearchMsgItem 带 msgId / msgSeq / msgRecord；再用 fetchMessagesByIds + mapMsgRecord 组装成 ChatMessage。
+     *
+     * 阻塞，需在 IO 线程调用；失败（超时/无回调/服务不可用）返回 null，搜索成功但无结果返回空列表。
+     */
+    fun searchChatMessages(chatId: String, keyword: String, limit: Int): List<ChatMessage>? {
+        if (!isHost) return null
+        val query = keyword.trim()
+        if (query.isEmpty()) return null
+        val max = limit.coerceIn(1, 100)
+        if (!ensureServices()) return null
+        val cl = hostClassLoader() ?: return null
+        val meta = ensureChatContext(chatId) ?: run {
+            Log.w(TAG, "chatSetting: searchChatMessages($chatId) meta unavailable")
+            return null
+        }
+        val peerUid = meta.peerUid.ifBlank {
+            if (meta.isGroup) meta.groupCode.toString() else meta.peerUin.toString()
+        }
+        if (peerUid.isBlank()) {
+            Log.w(TAG, "chatSetting: searchChatMessages($chatId) no peerUid")
+            return null
+        }
+        val service = waitForService(timeoutMs = 3_000L) { kernelSearchService() } ?: run {
+            Log.w(TAG, "chatSetting: searchChatMessages($chatId) search service unavailable")
+            return null
+        }
+        if (!ensureSearchListener(service)) return null
+        var searchId = -1
+        return try {
+            val paramsClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.SearchChatMsgsParams", false, cl,
+            )
+            val chatInfoClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.ChatInfo", false, cl,
+            )
+            val chatInfo = chatInfoClass
+                .getConstructor(Int::class.javaPrimitiveType, String::class.java)
+                .newInstance(meta.chatType, peerUid)
+            val params = paramsClass.getConstructor().newInstance()
+            paramsClass.getField("chatInfo").set(params, chatInfo)
+            paramsClass.getField("pageLimit").setInt(params, 20)
+            // MsgSearchField：CONTENT=1、FILENAME=2、SENDER=4；TIM「查找聊天记录」用的是 5。
+            paramsClass.getField("searchFields").setInt(params, 5)
+            paramsClass.getField("filterMsgType").set(params, ArrayList<Any>())
+            paramsClass.getField("filterSendersUid").set(params, ArrayList<Any>())
+            paramsClass.getField("filterMsgFromTime").setLong(params, 0L)
+            paramsClass.getField("filterMsgToTime").setLong(params, 0L)
+
+            val waiter = SearchAwait(query)
+            val keywords = ArrayList<String>().apply { add(query) }
+            val callbackClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.IOperateCallback", false, cl,
+            )
+            val requestLatch = CountDownLatch(1)
+            var requestCode = -1
+            var requestMsg = ""
+            val requestCallback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, method, args ->
+                if (method.name == "onResult") {
+                    requestCode = (args?.getOrNull(0) as? Number)?.toInt() ?: -1
+                    requestMsg = args?.getOrNull(1) as? String ?: ""
+                    requestLatch.countDown()
+                }
+                defaultValueFor(method.returnType)
+            }
+            val searchMethod = reflectMethod(service, "searchChatMsgs", 3) ?: run {
+                Log.w(
+                    TAG,
+                    "chatSetting: searchChatMsgs not found on ${service.javaClass.simpleName}",
+                )
+                return null
+            }
+            val returned = searchMethod.invoke(service, keywords, params, requestCallback)
+            searchId = (returned as? Number)?.toInt() ?: -1
+            if (searchId >= 0) {
+                searchWaiters[searchId] = waiter
+                unclaimedSearchResults.remove(searchId)?.let { deliverSearchResult(waiter, it) }
+            }
+            requestLatch.await(2, TimeUnit.SECONDS)
+            Log.i(
+                TAG,
+                "chatSetting: searchChatMsgs($chatId, \"$query\") chatType=${meta.chatType} " +
+                    "peerUid=${peerUid.take(12)} searchId=$searchId reqCode=$requestCode reqMsg=$requestMsg",
+            )
+            if (searchId < 0) return null
+
+            var got = waiter.await(6)
+            // 结果可能分页（pageLimit=20）；不够 limit 时用 searchMoreChatMsgs 继续翻页。
+            var pages = 1
+            while (waiter.items.size < max && waiter.hasMore && pages < 5) {
+                waiter.reset()
+                val moreMethod = reflectMethod(service, "searchMoreChatMsgs", 1) ?: break
+                runCatching { moreMethod.invoke(service, searchId) }
+                got = waiter.await(3)
+                Log.i(
+                    TAG,
+                    "chatSetting: searchMoreChatMsgs($chatId) page=$pages got=$got " +
+                        "total=${waiter.items.size} hasMore=${waiter.hasMore}",
+                )
+                pages++
+                if (!got) break
+            }
+            val items = waiter.items
+            if (items.isEmpty()) {
+                val received = waiter.callbackCount > 0
+                Log.i(
+                    TAG,
+                    "chatSetting: searchChatMessages($chatId, \"$query\") empty " +
+                        "receivedCallback=$received",
+                )
+                return if (received) emptyList() else null
+            }
+
+            val msgIds = LinkedHashSet<Long>()
+            val itemSeqs = HashMap<Long, Long>()
+            items.forEach { item ->
+                item ?: return@forEach
+                val msgId = (invokeGetter(item, "getMsgId") as? Number)?.toLong()
+                    ?.takeIf { it != 0L } ?: return@forEach
+                msgIds.add(msgId)
+                val seq = (invokeGetter(item, "getMsgSeq") as? Number)?.toLong() ?: 0L
+                if (seq > 0L) itemSeqs[msgId] = seq
+            }
+            // 主路径：按 msgId 批量拉完整消息（复用已有映射/图片/引用解析逻辑）。
+            val fetched = if (msgIds.isNotEmpty() && contacts[chatId] != null) {
+                runCatching { fetchMessagesByIds(chatId, msgIds.toList()) }.getOrDefault(emptyMap())
+            } else {
+                emptyMap()
+            }
+            val messages = ArrayList<ChatMessage>(msgIds.size)
+            val seen = HashSet<String>()
+            msgIds.forEach { msgId ->
+                fetched[msgId]?.let { message ->
+                    val seq = itemSeqs[msgId] ?: 0L
+                    val fixed = if (message.seq == 0L && seq > 0L) message.copy(seq = seq) else message
+                    if (seen.add(fixed.id)) messages.add(fixed)
+                }
+            }
+            // 兜底：结果项自带的 MsgRecord 直接映射。
+            if (messages.isEmpty()) {
+                items.forEach { item ->
+                    val record = item?.let { invokeGetter(it, "getMsgRecord") }
+                    val mapped = record?.let { mapMsgRecord(chatId, it) }?.message
+                    if (mapped != null && seen.add(mapped.id)) {
+                        val seq = (invokeGetter(item!!, "getMsgSeq") as? Number)?.toLong() ?: 0L
+                        messages.add(if (mapped.seq == 0L && seq > 0L) mapped.copy(seq = seq) else mapped)
+                    }
+                }
+            }
+            val ordered = messages
+                .sortedWith(
+                    compareByDescending<ChatMessage> { it.timestampMs }
+                        .thenByDescending { it.seq },
+                )
+                .take(max)
+            Log.i(
+                TAG,
+                "chatSetting: searchChatMessages($chatId, \"$query\") -> ${ordered.size}/${msgIds.size} " +
+                    "messages (limit=$max pages=$pages)",
+            )
+            ordered
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "chatSetting: searchChatMessages failed: ${t.javaClass.simpleName} ${t.message}",
+            )
+            null
+        } finally {
+            if (searchId >= 0) searchWaiters.remove(searchId)
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 好友/会话管理 + 群资料编辑（失败 false/null，日志前缀 manage:）
+    // ---------------------------------------------------------------------
+
+    /** 取会话的内核 Contact（contacts 缓存优先，缺失用 chatMeta 兜底构造）。 */
+    private fun kernelContactFor(chatId: String): Any? {
+        contacts[chatId]?.let { return it }
+        val meta = chatMeta[chatId] ?: ensureChatContext(chatId) ?: return null
+        return ensureKernelContact(chatId, meta)
+    }
+
+    private fun refreshContactsAndChatsSoon() {
+        // 联系人列表保持独立后台刷新；会话列表统一走 LiveChats 去抖合并调度，避免叠加刷新。
+        runCatching {
+            Thread {
+                runCatching { com.material3tim.data.repository.LiveContacts.refresh() }
+            }.start()
+        }
+        scheduleLiveChatsRefresh()
+    }
+
+    /** 清空会话聊天记录：内核 IKernelMsgService.clearMsgRecords(Contact, IClearMsgRecordsCallback)。 */
+    fun clearChatHistory(chatId: String): Boolean {
+        if (!isHost) return false
+        if (!ensureServices()) return false
+        val started = perfUptime()
+        return try {
+            val contact = kernelContactFor(chatId) ?: run {
+                Log.w(TAG, "manage: clearHistory chat=$chatId failed (contact unavailable)")
+                return false
+            }
+            val service = waitForService(timeoutMs = 1_200L) { msgService } ?: run {
+                Log.w(TAG, "manage: clearHistory chat=$chatId failed (msg service unavailable)")
+                return false
+            }
+            val target = resolveKernelMethod(service, "clearMsgRecords", 2) ?: run {
+                Log.w(TAG, "manage: clearHistory chat=$chatId failed (method clearMsgRecords/2 not found)")
+                return false
+            }
+            val cl = hostClassLoader() ?: return false
+            val callbackClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.IClearMsgRecordsCallback", false, cl,
+            )
+            val latch = CountDownLatch(1)
+            var code = -1
+            var message = ""
+            val callback = java.lang.reflect.Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, method, args ->
+                if (method.name == "onResult") {
+                    code = (args?.getOrNull(0) as? Number)?.toInt() ?: -1
+                    message = args?.getOrNull(1) as? String ?: ""
+                    latch.countDown()
+                }
+                defaultValueFor(method.returnType)
+            }
+            target.second.invoke(target.first, contact, callback)
+            val got = latch.await(8, TimeUnit.SECONDS)
+            val ok = code == 0
+            Log.i(
+                TAG,
+                "manage: clearHistory chat=$chatId ok=$ok code=$code msg=${message.take(80)} " +
+                    "timeout=${!got} impl=${target.first.javaClass.simpleName} " +
+                    "ms=${perfUptime() - started}",
+            )
+            if (ok) {
+                refreshChatsSoon()
+                LiveEvents.emitMessageEvent(
+                    MessageEvent(chatId = chatId, msgIds = emptyList(), kind = MessageEvent.Kind.DELETE),
+                )
+            }
+            ok
+        } catch (t: Throwable) {
+            Log.w(TAG, "manage: clearHistory failed chat=$chatId: ${t.javaClass.simpleName} ${t.message}")
+            false
+        }
+    }
+
+    /** 删除好友：内核 IKernelBuddyService.delBuddy(DelBuddyInfo, IOperateCallback)。 */
+    fun deleteFriend(chatId: String, uid: String): Boolean {
+        if (!isHost) return false
+        if (!ensureServices()) return false
+        return try {
+            val targetUid = uid.trim().ifBlank {
+                chatId.removePrefix("tim_friend_").removePrefix("tim_1_")
+                    .takeIf { it != chatId && it.isNotBlank() }.orEmpty()
+            }
+            if (targetUid.isBlank()) {
+                Log.w(TAG, "manage: deleteFriend failed chat=$chatId (uid unavailable)")
+                return false
+            }
+            val service = waitForService(timeoutMs = 1_200L) { buddyService } ?: run {
+                Log.w(TAG, "manage: deleteFriend($targetUid) failed (buddy service unavailable)")
+                return false
+            }
+            val cl = hostClassLoader() ?: return false
+            val infoClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.DelBuddyInfo", false, cl,
+            )
+            // TIM 自己的删好友链路：DelFriendNTServlet → buddyService.delBuddy(
+            //   DelBuddyInfo(friendUid, tempBlock=false, tempBothDel=true)；
+            // tempBothDel=true 表示双向删除，与 TIM 默认 KEY_DEL_TYPE 一致。
+            val info = infoClass
+                .getConstructor(String::class.java, Boolean::class.javaPrimitiveType, Boolean::class.javaPrimitiveType)
+                .newInstance(targetUid, false, true)
+            val code = invokeOperateApi(
+                "manage: deleteFriend($targetUid attempt=wrapper-delBuddy tempBothDel=true)",
+                service,
+                "delBuddy",
+                listOf(info),
+            )
+            val ok = code == 0
+            if (ok) {
+                loadedContacts = loadedContacts.filterNot { it.id == "tim_friend_$targetUid" }
+                refreshContactsAndChatsSoon()
+            }
+            Log.i(
+                TAG,
+                "manage: deleteFriend attempt=wrapper-delBuddy chat=$chatId uid=$targetUid " +
+                    "tempBothDel=true ok=$ok code=$code",
+            )
+            ok
+        } catch (t: Throwable) {
+            Log.w(TAG, "manage: deleteFriend failed chat=$chatId uid=$uid: ${t.javaClass.simpleName} ${t.message}")
+            false
+        }
+    }
+
+    /** 全局只注册一次 IKernelBuddyListener，用于接收 onBuddyReqChange(好友申请列表)。 */
+    private fun ensureBuddyReqListener(): Boolean {
+        if (buddyReqListenerRegistered) return true
+        synchronized(this) {
+            if (buddyReqListenerRegistered) return true
+            val service = waitForService(timeoutMs = 1_200L) { nativeBuddyService() } ?: run {
+                Log.w(TAG, "manage: newFriends listener failed (native buddy service unavailable)")
+                return false
+            }
+            val cl = hostClassLoader() ?: return false
+            val iface = runCatching {
+                Class.forName("com.tencent.qqnt.kernel.nativeinterface.IKernelBuddyListener", false, cl)
+            }.getOrNull() ?: return false
+            val proxy = java.lang.reflect.Proxy.newProxyInstance(cl, arrayOf(iface)) { _, method, args ->
+                if (method.name == "onBuddyReqChange") {
+                    val info = args?.getOrNull(0)
+                    val list = (info?.let { invokeGetter(it, "getBuddyReqs") } as? List<*>)
+                        .orEmpty()
+                        .filterNotNull()
+                    cachedBuddyReqs = list
+                    list.forEach { req ->
+                        val reqUid = (invokeGetter(req, "getFriendUid") as? String).orEmpty()
+                        val reqTime = (invokeGetter(req, "getReqTime") as? Number)?.toLong() ?: 0L
+                        if (reqUid.isNotBlank() && reqTime > 0L) buddyReqTimeByUid[reqUid] = reqTime
+                    }
+                    Log.i(TAG, "manage: newFriends changed count=${list.size}")
+                    buddyReqLatch?.countDown()
+                }
+                defaultValueFor(method.returnType)
+            }
+            val addMethod = reflectMethod(service, "addKernelBuddyListener", 1) ?: run {
+                Log.w(TAG, "manage: addKernelBuddyListener not found")
+                return false
+            }
+            return runCatching {
+                addMethod.invoke(service, proxy)
+                buddyReqListenerRegistered = true
+                true
+            }.getOrElse { t ->
+                Log.w(TAG, "manage: register buddy listener failed: ${t.javaClass.simpleName} ${t.message}")
+                false
+            }
+        }
+    }
+
+    private fun mapBuddyReq(record: Any?): FriendRequest? {
+        record ?: return null
+        val uid = (invokeGetter(record, "getFriendUid") as? String).orEmpty()
+        if (uid.isBlank()) return null
+        val nick = (invokeGetter(record, "getFriendNick") as? String)
+            ?.takeIf { it.isNotBlank() }
+        val nameMore = (invokeGetter(record, "getNameMore") as? String)
+            ?.takeIf { it.isNotBlank() }
+        val extWords = (invokeGetter(record, "getExtWords") as? String).orEmpty()
+        var time = (invokeGetter(record, "getReqTime") as? Number)?.toLong() ?: 0L
+        if (time in 1..9_999_999_999L) time *= 1000L
+        val isDecide = (invokeGetter(record, "getIsDecide") as? Boolean) == true
+        val isAgreed = (invokeGetter(record, "getIsAgreed") as? Boolean) == true
+        // 方向：BuddyReq.isInitiator=true 表示该申请由我发起（发出），false=对方申请我（收到）。
+        val isInitiator = (invokeGetter(record, "getIsInitiator") as? Boolean) ?: false
+        val isIncoming = !isInitiator
+        val uin = runCatching { uinForUid(uid).takeIf { it != 0L }?.toString().orEmpty() }
+            .getOrDefault("")
+        val uinLong = uin.toLongOrNull() ?: 0L
+        val displayName = nick ?: nameMore ?: uid
+        val timeLabel = if (time > 0L) {
+            runCatching {
+                java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault())
+                    .format(java.util.Date(time))
+            }.getOrDefault("")
+        } else {
+            ""
+        }
+        return FriendRequest(
+            id = uid,
+            name = displayName,
+            message = extWords,
+            timeLabel = timeLabel,
+            avatarSeed = seedFor(uinLong, uid.hashCode() and 0x7fffffff),
+            state = when {
+                !isDecide -> FriendRequestState.PENDING
+                isAgreed -> FriendRequestState.ACCEPTED
+                else -> FriendRequestState.REJECTED
+            },
+            uid = uid,
+            uin = uin,
+            avatarPath = userAvatarPath(uid, uinLong),
+            timeMillis = time,
+            isIncoming = isIncoming,
+        )
+    }
+
+    // ---- TIM「过滤通知」（风控好友申请，OidbSvc.0xd69 / SysSuspiciousMsg）并入新的朋友列表 ----
+
+    private fun suspiciousField(item: Any, fieldName: String): Any? = runCatching {
+        item.javaClass.getDeclaredField(fieldName).apply { isAccessible = true }.get(item)
+    }.getOrNull()
+
+    private fun suspiciousString(item: Any, vararg fieldNames: String): String {
+        for (name in fieldNames) {
+            val value = suspiciousField(item, name) as? String
+            if (!value.isNullOrBlank()) return value
+        }
+        return ""
+    }
+
+    private fun suspiciousLong(item: Any, fieldName: String): Long =
+        (suspiciousField(item, fieldName) as? Number)?.toLong() ?: 0L
+
+    private fun friendRequestTimeLabel(timeMs: Long): String = if (timeMs > 0L) {
+        runCatching {
+            java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault())
+                .format(java.util.Date(timeMs))
+        }.getOrDefault("")
+    } else {
+        ""
+    }
+
+    /** 触发 TIM 拉取风控/过滤通知列表：FriendListHandler.getSuspiciousMsgList(20, null, null)。 */
+    private fun triggerSuspiciousMsgFetch() {
+        val handler = runCatching {
+            val runtime = appRuntime ?: appRuntime() ?: return@runCatching null
+            runtime.javaClass
+                .getMethod("getBusinessHandler", String::class.java)
+                .invoke(runtime, "com.tencent.mobileqq.app.FriendListHandler")
+        }.getOrNull()
+        if (handler == null) {
+            Log.w(TAG, "manage: newFriends filtered fetch unavailable (FriendListHandler)")
+            return
+        }
+        val method = handler.javaClass.methods.firstOrNull {
+            it.name == "getSuspiciousMsgList" && it.parameterCount == 3
+        }
+        if (method == null) {
+            Log.w(TAG, "manage: newFriends filtered fetch unavailable (getSuspiciousMsgList)")
+            return
+        }
+        runCatching { method.invoke(handler, 20, null, null) }.onFailure {
+            Log.w(
+                TAG,
+                "manage: newFriends filtered fetch failed: ${it.javaClass.simpleName} ${it.message}",
+            )
+            return
+        }
+        Log.i(TAG, "manage: newFriends filtered fetch OidbSvc.0xd69 reqNum=20")
+    }
+
+    /** 一条风控/过滤通知 → FriendRequest（与普通申请同构，isIncoming=true，状态待处理）。 */
+    private fun mapSuspiciousToFriendRequest(item: Any): FriendRequest? {
+        val uin = suspiciousLong(item, "uin")
+        if (uin == 0L) return null
+        val uid = runCatching { resolveUidByUin(uin) }.getOrNull().orEmpty()
+        // SysSuspiciousMsg 字段：nick/msg(混淆名 f93455msg)/time(秒)/nameMore/reason...
+        val name = suspiciousString(item, "nick", "nameMore", "entity_name")
+            .ifBlank { uid.ifBlank { uin.toString() } }
+        val message = suspiciousString(item, "msg", "f93455msg", "reason")
+        var timeMs = suspiciousLong(item, "time")
+        if (timeMs in 1..9_999_999_999L) timeMs *= 1000L
+        val key = uid.ifBlank { "uin_$uin" }
+        return FriendRequest(
+            id = key,
+            name = name,
+            message = message,
+            timeLabel = friendRequestTimeLabel(timeMs),
+            avatarSeed = seedFor(uin, name.hashCode() and 0x7fffffff),
+            state = FriendRequestState.PENDING,
+            uid = uid,
+            uin = uin.toString(),
+            avatarPath = userAvatarPath(uid, uin),
+            timeMillis = timeMs,
+            isIncoming = true,
+        )
+    }
+
+    /** 读取 TIM 风控/过滤通知（INewFriendService.getAllSysSuspiciousMsg）；首次为空时触发 0xd69 拉取并等待 ≤2.5s。 */
+    private fun filteredFriendRequests(): List<FriendRequest> {
+        val service = newFriendService() ?: return emptyList()
+        val method = service.javaClass.methods.firstOrNull {
+            it.name == "getAllSysSuspiciousMsg" && it.parameterCount == 0
+        } ?: run {
+            Log.w(TAG, "manage: newFriends filtered unavailable (getAllSysSuspiciousMsg)")
+            return emptyList()
+        }
+        fun read(): List<Any> {
+            @Suppress("UNCHECKED_CAST")
+            return (runCatching { method.invoke(service) }.getOrNull() as? List<Any?>)
+                .orEmpty().filterNotNull()
+        }
+        var raw = read()
+        if (raw.isEmpty() && !suspiciousFetchedOnce) {
+            suspiciousFetchedOnce = true
+            triggerSuspiciousMsgFetch()
+            val deadline = perfUptime() + 1_200L
+            while (perfUptime() < deadline) {
+                Thread.sleep(120L)
+                raw = read()
+                if (raw.isNotEmpty()) break
+            }
+        }
+        val mapped = raw.mapNotNull { mapSuspiciousToFriendRequest(it) }
+        Log.i(
+            TAG,
+            "manage: newFriends suspicious raw=${raw.size} mapped=${mapped.size} " +
+                "fetchedOnce=$suspiciousFetchedOnce",
+        )
+        return mapped
+    }
+
+    /**
+     * 过滤通知（风控申请）的接受/删除（TIM 官方链路）：
+     * - accept=true → FriendListHandler.agreeSuspiciousMsg(uin)（OidbSvc.0xd72）
+     * - accept=false → FriendListHandler.deleteSuspiciousMsg(uin)（OidbSvc.0xd69 cmd_type=3，TIM 过滤页滑动删除同款）
+     * 成功后轮询 getAllSysSuspiciousMsg 确认该 uin 已移除（≤2s）。
+     */
+    private fun approveSuspiciousFriendRequest(uin: Long, accept: Boolean): Boolean {
+        if (uin == 0L) return false
+        val handler = runCatching {
+            val runtime = appRuntime ?: appRuntime() ?: return@runCatching null
+            runtime.javaClass
+                .getMethod("getBusinessHandler", String::class.java)
+                .invoke(runtime, "com.tencent.mobileqq.app.FriendListHandler")
+        }.getOrNull() ?: run {
+            Log.w(TAG, "manage: approveFriendRequest attempt=suspicious unavailable (FriendListHandler)")
+            return false
+        }
+        val methodName = if (accept) "agreeSuspiciousMsg" else "deleteSuspiciousMsg"
+        val method = handler.javaClass.methods.firstOrNull {
+            it.name == methodName && it.parameterCount == 1 &&
+                it.parameterTypes[0] == Long::class.javaPrimitiveType
+        } ?: run {
+            Log.w(TAG, "manage: approveFriendRequest attempt=suspicious $methodName not found")
+            return false
+        }
+        val invoked = runCatching {
+            method.invoke(handler, uin)
+            true
+        }.getOrElse { t ->
+            Log.w(
+                TAG,
+                "manage: approveFriendRequest attempt=suspicious invoke failed: " +
+                    "${t.javaClass.simpleName} ${t.message}",
+            )
+            false
+        }
+        if (!invoked) return false
+        Log.i(
+            TAG,
+            "manage: approveFriendRequest attempt=suspicious action=$methodName uin=$uin " +
+                "cmd=${if (accept) "OidbSvc.0xd72" else "OidbSvc.0xd69"}",
+        )
+        // 校验：风控列表里该 uin 消失
+        val service = newFriendService() ?: return true
+        val getAll = service.javaClass.methods.firstOrNull {
+            it.name == "getAllSysSuspiciousMsg" && it.parameterCount == 0
+        } ?: return true
+        val deadline = perfUptime() + 2_000L
+        while (perfUptime() < deadline) {
+            val list = runCatching { getAll.invoke(service) as? List<*> }.getOrNull().orEmpty()
+            val stillThere = list.filterNotNull().any { suspiciousLong(it, "uin") == uin }
+            if (!stillThere) {
+                Log.i(TAG, "manage: approveFriendRequest attempt=suspicious verify ok uin=$uin")
+                return true
+            }
+            Thread.sleep(200L)
+        }
+        Log.w(
+            TAG,
+            "manage: approveFriendRequest attempt=suspicious verify timeout uin=$uin " +
+                "(风控列表仍含该 uin，可能服务端异步)",
+        )
+        return true
+    }
+
+    /** 「新的朋友」好友申请：注册 BuddyListener → getBuddyReq 触发 → 等 onBuddyReqChange。 */
+    fun loadFriendRequests(): List<FriendRequest>? {
+        if (!isHost) return null
+        if (!ensureServices()) return null
+        val started = perfUptime()
+        return try {
+            val listenerOk = ensureBuddyReqListener()
+            val service = waitForService(timeoutMs = 1_200L) {
+                nativeBuddyService() ?: buddyService
+            } ?: run {
+                Log.w(TAG, "manage: newFriends failed (buddy service unavailable)")
+                return null
+            }
+            val latch = CountDownLatch(1)
+            buddyReqLatch = latch
+            val cl = hostClassLoader() ?: return null
+            val callbackClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.IOperateCallback", false, cl,
+            )
+            var requestCode = -1
+            var requestMsg = ""
+            val callback = java.lang.reflect.Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, method, args ->
+                if (method.name == "onResult") {
+                    requestCode = (args?.getOrNull(0) as? Number)?.toInt() ?: -1
+                    requestMsg = args?.getOrNull(1) as? String ?: ""
+                }
+                defaultValueFor(method.returnType)
+            }
+            val target = resolveKernelMethod(service, "getBuddyReq", 1) ?: run {
+                Log.w(TAG, "manage: newFriends failed (getBuddyReq not found)")
+                return null
+            }
+            runCatching { target.second.invoke(target.first, callback) }
+                .onFailure { Log.w(TAG, "manage: getBuddyReq invoke failed: ${it.javaClass.simpleName} ${it.message}") }
+            val got = if (listenerOk) latch.await(2_000L, TimeUnit.MILLISECONDS) else false
+            buddyReqLatch = null
+            val normalRequests = cachedBuddyReqs.mapNotNull { mapBuddyReq(it) }
+            // TIM「过滤通知」（风控好友申请）直接并入列表，与普通申请同构；不单独标注/入口。
+            val filteredRequests = runCatching { filteredFriendRequests() }.getOrElse { t ->
+                Log.w(
+                    TAG,
+                    "manage: newFriends filtered load failed: ${t.javaClass.simpleName} ${t.message}",
+                )
+                emptyList()
+            }
+            val merged = (normalRequests + filteredRequests)
+                // uid+reqTime 去重（风控申请 uid 可能解析不到，退化为 uin）
+                .distinctBy { req ->
+                    val key = req.uid.ifBlank { req.uin.ifBlank { req.id } }
+                    key.lowercase() + ":" + req.timeMillis
+                }
+                .sortedWith(
+                    compareBy({ it.state != FriendRequestState.PENDING }, { -it.timeMillis }),
+                )
+            val incoming = merged.count { it.isIncoming }
+            Log.i(
+                TAG,
+                "manage: newFriends normal=${normalRequests.size} filtered=${filteredRequests.size} " +
+                    "total=${merged.size} incoming=$incoming outgoing=${merged.size - incoming} " +
+                    "gotCallback=$got reqCode=$requestCode reqMsg=${requestMsg.take(60)} " +
+                    "listener=$listenerOk ms=${perfUptime() - started}",
+            )
+            Log.i(
+                TAG,
+                "manage: newFriends filtered count=${filteredRequests.size} total=${merged.size}",
+            )
+            merged
+        } catch (t: Throwable) {
+            Log.w(TAG, "manage: newFriends failed: ${t.javaClass.simpleName} ${t.message}")
+            null
+        }
+    }
+
+    // ---- 接受/拒绝好友申请：TIM 旧版 structmsg 通道（kernel approvalFriendRequest 被产品禁用 -10122） ----
+
+    private fun newFriendService(): Any? = runCatching {
+        val runtime = appRuntime ?: appRuntime() ?: return@runCatching null
+        val cl = hostClassLoader() ?: return@runCatching null
+        val iface = Class.forName("com.tencent.mobileqq.newfriend.api.INewFriendService", true, cl)
+        runtime.javaClass
+            .getMethod("getRuntimeService", Class::class.java, String::class.java)
+            .invoke(runtime, iface, "")
+    }.getOrNull()
+
+    private fun buddyReqUinOf(uid: String): Long = runCatching { uinForUid(uid) }.getOrDefault(0L)
+
+    /** 一条好友申请结构消息的候选信息（用于筛选 actions 非空的未处理申请）。 */
+    private data class StructMsgCandidate(
+        val raw: Any,
+        val reqUin: Long,
+        val uid: String,
+        val msgSeq: Long,
+        val msgType: Int,
+        val subType: Int,
+        val actionCount: Int,
+        val msgTime: Long,
+    ) {
+        /** sub_type >= 2 表示已处理（2=已同意，3=已拒绝，7/8=忽略/拉黑）。 */
+        val decided: Boolean get() = subType >= 2
+
+        fun describe(index: Int): String =
+            "candidates[$index] reqUin=$reqUin uid=$uid msgSeq=$msgSeq msgType=$msgType " +
+                "subType=$subType actions=$actionCount msgTime=$msgTime isDecide=$decided"
+    }
+
+    /** 收集 TIM「新的朋友」列表里的全部 structMsg$StructMsg（不筛选）。 */
+    private fun collectStructMsgCandidates(): List<StructMsgCandidate> {
+        val service = newFriendService() ?: run {
+            Log.w(TAG, "manage: approveFriendRequest attempt=legacy unavailable (INewFriendService)")
+            return emptyList()
+        }
+        val datasMethod = service.javaClass.methods.firstOrNull {
+            it.name == "getMixedNewFriendDatas" && it.parameterCount == 0
+        } ?: run {
+            Log.w(TAG, "manage: approveFriendRequest attempt=legacy unavailable (getMixedNewFriendDatas)")
+            return emptyList()
+        }
+        val list = runCatching { datasMethod.invoke(service) as? List<*> }.getOrNull().orEmpty()
+        val out = ArrayList<StructMsgCandidate>(list.size)
+        for (item in list) {
+            item ?: continue
+            val message = runCatching {
+                item.javaClass.declaredFields.firstOrNull {
+                    it.type.name == "com.tencent.mobileqq.systemmsg.MessageForSystemMsg"
+                }?.apply { isAccessible = true }?.get(item)
+            }.getOrNull() ?: continue
+            val structMsg = runCatching {
+                message.javaClass.getField("structMsg").get(message)
+            }.getOrNull() ?: continue
+            val msgNested = runCatching { pbMessage(structMsg, "msg") }.getOrNull()
+            val actionCount = msgNested?.let { runCatching { pbRepeatMessages(it, "actions").size }.getOrDefault(0) } ?: 0
+            out.add(
+                StructMsgCandidate(
+                    raw = structMsg,
+                    reqUin = runCatching { pbLong(structMsg, "req_uin") }.getOrDefault(0L),
+                    uid = msgNested?.let {
+                        runCatching { pbBytes(it, "uid") }.getOrNull()?.toString(Charsets.UTF_8)
+                    }.orEmpty(),
+                    msgSeq = runCatching { pbLong(structMsg, "msg_seq") }.getOrDefault(0L),
+                    msgType = runCatching { pbInt(structMsg, "msg_type") }.getOrDefault(-1),
+                    subType = msgNested?.let { runCatching { pbInt(it, "sub_type") }.getOrDefault(-1) } ?: -1,
+                    actionCount = actionCount,
+                    msgTime = runCatching { pbLong(structMsg, "msg_time") }.getOrDefault(0L),
+                ),
+            )
+        }
+        return out
+    }
+
+    /**
+     * 候选优先级（同一 uid 可能有多条系统消息，已处理的消息 actions 会被清空）：
+     * 1) actions>=2 且 sub_type<2（拒绝需要 index 1）→ msg_time 最新；
+     * 2) actions>=1 且 sub_type<2 → msg_time 最新；
+     * 3) actions 非空任一 → msg_time 最新。
+     */
+    private fun selectStructMsgCandidate(candidates: List<StructMsgCandidate>): StructMsgCandidate? {
+        val actionable = candidates.filter { it.actionCount >= 1 && !it.decided }
+        return actionable.filter { it.actionCount >= 2 }.maxByOrNull { it.msgTime }
+            ?: actionable.maxByOrNull { it.msgTime }
+            ?: candidates.filter { it.actionCount >= 1 }.maxByOrNull { it.msgTime }
+    }
+
+    /**
+     * 强制刷新 TIM「新的朋友」系统消息列表：
+     * `INewFriendService.initNewFriendList()` + `loadNewFriendMsg(true)`（反编译确认 boolean=true 走
+     * IMessageFacade.getAIOList 全量路径；false 走 getMsgList 受限路径），主线程执行后等 1.8s。
+     */
+    private fun forceRefreshNewFriendMessages() {
+        val service = newFriendService() ?: run {
+            Log.w(TAG, "manage: approveFriendRequest legacy force refresh unavailable (INewFriendService)")
+            return
+        }
+        Log.i(TAG, "manage: approveFriendRequest legacy force refresh loadNewFriendMsg(true)")
+        runCatching {
+            mainHandler.post {
+                runCatching {
+                    service.javaClass.methods
+                        .firstOrNull { it.name == "initNewFriendList" && it.parameterCount == 0 }
+                        ?.invoke(service)
+                    service.javaClass.methods
+                        .firstOrNull {
+                            it.name == "loadNewFriendMsg" && it.parameterCount == 1 &&
+                                it.parameterTypes[0] == Boolean::class.javaPrimitiveType
+                        }
+                        ?.invoke(service, true)
+                }.onFailure {
+                    Log.w(
+                        TAG,
+                        "manage: approveFriendRequest legacy force refresh failed: " +
+                            "${it.javaClass.simpleName} ${it.message}",
+                    )
+                }
+            }
+        }.onFailure {
+            Log.w(TAG, "manage: approveFriendRequest legacy force refresh post failed: ${it.message}")
+        }
+        Log.i(TAG, "perf: forceRefreshNewFriendMessages posted (no fixed sleep)")
+    }
+
+    /**
+     * 从 TIM「新的朋友」数据里取该申请可操作的 structmsg$StructMsg：
+     * 扫描全部候选（匹配 req_uin 或 SystemMsg.uid），按 actions/sub_type/msg_time 优先级筛选；
+     * 没有可操作候选时先强制刷新系统消息列表再扫一次；仍没有则打印全部候选并返回 null。
+     */
+    private fun newFriendStructMsgFor(targetUin: Long, targetUid: String): Any? {
+        fun matched(): List<StructMsgCandidate> = collectStructMsgCandidates().filter {
+            (targetUin != 0L && it.reqUin == targetUin) ||
+                (targetUid.isNotBlank() && it.uid == targetUid)
+        }
+
+        var candidates = matched()
+        Log.i(
+            TAG,
+            "manage: approveFriendRequest legacy scan uid=$targetUid uin=$targetUin " +
+                "candidates=${candidates.size}",
+        )
+        var chosen = selectStructMsgCandidate(candidates)
+        if (chosen == null) {
+            if (candidates.isNotEmpty() && candidates.all { it.decided }) {
+                Log.w(
+                    TAG,
+                    "manage: approveFriendRequest attempt=legacy already decided " +
+                        "(all candidates subType>=2) uid=$targetUid uin=$targetUin " +
+                        "candidates=${candidates.size}",
+                )
+            }
+            forceRefreshNewFriendMessages()
+            // 不再固定 sleep 1.8s：短轮询等刷新结果（最多 700ms），通常 120~240ms 内即可命中。
+            val rescanStarted = perfUptime()
+            while (perfUptime() - rescanStarted < 700L) {
+                candidates = matched()
+                chosen = selectStructMsgCandidate(candidates)
+                if (chosen != null) break
+                Thread.sleep(120L)
+            }
+            if (chosen == null) {
+                candidates = matched()
+                chosen = selectStructMsgCandidate(candidates)
+            }
+            Log.i(
+                TAG,
+                "manage: approveFriendRequest legacy rescan uid=$targetUid uin=$targetUin " +
+                    "candidates=${candidates.size} waitMs=${perfUptime() - rescanStarted}",
+            )
+        }
+        if (chosen == null) {
+            candidates.forEachIndexed { index, candidate ->
+                Log.w(TAG, "manage: approveFriendRequest legacy ${candidate.describe(index)}")
+            }
+            if (candidates.isNotEmpty() && candidates.all { it.decided }) {
+                Log.w(
+                    TAG,
+                    "manage: approveFriendRequest attempt=legacy already decided uid=$targetUid " +
+                        "uin=$targetUin candidates=${candidates.size}",
+                )
+            } else {
+                Log.w(
+                    TAG,
+                    "manage: approveFriendRequest attempt=legacy no actionable structmsg " +
+                        "uid=$targetUid uin=$targetUin candidates=${candidates.size}",
+                )
+            }
+            return null
+        }
+        if (chosen.decided) {
+            Log.w(
+                TAG,
+                "manage: approveFriendRequest attempt=legacy already decided " +
+                    "msgSeq=${chosen.msgSeq} subType=${chosen.subType} actions=${chosen.actionCount} " +
+                    "uid=$targetUid uin=$targetUin",
+            )
+            return null
+        }
+        Log.i(
+            TAG,
+            "manage: approveFriendRequest attempt=legacy chosen msgSeq=${chosen.msgSeq} " +
+                "msgType=${chosen.msgType} subType=${chosen.subType} actions=${chosen.actionCount} " +
+                "time=${chosen.msgTime} uid=$targetUid uin=$targetUin",
+        )
+        return chosen.raw
+    }
+
+    /**
+     * 构造 structmsg$ReqSystemMsgAction bytes（TIM 官方逻辑）：
+     * accept → actions[0].action_info，reject → actions[1].action_info；action_info 原样保留（含 type），
+     * 只清 remark=""、group_id=0、addFrdSNInfo{0,0}。
+     */
+    private fun buildFriendSystemMsgAction(structMsg: Any, accept: Boolean): ByteArray? {
+        val req = newPb("tencent.mobileim.structmsg.structmsg\$ReqSystemMsgAction") ?: run {
+            Log.w(TAG, "manage: approveFriendRequest legacy ReqSystemMsgAction class missing")
+            return null
+        }
+        val msgNested = pbMessage(structMsg, "msg") ?: run {
+            Log.w(TAG, "manage: approveFriendRequest legacy StructMsg.msg missing")
+            return null
+        }
+        pbSet(req, "msg_type", pbInt(structMsg, "msg_type"))
+        pbSet(req, "msg_seq", pbLong(structMsg, "msg_seq"))
+        pbSet(req, "req_uin", pbLong(structMsg, "req_uin"))
+        pbSet(req, "sub_type", pbInt(msgNested, "sub_type"))
+        pbSet(req, "src_id", pbInt(msgNested, "src_id"))
+        pbSet(req, "sub_src_id", pbInt(msgNested, "sub_src_id"))
+        pbSet(req, "group_msg_type", pbInt(msgNested, "group_msg_type"))
+        val actions = pbRepeatMessages(msgNested, "actions")
+        // TIM 官方逻辑：同意=actions[0].action_info，拒绝=actions[1].action_info（按索引，不按 type 匹配/覆盖）。
+        actions.forEachIndexed { index, action ->
+            val info = pbMessage(action, "action_info")
+            Log.i(
+                TAG,
+                "manage: approveFriendRequest legacy action[$index] " +
+                    "type=${info?.let { runCatching { pbInt(it, "type") }.getOrDefault(-1) } ?: -1} " +
+                    "name=${runCatching { pbString(action, "name") }.getOrDefault("")} " +
+                    "result=${runCatching { pbString(action, "result") }.getOrDefault("")} " +
+                    "detail=${runCatching { pbString(action, "detail_name") }.getOrDefault("")} " +
+                    "action=${runCatching { pbInt(action, "action") }.getOrDefault(-1)}",
+            )
+        }
+        val actionIndex = if (accept) 0 else 1
+        val action = actions.getOrNull(actionIndex)
+        val actionInfo = action?.let { pbMessage(it, "action_info") }
+        if (action == null || actionInfo == null) {
+            Log.w(
+                TAG,
+                "manage: approveFriendRequest legacy actions[$actionIndex] missing " +
+                    "(accept=$accept actions=${actions.size})",
+            )
+            return null
+        }
+        // 只清 remark/group_id/addFrdSNInfo，**不覆盖 action_info.type**（type 由服务端 actions 决定）。
+        val infoClass = "tencent.mobileim.structmsg.structmsg\$SystemMsgActionInfo"
+        val infoBytes = pbBytesOf(actionInfo)
+        val newInfo = if (infoBytes != null && infoBytes.isNotEmpty()) {
+            pbParse(infoClass, infoBytes)
+        } else {
+            runCatching { newPb(infoClass) }.getOrNull()
+        } ?: run {
+            Log.w(TAG, "manage: approveFriendRequest legacy action_info build failed")
+            return null
+        }
+        val keptType = runCatching { pbInt(newInfo, "type") }.getOrDefault(-1)
+        pbSet(newInfo, "remark", "")
+        pbSet(newInfo, "group_id", 0)
+        runCatching {
+            val sn = newPb("tencent.mobileim.structmsg.structmsg\$AddFrdSNInfo")
+            if (sn != null) {
+                pbSet(sn, "uint32_not_see_dynamic", 0)
+                pbSet(sn, "uint32_set_sn", 0)
+                pbSet(newInfo, "addFrdSNInfo", sn)
+            }
+        }
+        pbSet(req, "action_info", newInfo)
+        Log.i(
+            TAG,
+            "manage: approveFriendRequest legacy build accept=$accept actionIndex=$actionIndex " +
+                "actionInfoType=$keptType (不覆盖) actions=${actions.size} " +
+                "reqBytes=${pbBytesOf(req)?.size ?: -1}",
+        )
+        return pbBytesOf(req)
+    }
+
+    /** 发送原始 SSO proto 请求（非 OIDB 包装），阻塞等响应 wupBuffer。 */
+    private fun sendRawProtoRequest(cmd: String, body: ByteArray, timeoutMs: Long = 8_000L): ByteArray? {
+        if (!isHost) return null
+        val manager = groupFileProtoReqManager() ?: run {
+            Log.w(TAG, "manage: raw proto IProtoReqManager unavailable cmd=$cmd")
+            return null
+        }
+        val cl = hostClassLoader() ?: return null
+        val reqClass = runCatching {
+            Class.forName(
+                "com.tencent.mobileqq.transfile.api.impl.ProtoReqManagerImpl\$ProtoReq", true, cl,
+            )
+        }.getOrNull() ?: return null
+        val callbackClass = runCatching {
+            Class.forName(
+                "com.tencent.mobileqq.transfile.api.impl.ProtoReqManagerImpl\$IProtoRespBack", true, cl,
+            )
+        }.getOrNull() ?: return null
+        val req = runCatching { reqClass.getConstructor().newInstance() }.getOrNull() ?: return null
+        val latch = CountDownLatch(1)
+        val holder = arrayOfNulls<ByteArray>(1)
+        var resultCode = -1
+        val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, method, methodArgs ->
+            if (method.name == "onProtoResp") {
+                runCatching {
+                    val protoResp = methodArgs?.getOrNull(0)
+                    val fromServiceMsg = protoResp?.javaClass?.getField("resp")?.get(protoResp)
+                    resultCode = (fromServiceMsg?.javaClass?.getMethod("getResultCode")
+                        ?.invoke(fromServiceMsg) as? Number)?.toInt() ?: -1
+                    holder[0] = fromServiceMsg?.javaClass
+                        ?.getMethod("getWupBuffer")
+                        ?.invoke(fromServiceMsg) as? ByteArray
+                }.onFailure {
+                    Log.w(TAG, "manage: raw proto parse resp failed: ${it.javaClass.simpleName} ${it.message}")
+                }
+                latch.countDown()
+            }
+            null
+        }
+        runCatching {
+            reqClass.getField("ssoCmd").set(req, cmd)
+            reqClass.getField("reqBody").set(req, body)
+            reqClass.getField("callback").set(req, callback)
+        }.onFailure {
+            Log.w(TAG, "manage: raw proto fill req failed: ${it.javaClass.simpleName} ${it.message}")
+            return null
+        }
+        val sendMethod = manager.javaClass.methods.firstOrNull {
+            it.name == "sendProtoReq" && it.parameterCount == 1
+        } ?: return null
+        runCatching { sendMethod.invoke(manager, req) }.onFailure { t ->
+            val cause = (t as? java.lang.reflect.InvocationTargetException)?.targetException ?: t
+            Log.w(TAG, "manage: raw proto send failed cmd=$cmd: ${cause.javaClass.simpleName} ${cause.message}")
+            return null
+        }
+        val finished = latch.await(timeoutMs, TimeUnit.MILLISECONDS)
+        val raw = holder[0]
+        Log.i(
+            TAG,
+            "manage: raw proto rsp cmd=$cmd resultCode=$resultCode timeout=${!finished} " +
+                "bytes=${raw?.size ?: -1} hex=${raw?.let { hexLowerPrefix(it, 96) }.orEmpty()}",
+        )
+        return raw?.takeIf { it.isNotEmpty() }
+    }
+
+    /** 重新触发 getBuddyReq 并最多等 [timeoutMs] 让 onBuddyReqChange 更新缓存（成功校验用）。 */
+    private fun refreshBuddyReqsBlocking(timeoutMs: Long = 3_000L): Boolean {
+        if (!ensureBuddyReqListener()) return false
+        val service = waitForService(timeoutMs = 1_500L) {
+            nativeBuddyService() ?: buddyService
+        } ?: return false
+        val target = resolveKernelMethod(service, "getBuddyReq", 1) ?: return false
+        val cl = hostClassLoader() ?: return false
+        val callbackClass = Class.forName(
+            "com.tencent.qqnt.kernel.nativeinterface.IOperateCallback", false, cl,
+        )
+        val latch = CountDownLatch(1)
+        buddyReqLatch = latch
+        val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, method, _ ->
+            defaultValueFor(method.returnType)
+        }
+        runCatching { target.second.invoke(target.first, callback) }
+        val got = latch.await(timeoutMs, TimeUnit.MILLISECONDS)
+        buddyReqLatch = null
+        Log.i(TAG, "manage: approveFriendRequest verifyRefresh got=$got cached=${cachedBuddyReqs.size}")
+        return got
+    }
+
+    private fun buddyReqDecidedState(friendUid: String): Pair<Boolean, Boolean>? {
+        val req = cachedBuddyReqs.firstOrNull { req ->
+            req != null && (invokeGetter(req, "getFriendUid") as? String) == friendUid
+        } ?: return null
+        val decided = (invokeGetter(req, "getIsDecide") as? Boolean) == true
+        val agreed = (invokeGetter(req, "getIsAgreed") as? Boolean) == true
+        return decided to agreed
+    }
+
+    /**
+     * 旧版接受/拒绝通道（TIM「新的朋友」实际链路）：
+     * ProfileService.Pb.ReqSystemMsgAction.Friend + structmsg$ReqSystemMsgAction。
+     */
+    private fun approveFriendRequestLegacy(
+        friendUid: String,
+        targetUin: Long,
+        accept: Boolean,
+    ): Boolean {
+        val structMsg = newFriendStructMsgFor(targetUin, friendUid) ?: return false
+        val body = buildFriendSystemMsgAction(structMsg, accept) ?: return false
+        val raw = sendRawProtoRequest(
+            "ProfileService.Pb.ReqSystemMsgAction.Friend",
+            body,
+            8_000L,
+        ) ?: run {
+            Log.w(TAG, "manage: approveFriendRequest attempt=legacy no response uid=$friendUid")
+            return false
+        }
+        val rsp = pbParse("tencent.mobileim.structmsg.structmsg\$RspSystemMsgAction", raw)
+        if (rsp == null) {
+            Log.w(TAG, "manage: approveFriendRequest attempt=legacy parse rsp failed uid=$friendUid")
+            return false
+        }
+        val head = pbMessage(rsp, "head")
+        val result = head?.let { runCatching { pbInt(it, "result") }.getOrDefault(-1) } ?: -1
+        val failMsg = head?.let { runCatching { pbString(it, "msg_fail") }.getOrDefault("") }.orEmpty()
+        val detail = runCatching { pbString(rsp, "msg_detail") }.getOrDefault("")
+        // 双校验：head.result==0 且 msg_detail 方向正确（接受含「同意」/拒绝含「拒绝」）。
+        val expectedKeyword = if (accept) "同意" else "拒绝"
+        val detailOk = when {
+            detail.isBlank() -> null
+            detail.contains(expectedKeyword) -> true
+            else -> false
+        }
+        val ok = result == 0 && detailOk != false
+        Log.i(
+            TAG,
+            "manage: approveFriendRequest attempt=legacy uid=$friendUid uin=$targetUin " +
+                "accept=$accept result=$result detail=${detail.take(60)} " +
+                "detailOk=$detailOk expected=$expectedKeyword msgFail=${failMsg.take(60)} ok=$ok",
+        )
+        if (!ok) {
+            if (result == 0 && detailOk == false) {
+                Log.w(
+                    TAG,
+                    "manage: approveFriendRequest attempt=legacy detail mismatch: " +
+                        "accept=$accept 但服务端返回 detail=$detail，按失败处理",
+                )
+            }
+            return false
+        }
+        // 成功后重新拉 getBuddyReq，最多 3s 校验 isDecide/isAgreed 变化
+        val before = buddyReqDecidedState(friendUid)
+        val refreshed = refreshBuddyReqsBlocking(3_000L)
+        val after = buddyReqDecidedState(friendUid)
+        val verifyOk = after != null && after.first && (after.second == accept)
+        Log.i(
+            TAG,
+            "manage: approveFriendRequest attempt=legacy verify uid=$friendUid refreshed=$refreshed " +
+                "before=$before after=$after verifyOk=$verifyOk",
+        )
+        if (!verifyOk && before == null) {
+            Log.w(
+                TAG,
+                "manage: approveFriendRequest attempt=legacy verify skipped " +
+                    "(该 uin 未出现在 BuddyReq 缓存，以服务端 result=0 为准)",
+            )
+        }
+        return true
+    }
+
+    /** 内核保底通道：IKernelBuddyService.approvalFriendRequest(ApprovalBuddyRequest, cb)。 */
+    private fun approveFriendRequestKernel(friendUid: String, accept: Boolean): Int = try {
+        val service = waitForService(timeoutMs = 1_200L) { buddyService } ?: return -1
+        val cl = hostClassLoader() ?: return -1
+        val reqClass = Class.forName(
+            "com.tencent.qqnt.kernel.nativeinterface.ApprovalBuddyRequest", false, cl,
+        )
+        val reqTime = buddyReqTimeByUid[friendUid] ?: 0L
+        val request = reqClass.getConstructor(
+            String::class.java,
+            Boolean::class.javaPrimitiveType,
+            String::class.java,
+            Long::class.javaPrimitiveType,
+        ).newInstance(friendUid, accept, "", reqTime)
+        invokeOperateApi(
+            "manage: approveFriendRequest attempt=kernel($friendUid accept=$accept reqTime=$reqTime)",
+            service,
+            "approvalFriendRequest",
+            listOf(request),
+        )
+    } catch (t: Throwable) {
+        Log.w(
+            TAG,
+            "manage: approveFriendRequest attempt=kernel failed: ${t.javaClass.simpleName} ${t.message}",
+        )
+        -1
+    }
+
+    /** 同意/拒绝好友申请：优先 TIM 旧版 structmsg 通道（kernel 被产品禁用），最后 kernel 保底。 */
+    fun approveFriendRequest(uid: String, uin: String, accept: Boolean): Boolean {
+        if (!isHost) return false
+        if (!ensureServices()) return false
+        return try {
+            val friendUid = uid.trim().ifBlank {
+                val uinLong = uin.trim().toLongOrNull() ?: 0L
+                resolveUidByUin(uinLong).orEmpty()
+            }
+            if (friendUid.isBlank()) {
+                Log.w(TAG, "manage: approveFriendRequest failed (uid/uin unavailable) uin=$uin")
+                return false
+            }
+            // 只允许处理「收到」的申请；发出的申请（isInitiator=true）没有同意/拒绝语义。
+            val cachedReq = cachedBuddyReqs.firstOrNull { req ->
+                req != null && (invokeGetter(req, "getFriendUid") as? String) == friendUid
+            }
+            val isOutgoing = cachedReq != null &&
+                (invokeGetter(cachedReq, "getIsInitiator") as? Boolean) == true
+            if (isOutgoing) {
+                Log.w(TAG, "manage: approveFriendRequest skipped uid=$friendUid (outgoing request)")
+                return false
+            }
+            val targetUin = uin.trim().toLongOrNull()?.takeIf { it != 0L }
+                ?: buddyReqUinOf(friendUid)
+            // 0) TIM「过滤通知」（风控申请）优先：agreeSuspiciousMsg / deleteSuspiciousMsg
+            val isFiltered = runCatching {
+                filteredFriendRequests().any { it.uin.isNotBlank() && it.uin == targetUin.toString() }
+            }.getOrElse { t ->
+                Log.w(
+                    TAG,
+                    "manage: approveFriendRequest filtered check failed: " +
+                        "${t.javaClass.simpleName} ${t.message}",
+                )
+                false
+            }
+            if (isFiltered && approveSuspiciousFriendRequest(targetUin, accept)) {
+                refreshContactsAndChatsSoon()
+                Log.i(
+                    TAG,
+                    "manage: approveFriendRequest uid=$friendUid uin=$targetUin accept=$accept " +
+                        "attempt=suspicious ok=true",
+                )
+                return true
+            }
+            // 1) TIM 旧版 structmsg 通道
+            if (approveFriendRequestLegacy(friendUid, targetUin, accept)) {
+                cachedBuddyReqs = cachedBuddyReqs.filterNot { req ->
+                    req == null || (invokeGetter(req, "getFriendUid") as? String) == friendUid
+                }
+                refreshContactsAndChatsSoon()
+                Log.i(
+                    TAG,
+                    "manage: approveFriendRequest uid=$friendUid uin=$targetUin accept=$accept " +
+                        "attempt=legacy ok=true",
+                )
+                return true
+            }
+            // 2) kernel 保底（很可能 -10122）
+            val code = approveFriendRequestKernel(friendUid, accept)
+            val ok = code == 0
+            if (ok) {
+                cachedBuddyReqs = cachedBuddyReqs.filterNot { req ->
+                    req == null || (invokeGetter(req, "getFriendUid") as? String) == friendUid
+                }
+                refreshContactsAndChatsSoon()
+            }
+            Log.i(
+                TAG,
+                "manage: approveFriendRequest uid=$friendUid uin=$targetUin accept=$accept " +
+                    "attempt=kernel ok=$ok code=$code",
+            )
+            ok
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "manage: approveFriendRequest failed uid=$uid accept=$accept: " +
+                    "${t.javaClass.simpleName} ${t.message}",
+            )
+            false
+        }
+    }
+
+    /** 内核查询某 uid 的备注（native buddyService.getBuddyRemark(ArrayList)）。 */
+    private fun kernelBuddyRemark(uid: String): String? = runCatching {
+        val service = nativeBuddyService() ?: return@runCatching null
+        val method = service.javaClass.methods.firstOrNull {
+            it.name == "getBuddyRemark" && it.parameterCount == 1
+        } ?: return@runCatching null
+        @Suppress("UNCHECKED_CAST")
+        val map = method.invoke(service, ArrayList<String>().apply { add(uid) }) as? Map<*, *>
+            ?: return@runCatching null
+        map[uid] as? String
+    }.getOrNull()
+
+    /** 轮询内核备注直到与期望一致（兼容清空备注：期望空时 map 无该 key 也算成功）。 */
+    private fun verifyFriendRemark(uid: String, expected: String, timeoutMs: Long): Boolean {
+        val deadline = perfUptime() + timeoutMs
+        while (perfUptime() < deadline) {
+            val current = kernelBuddyRemark(uid)
+            if (expected.isEmpty()) {
+                if (current.isNullOrEmpty()) return true
+            } else if (current == expected) {
+                return true
+            }
+            Thread.sleep(150L)
+        }
+        return false
+    }
+
+    /**
+     * 好友备注（TIM 4.1 实际链路，见 EditFriendRemarkService）：
+     * - 好友：`FriendListHandler.setFriendComment(uin, remark, false)`（旧 servlet CMD_SETCOMMENT，异步，轮询备注校验）；
+     * - 非好友/旧通道失败：wrapper `IKernelBuddyService.setBuddyRemark(RemarkParams(uid, remark, null), cb)`；
+     * 日志 manage: setFriendRemark attempt=... code=..
+     */
+    fun setFriendRemark(uid: String, remark: String): Boolean {
+        if (!isHost) return false
+        if (!ensureServices()) return false
+        val targetUid = uid.trim()
+        if (targetUid.isBlank()) return false
+        val uin = runCatching { uinForUid(targetUid) }.getOrDefault(0L)
+        val isFriend = runCatching {
+            loadedContacts.any { it.id == "tim_friend_$targetUid" } ||
+                (nativeBuddyService()?.javaClass?.getMethod("isBuddy", String::class.java)
+                    ?.invoke(nativeBuddyService(), targetUid) as? Boolean == true)
+        }.getOrDefault(false)
+        // 1) 好友：走 TIM UI 同款旧 servlet（FriendListHandler.setFriendComment）
+        if (isFriend && uin != 0L) {
+            val handler = runCatching {
+                appRuntime()?.javaClass
+                    ?.getMethod("getBusinessHandler", String::class.java)
+                    ?.invoke(appRuntime(), "com.tencent.mobileqq.app.FriendListHandler")
+            }.getOrNull()
+            val method = handler?.javaClass?.methods?.firstOrNull {
+                it.name == "setFriendComment" && it.parameterCount == 3
+            }
+            if (handler != null && method != null) {
+                val invoked = runCatching {
+                    method.invoke(handler, uin.toString(), remark, false)
+                    true
+                }.getOrElse { t ->
+                    Log.w(
+                        TAG,
+                        "manage: setFriendRemark attempt=legacyServlet invoke failed: " +
+                            "${t.javaClass.simpleName} ${t.message}",
+                    )
+                    false
+                }
+                if (invoked && verifyFriendRemark(targetUid, remark, 4_000L)) {
+                    Log.i(
+                        TAG,
+                        "manage: setFriendRemark attempt=legacyServlet uid=$targetUid uin=$uin " +
+                            "len=${remark.length} ok=true",
+                    )
+                    refreshContactsAndChatsSoon()
+                    return true
+                }
+                Log.i(
+                    TAG,
+                    "manage: setFriendRemark attempt=legacyServlet uid=$targetUid uin=$uin " +
+                        "invoked=$invoked verify=false",
+                )
+            } else {
+                Log.w(TAG, "manage: setFriendRemark attempt=legacyServlet unavailable (handler/method)")
+            }
+        }
+        // 2) 内核 wrapper setBuddyRemark（TIM 非好友分支）
+        return try {
+            val service = waitForService(timeoutMs = 1_200L) { buddyService } ?: return false
+            val cl = hostClassLoader() ?: return false
+            val paramsClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.RemarkParams", false, cl,
+            )
+            val signClass = runCatching {
+                Class.forName("com.tencent.qqnt.kernel.nativeinterface.RemarkSignExtInfo", false, cl)
+            }.getOrNull()
+            val params = paramsClass.getConstructor(
+                String::class.java, String::class.java, signClass ?: Any::class.java,
+            ).newInstance(targetUid, remark, null)
+            val code = invokeOperateApi(
+                "manage: setFriendRemark attempt=kernel(uid,remark) uid=$targetUid",
+                service,
+                "setBuddyRemark",
+                listOf(params),
+            )
+            val ok = code == 0
+            if (ok) refreshContactsAndChatsSoon()
+            Log.i(
+                TAG,
+                "manage: setFriendRemark attempt=kernel uid=$targetUid len=${remark.length} " +
+                    "ok=$ok code=$code isFriend=$isFriend",
+            )
+            ok
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "manage: setFriendRemark failed uid=$targetUid: ${t.javaClass.simpleName} ${t.message}",
+            )
+            false
+        }
+    }
+
+    /** 宿主 CL 的 kotlin.Unit 实例（供 Function1 proxy 返回）。 */
+    private fun hostKotlinUnit(): Any? = runCatching {
+        val cl = hostClassLoader() ?: return@runCatching null
+        Class.forName("kotlin.Unit", false, cl).getField("INSTANCE").get(null)
+    }.getOrNull()
+
+    /** 构造宿主 CL 的 kotlin.jvm.functions.Function1<T, Unit> proxy（用于调用 TIM Kotlin 仓库 API）。 */
+    private fun newHostFunction1(onInvoke: (Any?) -> Unit): Any? {
+        val cl = hostClassLoader() ?: return null
+        val iface = runCatching {
+            Class.forName("kotlin.jvm.functions.Function1", false, cl)
+        }.getOrNull() ?: return null
+        val unit = hostKotlinUnit()
+        return java.lang.reflect.Proxy.newProxyInstance(cl, arrayOf(iface)) { _, method, args ->
+            if (method.name == "invoke") {
+                runCatching { onInvoke(args?.getOrNull(0)) }
+                unit
+            } else {
+                defaultValueFor(method.returnType)
+            }
+        }
+    }
+
+    private fun troopOperationRepo(): Any? =
+        groupManageQRouteApi("com.tencent.qqnt.troop.ITroopOperationRepoApi")
+            ?: runCatching {
+                val cl = hostClassLoader() ?: return@runCatching null
+                Class.forName("com.tencent.qqnt.troop.TroopOperationRepo", true, cl)
+                    .getField("INSTANCE").get(null)
+            }.getOrNull()
+
+    /**
+     * 群简介：走 TIM 自己的仓库 API（和退群/解散同思路），优先
+     * `ITroopOperationRepoApi.modifyGroupDetailInfoV2(filter, modifyInfo, owner=null, groupCode, e, Lazy=null, modifyType)`
+     * （filter.fingerMemo=1 + modifyInfo.fingerMemo=描述）；失败再试非 V2 的 `modifyGroupDetailInfo`
+     * （config 里直接改 GroupModifyInfoReq）。modifyType 取值反编译未标注，按 0/8/1/2/4 依次尝试。
+     */
+    private fun setGroupDescriptionViaTroopRepo(groupCode: Long, description: String): Boolean {
+        val api = troopOperationRepo() ?: return false
+        val cl = hostClassLoader() ?: return false
+        val eClass = runCatching { Class.forName("com.tencent.qqnt.troop.e", false, cl) }.getOrNull()
+        // ---- 1) modifyGroupDetailInfoV2(Function1<Filter>, Function1<ModifyInfo>, owner, group, e, Lazy, int) ----
+        val v2Method = api.javaClass.methods.firstOrNull {
+            it.name == "modifyGroupDetailInfoV2" && it.parameterCount == 7
+        }
+        if (v2Method != null && eClass != null) {
+            for (modifyType in listOf(0, 8, 1, 2, 4)) {
+                val filterFn = newHostFunction1 { target ->
+                    runCatching {
+                        if (target != null) {
+                            target.javaClass.getField("fingerMemo").setInt(target, 1)
+                        }
+                    }
+                } ?: continue
+                val modifyFn = newHostFunction1 { target ->
+                    runCatching {
+                        if (target != null) {
+                            target.javaClass.getField("fingerMemo").set(target, description)
+                        }
+                    }
+                } ?: continue
+                val latch = CountDownLatch(1)
+                var resultOk = false
+                var code = -1
+                var msg = ""
+                val callback = java.lang.reflect.Proxy.newProxyInstance(cl, arrayOf(eClass)) { _, m, args ->
+                    if (m.name == "onResult") {
+                        resultOk = (args?.getOrNull(0) as? Boolean) == true
+                        code = (args?.getOrNull(1) as? Number)?.toInt() ?: -1
+                        msg = args?.getOrNull(2) as? String ?: ""
+                        latch.countDown()
+                    }
+                    defaultValueFor(m.returnType)
+                }
+                val invoked = runCatching {
+                    v2Method.invoke(
+                        api, filterFn, modifyFn, null, groupCode.toString(),
+                        callback, null, modifyType,
+                    )
+                    true
+                }.getOrElse { t ->
+                    Log.w(
+                        TAG,
+                        "manage: groupDesc attempt=repoV2 invoke failed modifyType=$modifyType: " +
+                            "${t.javaClass.simpleName} ${t.message}",
+                    )
+                    false
+                }
+                val got = latch.await(6, TimeUnit.SECONDS)
+                val ok = resultOk || code == 0
+                Log.i(
+                    TAG,
+                    "manage: groupDesc attempt=repoV2 modifyType=$modifyType invoked=$invoked " +
+                        "gotCallback=$got code=$code msg=${msg.take(80)} ok=$ok",
+                )
+                if (ok) return true
+            }
+        } else {
+            Log.w(TAG, "manage: groupDesc attempt=repoV2 unavailable (method/callback class)")
+        }
+        // ---- 2) 非 V2：modifyGroupDetailInfo(troopUin, owner, from, modifyType, e, config, g) ----
+        val v1Method = api.javaClass.methods.firstOrNull {
+            it.name == "modifyGroupDetailInfo" && it.parameterCount == 7
+        }
+        if (v1Method != null && eClass != null) {
+            val configFn = newHostFunction1 { req ->
+                runCatching {
+                    req ?: return@runCatching
+                    val filter = req.javaClass.getField("filter").get(req)
+                    filter?.javaClass?.getField("fingerMemo")?.setInt(filter, 1)
+                    val info = req.javaClass.getField("modifyInfo").get(req)
+                    info?.javaClass?.getField("fingerMemo")?.set(info, description)
+                }
+            }
+            val gClass = runCatching {
+                Class.forName("com.tencent.qqnt.troop.g", false, cl)
+            }.getOrNull()
+            val innerLatch = CountDownLatch(1)
+            var innerCode = -1
+            val innerG = gClass?.let { iface ->
+                java.lang.reflect.Proxy.newProxyInstance(cl, arrayOf(iface)) { _, m, args ->
+                    if (m.name == "onResult") {
+                        innerCode = (args?.getOrNull(0) as? Number)?.toInt() ?: -1
+                        innerLatch.countDown()
+                    }
+                    defaultValueFor(m.returnType)
+                }
+            }
+            val eLatch = CountDownLatch(1)
+            var eOk = false
+            var eCode = -1
+            val eCallback = java.lang.reflect.Proxy.newProxyInstance(cl, arrayOf(eClass)) { _, m, args ->
+                if (m.name == "onResult") {
+                    eOk = (args?.getOrNull(0) as? Boolean) == true
+                    eCode = (args?.getOrNull(1) as? Number)?.toInt() ?: -1
+                    eLatch.countDown()
+                }
+                defaultValueFor(m.returnType)
+            }
+            if (configFn != null) {
+                val invoked = runCatching {
+                    v1Method.invoke(
+                        api, groupCode.toString(), null, "m3tim", 0,
+                        eCallback, configFn, innerG,
+                    )
+                    true
+                }.getOrElse { t ->
+                    Log.w(
+                        TAG,
+                        "manage: groupDesc attempt=repoV1(nonV2) invoke failed: " +
+                            "${t.javaClass.simpleName} ${t.message}",
+                    )
+                    false
+                }
+                val got = eLatch.await(6, TimeUnit.SECONDS)
+                innerLatch.await(1, TimeUnit.SECONDS)
+                val ok = eOk || eCode == 0 || innerCode == 0
+                Log.i(
+                    TAG,
+                    "manage: groupDesc attempt=repoV1(nonV2) invoked=$invoked gotCallback=$got " +
+                        "eCode=$eCode innerCode=$innerCode ok=$ok",
+                )
+                if (ok) return true
+            }
+        } else {
+            Log.w(TAG, "manage: groupDesc attempt=repoV1(nonV2) unavailable")
+        }
+        return false
+    }
+
+    // ---- 群简介：TIM 原生链路 modifyTroopData（群简介=troopCard.richIntroduction，即 mRichFingerMemo） ----
+
+    private fun troopInfoService(): Any? = runCatching {
+        val cl = hostClassLoader() ?: return@runCatching null
+        val runtime = appRuntime ?: appRuntime() ?: return@runCatching null
+        val svcClass = Class.forName("com.tencent.mobileqq.troop.api.ITroopInfoService", false, cl)
+        runtime.javaClass
+            .getMethod("getRuntimeService", Class::class.java, String::class.java)
+            .invoke(runtime, svcClass, "")
+    }.getOrNull()
+
+    /** ITroopInfoService.getTroopInfo(groupUin) → com.tencent.mobileqq.data.troop.TroopInfo（本地 DB 资料）。 */
+    private fun troopInfoFor(groupCode: Long): Any? = runCatching {
+        val service = troopInfoService() ?: return@runCatching null
+        service.javaClass.getMethod("getTroopInfo", String::class.java)
+            .invoke(service, groupCode.toString())
+    }.getOrNull()
+
+    private fun troopInfoString(info: Any?, field: String): String = runCatching {
+        info?.javaClass?.getField(field)?.get(info) as? String
+    }.getOrNull().orEmpty()
+
+    private fun troopInfoLong(info: Any?, field: String): Long = runCatching {
+        (info?.javaClass?.getField(field)?.get(info) as? Number)?.toLong()
+    }.getOrNull() ?: 0L
+
+    private fun troopInfoInt(info: Any?, field: String): Int = runCatching {
+        (info?.javaClass?.getField(field)?.get(info) as? Number)?.toInt()
+    }.getOrNull() ?: 0
+
+    /**
+     * 构造 `com.tencent.mobileqq.data.troop.b` troopCard（与 TroopInfoActivity.N3 一致，15 参）：
+     * 除 richIntroduction=新简介外，其它字段全部取 TIM 本地真实资料，避免覆盖群名/分类/位置/学校。
+     */
+    private fun buildTroopCard(groupCode: Long, info: Any, description: String): Any? {
+        val cl = hostClassLoader() ?: return null
+        val cardClass = runCatching {
+            Class.forName("com.tencent.mobileqq.data.troop.b", false, cl)
+        }.getOrNull() ?: run {
+            Log.w(TAG, "manage: groupDesc troopCard class missing")
+            return null
+        }
+        val typeExt = troopInfoInt(info, "troopTypeExt")
+        // TIM: i3 = troopTypeExt == 2 ? 3 : troopTypeExt；-1 表示无需修改，这里退化为 0。
+        val groupType = if (typeExt == 2) 3 else typeExt
+        if (groupType == -1) {
+            Log.w(TAG, "manage: groupDesc troopCard troopTypeExt=-1, fallback groupType=0")
+        }
+        val tags = runCatching {
+            val tagsRaw = troopInfoString(info, "mTags")
+            val troopInfoClass = Class.forName("com.tencent.mobileqq.data.troop.TroopInfo", false, cl)
+            @Suppress("UNCHECKED_CAST")
+            troopInfoClass.getMethod("getTags", String::class.java).invoke(null, tagsRaw) as? List<String>
+        }.getOrNull() ?: emptyList()
+        val values = listOf(
+            groupCode.toString(),
+            if (groupType == -1) 0 else groupType,
+            troopInfoString(info, "troopname"),
+            troopInfoLong(info, "dwGroupClassExt"),
+            troopInfoString(info, "mGroupClassExtText"),
+            tags,
+            troopInfoInt(info, "cityId"),
+            troopInfoLong(info, "troopLat"),
+            troopInfoLong(info, "troopLon"),
+            0L, // TroopInfo 无 poiId 字段（TIM DB 未持久化），传 0 不修改
+            troopInfoString(info, "strLocation"), // geoContent ↔ TroopInfoData.troopLocation
+            description,                          // richIntroduction = 群简介（richFingerMemo）
+            troopInfoString(info, "location"),    // schoolLocation ↔ TroopInfoData.location
+            troopInfoInt(info, "grade"),
+            troopInfoString(info, "school"),
+        )
+        return runCatching {
+            val ctor = cardClass.getConstructor(
+                String::class.java,
+                Int::class.javaPrimitiveType,
+                String::class.java,
+                Long::class.javaPrimitiveType,
+                String::class.java,
+                java.util.List::class.java,
+                Int::class.javaPrimitiveType,
+                Long::class.javaPrimitiveType,
+                Long::class.javaPrimitiveType,
+                Long::class.javaPrimitiveType,
+                String::class.java,
+                String::class.java,
+                String::class.java,
+                Int::class.javaPrimitiveType,
+                String::class.java,
+            )
+            ctor.newInstance(*values.toTypedArray())
+        }.onFailure {
+            Log.w(TAG, "manage: groupDesc troopCard new failed: ${it.javaClass.simpleName} ${it.message}")
+        }.getOrNull().also { card ->
+            Log.i(
+                TAG,
+                "manage: groupDesc troopCard group=$groupCode type=$groupType name=${values[2]} " +
+                    "classExt=${values[3]} classText=${values[4]} tags=${tags.size} " +
+                    "geo=${(values[10] as String).take(40)} rich=${description.take(40)} " +
+                    "schoolLocation=${(values[12] as String).take(40)} grade=${values[13]} " +
+                    "school=${(values[14] as String).take(40)} built=${card != null}",
+            )
+        }
+    }
+
+    /** 读回校验群简介（清 chatInfoCache/groupDetailCache，最多 [timeoutMs] 轮询 chatInfo/TroopInfo/kernel detail）。 */
+    private fun verifyGroupDescription(
+        chatId: String,
+        groupCode: Long,
+        expected: String,
+        timeoutMs: Long = 2_000L,
+    ): Boolean {
+        val expectedTrim = expected.trim()
+        val cl = hostClassLoader()
+        val deadline = perfUptime() + timeoutMs
+        var last = ""
+        while (perfUptime() < deadline) {
+            invalidateChatInfoCache(chatId)
+            groupDetailCache.remove(groupCode)
+            val fromTroopInfo = runCatching {
+                troopInfoFor(groupCode)?.let {
+                    it.javaClass.getField("mRichFingerMemo").get(it) as? String
+                }
+            }.getOrNull().orEmpty()
+            val fromDetail = runCatching {
+                val service = kernelService?.let { invokeGetter(it, "getGroupService") } ?: return@runCatching ""
+                val detail = cl?.let { batchGroupDetail(it, service, groupCode) } ?: return@runCatching ""
+                listOf("getFingerMemo", "getRichFingerMemo")
+                    .mapNotNull { invokeGetter(detail, it) as? String }
+                    .firstOrNull { it.isNotBlank() }
+                    .orEmpty()
+            }.getOrNull().orEmpty()
+            val fromChatInfo = runCatching { loadChatInfo(chatId)?.description }.getOrNull().orEmpty()
+            last = listOf(fromChatInfo, fromDetail, fromTroopInfo)
+                .firstOrNull { it.isNotBlank() }.orEmpty()
+            Log.i(
+                TAG,
+                "manage: groupDesc verify chat=$chatId group=$groupCode " +
+                    "chatInfo=${fromChatInfo.take(40)} detail=${fromDetail.take(40)} " +
+                    "troopInfo=${fromTroopInfo.take(40)} expected=${expectedTrim.take(40)}",
+            )
+            if (fromChatInfo.trim() == expectedTrim ||
+                fromDetail.trim() == expectedTrim ||
+                fromTroopInfo.trim() == expectedTrim
+            ) {
+                return true
+            }
+            Thread.sleep(120L)
+        }
+        Log.w(
+            TAG,
+            "manage: groupDesc verify failed group=$groupCode last=${last.take(40)} " +
+                "expected=${expectedTrim.take(40)}",
+        )
+        return false
+    }
+
+    /** TIM 原生群资料修改：ITroopOperationRepoApi.modifyTroopData(groupUin, troopCard, owner=null, e callback)。 */
+    private fun setGroupDescriptionViaTroopCard(
+        chatId: String,
+        groupCode: Long,
+        description: String,
+    ): Boolean {
+        val api = troopOperationRepo() ?: run {
+            Log.w(TAG, "manage: groupDesc attempt=troopCard unavailable (troopOperationRepo)")
+            return false
+        }
+        val info = troopInfoFor(groupCode) ?: run {
+            Log.w(TAG, "manage: groupDesc attempt=troopCard unavailable (ITroopInfoService/getTroopInfo)")
+            return false
+        }
+        val card = buildTroopCard(groupCode, info, description) ?: return false
+        val cl = hostClassLoader() ?: return false
+        val method = api.javaClass.methods.firstOrNull {
+            it.name == "modifyTroopData" && it.parameterCount == 4
+        } ?: run {
+            Log.w(TAG, "manage: groupDesc attempt=troopCard unavailable (modifyTroopData)")
+            return false
+        }
+        val eClass = runCatching {
+            Class.forName("com.tencent.qqnt.troop.e", false, cl)
+        }.getOrNull() ?: run {
+            Log.w(TAG, "manage: groupDesc attempt=troopCard unavailable (troop.e)")
+            return false
+        }
+        val latch = CountDownLatch(1)
+        var resultOk = false
+        var code = -1
+        var msg = ""
+        val callback = java.lang.reflect.Proxy.newProxyInstance(cl, arrayOf(eClass)) { _, m, args ->
+            if (m.name == "onResult") {
+                resultOk = (args?.getOrNull(0) as? Boolean) == true
+                code = (args?.getOrNull(1) as? Number)?.toInt() ?: -1
+                msg = args?.getOrNull(2) as? String ?: ""
+                latch.countDown()
+            }
+            defaultValueFor(m.returnType)
+        }
+        val invoked = runCatching {
+            method.invoke(api, groupCode.toString(), card, null, callback)
+            true
+        }.getOrElse { t ->
+            Log.w(
+                TAG,
+                "manage: groupDesc attempt=troopCard invoke failed: " +
+                    "${t.javaClass.simpleName} ${t.message}",
+            )
+            false
+        }
+        val got = latch.await(8, TimeUnit.SECONDS)
+        val ok = invoked && (resultOk || code == 0)
+        Log.i(
+            TAG,
+            "manage: groupDesc attempt=troopCard group=$groupCode code=$code msg=${msg.take(80)} " +
+                "gotCallback=$got resultOk=$resultOk ok=$ok",
+        )
+        if (!ok) return false
+        val verified = verifyGroupDescription(chatId, groupCode, description, 2_000L)
+        Log.i(TAG, "manage: groupDesc attempt=troopCard verify=$verified group=$groupCode")
+        return verified
+    }
+
+    /** 修改群简介：TIM 原生 modifyTroopData（richFingerMemo）→ 旧版 OIDB 0x89a_0（读回验证）→ kernel 兜底。 */
+    fun setGroupDescription(chatId: String, description: String): Boolean {
+        if (!isHost) return false
+        if (!ensureServices()) return false
+        val groupCode = groupCodeFor(chatId) ?: run {
+            Log.w(TAG, "manage: groupDesc failed chat=$chatId (not a group)")
+            return false
+        }
+        return try {
+            var ok = setGroupDescriptionViaTroopCard(chatId, groupCode, description)
+            if (!ok) {
+                // 保留旧 repoV2/V1 尝试（大概率 unavailable，仅作日志兜底）
+                val repoOk = runCatching { setGroupDescriptionViaTroopRepo(groupCode, description) }
+                    .onFailure {
+                        Log.w(
+                            TAG,
+                            "manage: groupDesc attempt=repoV2 crashed: " +
+                                "${it.javaClass.simpleName} ${it.message}",
+                        )
+                    }
+                    .getOrDefault(false)
+                if (repoOk) {
+                    ok = verifyGroupDescription(chatId, groupCode, description, 2_000L)
+                    Log.i(TAG, "manage: groupDesc attempt=repoV2 verify=$ok group=$groupCode")
+                }
+            }
+            if (!ok) {
+                val oidbOk = setGroupDescriptionViaOidb(groupCode, description)
+                val verified = verifyGroupDescription(chatId, groupCode, description, 2_000L)
+                Log.i(
+                    TAG,
+                    "manage: groupDesc attempt=legacyOidb oidbOk=$oidbOk verify=$verified " +
+                        "group=$groupCode",
+                )
+                ok = oidbOk && verified
+            }
+            if (!ok) {
+                // kernel 兜底（产品禁用时返回 -10122，最终仍以读回为准）
+                val kernelOk = runCatching {
+                    val service = groupKernelService() ?: nativeGroupService() ?: return@runCatching false
+                    val cl = hostClassLoader() ?: return@runCatching false
+                    val reqClass = Class.forName(
+                        "com.tencent.qqnt.kernel.nativeinterface.GroupModifyInfoReq", false, cl,
+                    )
+                    val req = reqClass.getConstructor().newInstance()
+                    reqClass.getField("groupCode").setLong(req, groupCode)
+                    val filter = reqClass.getField("filter").get(req)
+                    val modifyInfo = reqClass.getField("modifyInfo").get(req)
+                    filter?.javaClass?.getField("fingerMemo")?.setInt(filter, 1)
+                    filter?.javaClass?.getField("richFingerMemo")?.setInt(filter, 1)
+                    modifyInfo?.javaClass?.getField("fingerMemo")?.set(modifyInfo, description)
+                    modifyInfo?.javaClass?.getField("richFingerMemo")?.set(modifyInfo, description)
+                    val code = invokeOperateApi(
+                        "manage: groupDesc attempt=kernel",
+                        service,
+                        "modifyGroupDetailInfoV2",
+                        listOf(req, 0),
+                    )
+                    Log.i(TAG, "manage: groupDesc attempt=kernel group=$groupCode code=$code")
+                    code == 0
+                }.getOrDefault(false)
+                if (kernelOk) {
+                    ok = verifyGroupDescription(chatId, groupCode, description, 2_000L)
+                    Log.i(TAG, "manage: groupDesc attempt=kernel verify=$ok group=$groupCode")
+                }
+            }
+            if (ok) {
+                invalidateChatInfoCache(chatId)
+                groupDetailCache.remove(groupCode)
+                LiveEvents.emitDataUpdate(DataUpdate(chatId = chatId, kind = DataUpdate.Kind.CHAT_INFO))
+            }
+            Log.i(
+                TAG,
+                "manage: groupDesc chat=$chatId group=$groupCode ok=$ok len=${description.length}",
+            )
+            ok
+        } catch (t: Throwable) {
+            Log.w(TAG, "manage: groupDesc failed chat=$chatId: ${t.javaClass.simpleName} ${t.message}")
+            false
+        }
+    }
+
+    /**
+     * 旧版群资料修改 OIDB 0x89a_0（command 2202/svc 0）：
+     * st_group_info.string_group_finger_memo + string_group_rich_finger_memo。
+     * uint32_flag 低位含义未在反编译中确认，按候选位逐个尝试（1/2/4/8/16/3/5/0），成功即返回；
+     * 调用方必须再做读回验证。
+     */
+    private fun setGroupDescriptionViaOidb(groupCode: Long, description: String): Boolean {
+        val descBytes = description.toByteArray(Charsets.UTF_8)
+        for (flag in listOf(1, 2, 4, 8, 16, 3, 5, 0)) {
+            val ok = runCatching {
+                val req = newPb("tencent.im.oidb.cmd0x89a.oidb_0x89a\$ReqBody") ?: return@runCatching false
+                pbSet(req, "uint64_group_code", groupCode)
+                val info = pbMessage(req, "st_group_info") ?: return@runCatching false
+                pbSet(info, "string_group_finger_memo", pbByteStringOf(descBytes))
+                pbSet(info, "string_group_rich_finger_memo", pbByteStringOf(descBytes))
+                pbSet(info, "uint32_flag", flag)
+                pbSetHasFlag(info, true)
+                val bytes = pbBytesOf(req) ?: return@runCatching false
+                val rsp = sendOidbRequest("OidbSvc.0x89a_0", 2202, 0, bytes) ?: return@runCatching false
+                Log.i(
+                    TAG,
+                    "manage: groupDesc attempt=legacyOidb flag=$flag result=${rsp.result} " +
+                        "msg=${rsp.errorMsg.take(80)} rspBytes=${rsp.body.size}",
+                )
+                rsp.result == 0
+            }.getOrDefault(false)
+            if (ok) return true
+        }
+        return false
+    }
+
+    /** 打开 TIM 原生群资料/群头像编辑入口（原生页面内点群头像即可编辑）。 */
+    fun openGroupAvatarEditor(chatId: String): Boolean {
+        if (!isHost) return false
+        return try {
+            val groupCode = groupCodeFor(chatId)
+                ?: chatId.split('_').getOrNull(2)?.toLongOrNull()
+                ?: 0L
+            if (groupCode == 0L) {
+                Log.w(TAG, "groupAvatar: open native editor ok=false (not a group) chat=$chatId")
+                return false
+            }
+            val activity = callLaunchActivity()
+            val context: Context = activity ?: appContext() ?: hostContext() ?: run {
+                Log.w(TAG, "groupAvatar: open native editor ok=false (no context)")
+                return false
+            }
+            var ok = false
+            var impl = ""
+            // 1) TIM 官方路由：ITroopUtilApi.openTroopInfoActivity(Context, troopUin)
+            runCatching {
+                val api = groupManageQRouteApi("com.tencent.mobileqq.troop.api.ITroopUtilApi")
+                    ?: return@runCatching
+                val method = api.javaClass.methods.firstOrNull {
+                    it.name == "openTroopInfoActivity" && it.parameterCount == 2 &&
+                        android.content.Context::class.java.isAssignableFrom(it.parameterTypes[0]) &&
+                        it.parameterTypes[1] == String::class.java
+                } ?: return@runCatching
+                method.invoke(api, context, groupCode.toString())
+                ok = true
+                impl = "ITroopUtilApi.openTroopInfoActivity"
+            }.onFailure {
+                Log.w(TAG, "groupAvatar: QRoute open failed: ${it.javaClass.simpleName} ${it.message}")
+            }
+            // 2) 回退：直接构造 TIM 原生群资料 Activity intent
+            if (!ok) {
+                runCatching {
+                    val cl = hostClassLoader() ?: return@runCatching
+                    val clazz = Class.forName(
+                        "com.tencent.mobileqq.troop.troopcard.ui.TroopInfoActivity", false, cl,
+                    )
+                    val intent = Intent(context, clazz).apply {
+                        putExtra("troop_uin", groupCode.toString())
+                        putExtra("troop_info_from", 4)
+                        if (context !is Activity) addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    context.startActivity(intent)
+                    ok = true
+                    impl = "TroopInfoActivity intent"
+                }.onFailure {
+                    Log.w(TAG, "groupAvatar: intent open failed: ${it.javaClass.simpleName} ${it.message}")
+                }
+            }
+            Log.i(
+                TAG,
+                "groupAvatar: open native editor ok=$ok impl=$impl chat=$chatId group=$groupCode " +
+                    "activity=${activity?.javaClass?.simpleName}",
+            )
+            ok
+        } catch (t: Throwable) {
+            Log.w(TAG, "groupAvatar: open native editor failed: ${t.javaClass.simpleName} ${t.message}")
+            false
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 语音 / 视频通话：拉起 TIM 原版通话 UI
+    // ---------------------------------------------------------------------
+
+    fun startVoiceCall(chatId: String): Boolean = startCallInternal(chatId, video = false)
+
+    fun startVideoCall(chatId: String): Boolean = startCallInternal(chatId, video = true)
+
+    /** kernel chatType（1=c2c / 2=group）→ TIM 旧版 uinType（0/1/…）。 */
+    private fun legacyUinTypeForChatType(chatType: Int): Int = runCatching {
+        val cl = hostClassLoader() ?: return@runCatching null
+        val converter = Class.forName("com.tencent.nt.adapter.session.SessionConverterUtils", true, cl)
+        converter.getMethod("c", Int::class.javaPrimitiveType).invoke(null, chatType) as? Int
+    }.getOrNull() ?: if (chatType == 2) 1 else 0
+
+    /** 当前前台 Activity；取不到时退回 QBaseActivity.sTopActivity（TIM 通话权限/界面需要 Activity 上下文）。 */
+    private fun callLaunchActivity(): Activity? {
+        hostActivity()?.let { return it }
+        val cl = hostClassLoader() ?: return null
+        for (name in listOf(
+            "com.tencent.mobileqq.activity.QBaseActivity",
+            "com.tencent.mobileqq.activity.BaseActivity",
+        )) {
+            val value = runCatching {
+                Class.forName(name, false, cl).getField("sTopActivity").get(null) as? Activity
+            }.getOrNull()
+            if (value != null) return value
+        }
+        return null
+    }
+
+    /** TIM qqpermission 常量（ID.QQ_QAV / SCENE.QQ_QAV），取不到时用字面量兜底。 */
+    private fun callPermissionConstant(nested: String, field: String): String? = runCatching {
+        val cl = hostClassLoader() ?: return@runCatching null
+        Class.forName("com.tencent.mobileqq.qqpermission.QQPermissionConstants\$$nested", true, cl)
+            .getField(field)
+            .get(null) as? String
+    }.getOrNull()?.takeIf { it.isNotBlank() }
+
+    /**
+     * 在 ChatActivityUtils 里按签名找 TIM 的发起通话方法（方法名被混淆，不能按 h0/i0 直接反射）：
+     * - 13 参：h0(QQAppInterface, Context, int uinType, String peerUin, String peerNick, String phoneNum,
+     *   boolean onlyAudio, String extraUin, boolean checkShieldMsg, boolean checkWifi, u, String from, Map)
+     * - 15 参：i0(..., String permissionId, String permissionScene)
+     */
+    private fun findChatActivityUtilsCallMethod(
+        cl: ClassLoader,
+        parameterCount: Int,
+    ): java.lang.reflect.Method? {
+        val clazz = runCatching {
+            Class.forName("com.tencent.mobileqq.activity.ChatActivityUtils", true, cl)
+        }.getOrNull() ?: return null
+        return clazz.methods.firstOrNull { method ->
+            if (method.parameterCount != parameterCount || !java.lang.reflect.Modifier.isStatic(method.modifiers)) {
+                return@firstOrNull false
+            }
+            if (method.returnType != Boolean::class.javaPrimitiveType) return@firstOrNull false
+            val p = method.parameterTypes
+            p[0].name == "com.tencent.mobileqq.app.QQAppInterface" &&
+                android.content.Context::class.java.isAssignableFrom(p[1]) &&
+                p[2] == Int::class.javaPrimitiveType &&
+                p[3] == String::class.java &&
+                p[4] == String::class.java &&
+                p[5] == String::class.java &&
+                p[6] == Boolean::class.javaPrimitiveType &&
+                p[7] == String::class.java &&
+                p[8] == Boolean::class.javaPrimitiveType &&
+                p[9] == Boolean::class.javaPrimitiveType &&
+                p[11] == String::class.java &&
+                java.util.Map::class.java.isAssignableFrom(p[12]) &&
+                (parameterCount == 13 || (p[13] == String::class.java && p[14] == String::class.java))
+        }
+    }
+
+    private fun startCallInternal(chatId: String, video: Boolean): Boolean {
+        if (!isHost) return false
+        val op = if (video) "video" else "voice"
+        val started = android.os.SystemClock.uptimeMillis()
+        return try {
+            if (!ensureServices()) {
+                Log.w(TAG, "call: $op failed chat=$chatId (services unavailable)")
+                return false
+            }
+            val meta = ensureChatContext(chatId)
+            val chatType = meta?.chatType ?: when {
+                chatId.startsWith("tim_2_") -> 2
+                chatId.startsWith("tim_1_") -> 1
+                else -> 1
+            }
+            val isGroup = meta?.isGroup == true || chatType == 2
+            val peerUid = meta?.peerUid?.takeIf { it.isNotBlank() }
+                ?: chatId.split('_').getOrNull(2).orEmpty()
+            var peerUin = meta?.peerUin?.takeIf { it != 0L } ?: 0L
+            if (peerUin == 0L && !isGroup && peerUid.isNotBlank()) {
+                peerUin = runCatching { uinForUid(peerUid) }.getOrDefault(0L)
+            }
+            if (peerUin == 0L) {
+                Log.w(TAG, "call: $op failed chat=$chatId (peerUin unresolved, uid=${peerUid.take(16)})")
+                return false
+            }
+            val peerNick = meta?.name?.takeIf { it.isNotBlank() }
+                ?: runCatching { loadRecentChats()?.firstOrNull { it.id == chatId }?.name }.getOrNull()
+                ?: ""
+            val uinType = legacyUinTypeForChatType(chatType)
+            val activity = callLaunchActivity()
+            val context: Context = activity ?: appContext() ?: hostContext() ?: run {
+                Log.w(TAG, "call: $op failed chat=$chatId (no context)")
+                return false
+            }
+            val app = appRuntime() ?: run {
+                Log.w(TAG, "call: $op failed chat=$chatId (app runtime unavailable)")
+                return false
+            }
+            val cl = hostClassLoader() ?: return false
+            val map = HashMap<String, String>().apply {
+                put("should_believe_only_audio_flag", "true")
+            }
+            val h0 = findChatActivityUtilsCallMethod(cl, 13)
+            if (h0 != null) {
+                val ok = (h0.invoke(
+                    null,
+                    app,
+                    context,
+                    uinType,
+                    peerUin.toString(),
+                    peerNick,
+                    "",
+                    !video,
+                    peerUin.toString(),
+                    true,
+                    true,
+                    null,
+                    "from_internal",
+                    map,
+                ) as? Boolean) == true
+                Log.i(
+                    TAG,
+                    "call: $op chat=$chatId uinType=$uinType peerUin=$peerUin " +
+                        "peerUid=${peerUid.take(12)} group=$isGroup title=${peerNick.take(20)} " +
+                        "activity=${activity?.javaClass?.simpleName} impl=ChatActivityUtils.h0 ok=$ok " +
+                        "elapsedMs=${android.os.SystemClock.uptimeMillis() - started}",
+                )
+                return ok
+            }
+            val i0 = findChatActivityUtilsCallMethod(cl, 15)
+            if (i0 != null) {
+                val permissionId = callPermissionConstant("Business\$ID", "QQ_QAV") ?: "biz_src_sq_qav"
+                val permissionScene = callPermissionConstant("Business\$SCENE", "QQ_QAV") ?: "qq_qav"
+                val ok = (i0.invoke(
+                    null,
+                    app,
+                    context,
+                    uinType,
+                    peerUin.toString(),
+                    peerNick,
+                    "",
+                    !video,
+                    peerUin.toString(),
+                    true,
+                    true,
+                    null,
+                    "from_internal",
+                    map,
+                    permissionId,
+                    permissionScene,
+                ) as? Boolean) == true
+                Log.i(
+                    TAG,
+                    "call: $op chat=$chatId uinType=$uinType peerUin=$peerUin " +
+                        "activity=${activity?.javaClass?.simpleName} impl=ChatActivityUtils.i0 ok=$ok " +
+                        "elapsedMs=${android.os.SystemClock.uptimeMillis() - started}",
+                )
+                return ok
+            }
+            Log.w(
+                TAG,
+                "call: no native entry found chat=$chatId op=$op " +
+                    "(ChatActivityUtils 13/15 参方法未找到，TIM 版本可能已改)",
+            )
+            false
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "call: $op failed chat=$chatId: ${t.javaClass.simpleName} ${t.message}",
+            )
+            false
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 全局搜索：跨会话消息 + 联系人 + 群聊
+    // ---------------------------------------------------------------------
+
+    /** 全局消息搜索最多扫多少个最近会话（内核 searchChatMsgs 只支持单会话，需逐个扫）。 */
+    private const val MAX_SEARCH_CHATS = 12
+
+    /**
+     * 全局搜索（首页搜索框）：消息跨最近会话逐个用内核 searchChatMsgs 搜索后合并去重排序；
+     * 联系人/群聊走本地 loadContacts/loadRecentChats 过滤（快且可靠）。
+     * 阻塞，IO 线程调用；失败返回 null，关键词为空返回空结果。
+     */
+    fun searchAll(keyword: String, messageLimit: Int = 50): GlobalSearchResult? {
+        if (!isHost) return null
+        val query = keyword.trim()
+        if (query.isEmpty()) return GlobalSearchResult()
+        if (!ensureServices()) return null
+        val started = android.os.SystemClock.uptimeMillis()
+        return try {
+            val recent = runCatching { loadRecentChats() }.getOrNull().orEmpty()
+            val messages = runCatching { searchMessagesGlobal(query, recent, messageLimit) }
+                .onFailure {
+                    Log.w(
+                        TAG,
+                        "search: messages failed: ${it.javaClass.simpleName} ${it.message}",
+                    )
+                }
+                .getOrDefault(emptyList())
+            val contacts = runCatching { searchContactsLocal(query) }
+                .onFailure {
+                    Log.w(TAG, "search: contacts failed: ${it.javaClass.simpleName} ${it.message}")
+                }
+                .getOrDefault(emptyList())
+            val groups = runCatching { searchGroupsLocal(query, recent) }
+                .onFailure {
+                    Log.w(TAG, "search: groups failed: ${it.javaClass.simpleName} ${it.message}")
+                }
+                .getOrDefault(emptyList())
+            Log.i(
+                TAG,
+                "search: keyword=${query.take(40)} msgs=${messages.size} contacts=${contacts.size} " +
+                    "groups=${groups.size} recentChats=${recent.size} " +
+                    "elapsedMs=${android.os.SystemClock.uptimeMillis() - started}",
+            )
+            GlobalSearchResult(messages = messages, contacts = contacts, groups = groups)
+        } catch (t: Throwable) {
+            Log.w(TAG, "search: failed keyword=${query.take(40)}: ${t.javaClass.simpleName} ${t.message}")
+            null
+        }
+    }
+
+    /** 跨会话消息搜索：复用单会话内核搜索（searchChatMessages），合并去重后按时间倒序取前 N。 */
+    private fun searchMessagesGlobal(
+        keyword: String,
+        recent: List<ChatItem>,
+        messageLimit: Int,
+    ): List<GlobalSearchMessage> {
+        val max = messageLimit.coerceIn(1, 100)
+        val chats = recent.filter { it.id.startsWith("tim_") }.take(MAX_SEARCH_CHATS)
+        val collected = LinkedHashMap<String, GlobalSearchMessage>()
+        var scanned = 0
+        for (chat in chats) {
+            if (collected.size >= max * 4) break
+            scanned++
+            val found = runCatching { searchChatMessages(chat.id, keyword, minOf(8, max)) }
+                .getOrNull()
+                .orEmpty()
+            if (found.isEmpty()) continue
+            found.forEach { message ->
+                val key = "${chat.id}:${message.id}"
+                if (collected.containsKey(key)) return@forEach
+                val msgId = message.id.removePrefix("tim_").toLongOrNull() ?: 0L
+                collected[key] = GlobalSearchMessage(
+                    chatId = chat.id,
+                    chatName = chat.name,
+                    isGroup = chat.isGroup,
+                    senderName = if (message.isMe) "我" else message.senderName,
+                    msgId = msgId,
+                    msgSeq = message.seq,
+                    preview = searchPreviewOf(message),
+                    timeLabel = searchTimeLabel(message.timestampMs),
+                    timestampMs = message.timestampMs,
+                )
+            }
+        }
+        Log.i(
+            TAG,
+            "search: messages scanned=$scanned chats raw=${collected.size} limit=$max",
+        )
+        return collected.values
+            .sortedWith(
+                compareByDescending<GlobalSearchMessage> { it.timestampMs }
+                    .thenByDescending { it.msgSeq },
+            )
+            .take(max)
+    }
+
+    private fun searchPreviewOf(message: ChatMessage): String {
+        val raw = when (message.type) {
+            ChatMessageType.TEXT -> message.content
+            ChatMessageType.IMAGE -> "[图片]"
+            ChatMessageType.FILE -> "[文件]"
+            ChatMessageType.VOICE -> "[语音]"
+            ChatMessageType.VIDEO -> "[视频]"
+            ChatMessageType.RED_PACKET -> "[红包]"
+            ChatMessageType.LINK -> "[链接]"
+            ChatMessageType.SYSTEM -> message.content
+            ChatMessageType.CHAT_RECORD -> "[聊天记录]"
+            ChatMessageType.ARK -> "[卡片]"
+        }
+        return raw.replace('\n', ' ').trim().take(60)
+    }
+
+    private fun searchTimeLabel(timestampMs: Long): String {
+        if (timestampMs <= 0L) return ""
+        return runCatching {
+            java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault())
+                .format(java.util.Date(timestampMs))
+        }.getOrDefault("")
+    }
+
+    /** 联系人本地过滤：昵称/签名包含匹配；关键词是数字时再按 QQ 号匹配（懒转换 uid→uin）。 */
+    private fun searchContactsLocal(keyword: String): List<ContactItem> {
+        val all = if (loadedContacts.isNotEmpty()) {
+            loadedContacts
+        } else {
+            runCatching { loadContacts() }.getOrNull().orEmpty()
+        }
+        if (all.isEmpty()) return emptyList()
+        val lower = keyword.lowercase()
+        val digits = keyword.filter { it.isDigit() }
+        val numericQuery = digits.isNotEmpty() && digits.length == keyword.count { it.isDigit() }
+        val result = ArrayList<ContactItem>(20)
+        for (contact in all) {
+            if (result.size >= 20) break
+            val nameHit = contact.name.lowercase().contains(lower)
+            val signatureHit = contact.signature.lowercase().contains(lower)
+            var uinHit = false
+            if (!nameHit && !signatureHit && numericQuery && digits.length >= 4) {
+                val uid = contact.id.removePrefix("tim_friend_")
+                val uin = runCatching { uinForUid(uid) }.getOrDefault(0L)
+                uinHit = uin != 0L && uin.toString().contains(digits)
+            }
+            if (nameHit || signatureHit || uinHit) result.add(contact)
+        }
+        return result
+    }
+
+    private fun groupCodeOfChatId(chatId: String): String =
+        chatMeta[chatId]?.groupCode?.takeIf { it != 0L }?.toString()
+            ?: chatId.split('_').getOrNull(2)?.takeIf { value -> value.all { it.isDigit() } }.orEmpty()
+
+    /** 群聊本地过滤：群名包含匹配，关键词是数字时再按群号匹配。 */
+    private fun searchGroupsLocal(keyword: String, recent: List<ChatItem>): List<ChatItem> {
+        val lower = keyword.lowercase()
+        val digits = keyword.filter { it.isDigit() }
+        return recent.filter { chat ->
+            if (!chat.isGroup) return@filter false
+            if (chat.name.lowercase().contains(lower)) return@filter true
+            if (digits.isEmpty()) return@filter false
+            groupCodeOfChatId(chat.id).contains(digits)
+        }.take(20)
+    }
+
+    // ---------------------------------------------------------------------
+    // 加好友 / 群搜索（TIM SummaryCard 精确查找 + 本地会话/联系人兜底）
+    // ---------------------------------------------------------------------
+
+    /**
+     * TIM 的加好友/群精确查找走 SummaryCard.ReqSearch（FriendListHandler.searchFriend），
+     * 这里复用 TIM 自己的 SearchFacade（com.tencent.mobileqq.activity.contact.addcontact.e）：
+     * - search_list 的取值来自 SearchFacade 的 static 数组 i/j：80000000=找人，80000001=找群；
+     * - AddFriendActivity.searchFriend()/doSearchTroop() 正是这样调用 facade.n(...) 的。
+     */
+    private const val SUMMARY_CARD_SEARCH_TYPE_USER = 0x04c4b400 // 80000000：QQ号/手机号/邮箱精确查找
+    private const val SUMMARY_CARD_SEARCH_TYPE_TROOP = 0x04c4b401 // 80000001：群号查找
+
+    /** 同时只允许一个「加好友/群」搜索在跑（期间会注册/注销 TIM 的搜索 observer）。 */
+    private val addFriendSearchLock = Any()
+
+    /** 最近一次加好友请求失败时服务端/风控返回的可读文案（UI 失败提示用）。 */
+    @Volatile
+    private var lastAddFriendError: String? = null
+
+    /** 供 UI 读取最近一次加好友失败原因。 */
+    fun lastAddFriendError(): String? = lastAddFriendError
+
+    private fun wrapperSession(): Any? = kernelService?.let { kernel ->
+        runCatching { kernel.javaClass.getMethod("getWrapperSession").invoke(kernel) }.getOrNull()
+    }
+
+    /** native IKernelProfileService（wrapper 没暴露 getUserDetailInfoByUin）。 */
+    private fun nativeProfileService(): Any? =
+        profileService?.let { nativeServiceOf(it) }
+            ?: wrapperSession()?.let { invokeGetter(it, "getProfileService") }
+
+    /** native IKernelGroupService。 */
+    private fun nativeGroupService(): Any? =
+        groupKernelService()?.let { nativeServiceOf(it) }
+            ?: wrapperSession()?.let { invokeGetter(it, "getGroupService") }
+
+    /** native IKernelBuddyService。 */
+    private fun nativeBuddyService(): Any? =
+        buddyService?.let { nativeServiceOf(it) }
+            ?: wrapperSession()?.let { invokeGetter(it, "getBuddyService") }
+
+    private fun addFriendUserKey(user: AddFriendUser): String =
+        user.uid.takeIf { it.isNotBlank() } ?: "uin:${user.uin}"
+
+    private fun addFriendKeywordMatches(keyword: String, vararg candidates: String): Boolean {
+        val k = keyword.trim()
+        if (k.isEmpty()) return false
+        return candidates.any { c ->
+            c.isNotBlank() && (c.equals(k, ignoreCase = true) || c.contains(k, ignoreCase = true))
+        }
+    }
+
+    // TIM 的搜索模型类是混淆后的 public 字段（search/c/a/a/a 的 a..k；AccountSearchPb$record 的 PB 字段），
+    // 这里用反射读字段名（这些 PB 字段名没有被混淆）。
+
+    private fun readPublicField(target: Any, name: String): Any? = runCatching {
+        target.javaClass.getField(name).get(target)
+    }.getOrNull()
+
+    private fun readPbLong(record: Any, name: String): Long =
+        (readPublicField(record, name)?.let { invokeGetter(it, "get") } as? Number)?.toLong() ?: 0L
+
+    private fun readPbInt(record: Any, name: String): Int =
+        (readPublicField(record, name)?.let { invokeGetter(it, "get") } as? Number)?.toInt() ?: 0
+
+    private fun readPbString(record: Any, name: String): String =
+        readPublicField(record, name)?.let { invokeGetter(it, "get") } as? String ?: ""
+
+    /**
+     * 解析 SearchFacade 回调 data（ArrayList<com.tencent.mobileqq.search.c.a.a.a>）：
+     * 元素 a=search type、e=List<AccountSearchPb$record>：
+     * - 80000000 → 用户（record.uin/account_id、name、mobile）；
+     * - 80000001 → 群（record.code 群号、name 群名、number 成员数）。
+     */
+    private fun parseSummaryCardSearchData(
+        data: Any?,
+        users: MutableList<AddFriendUser>,
+        groups: MutableList<AddFriendGroup>,
+        label: String,
+        withUsers: Boolean,
+        withGroups: Boolean,
+    ) {
+        @Suppress("UNCHECKED_CAST")
+        val resultGroups = data as? List<Any?> ?: run {
+            Log.i(TAG, "addFriend: remoteSearch($label) null data")
+            return
+        }
+        resultGroups.forEach { item ->
+            item ?: return@forEach
+            val type = (readPublicField(item, "a") as? Number)?.toInt() ?: 0
+            @Suppress("UNCHECKED_CAST")
+            val records = readPublicField(item, "e") as? List<Any?> ?: return@forEach
+            Log.i(
+                TAG,
+                "addFriend: remoteSearch($label) item type=$type records=${records.size}",
+            )
+            records.filterNotNull().forEach { record ->
+                val groupRecord = recordLooksLikeGroup(record)
+                when {
+                    groupRecord && withGroups -> appendGroupFromRecord(record, groups)
+                    !groupRecord && withUsers -> appendUserFromRecord(record, users)
+                    // type 明确但字段不全时也给对应解析器一次机会（它们自身会过滤）。
+                    type == SUMMARY_CARD_SEARCH_TYPE_TROOP && withGroups ->
+                        appendGroupFromRecord(record, groups)
+                    type == SUMMARY_CARD_SEARCH_TYPE_USER && withUsers ->
+                        appendUserFromRecord(record, users)
+                }
+            }
+        }
+    }
+
+    /** 记录是否像群：有群号 code，且没有用户 uin/account_id。 */
+    private fun recordLooksLikeGroup(record: Any): Boolean =
+        readPbLong(record, "code") > 0L &&
+            readPbLong(record, "uin") <= 0L &&
+            readPbLong(record, "account_id") <= 0L
+
+    /** 从 AccountSearchPb$record 的 mobile 字段取手机号：TIM 返回形如 "+8613800000000"。 */
+    private fun recordPhone(record: Any): String {
+        val raw = readPbString(record, "mobile").trim()
+        if (raw.isEmpty()) return ""
+        val digits = raw.filter { it.isDigit() }
+        return when {
+            digits.length > 11 && digits.startsWith("86") -> digits.substring(2)
+            else -> digits
+        }
+    }
+
+    /**
+     * 从 AccountSearchPb$record 里取「加好友验证 token」：
+     * - bytes_token 是 PBBytesField；TIM 原生详情卡会把它的 byte[] 通过
+     *   IFriendHandlerService.cacheToken(uin, sourceID, subSourceID, token) 交给加好友协议；
+     * - 兼容 authSig / auth_sign / token 字符串字段（部分版本把签名放 JSON 扩展里）。
+     * 返回约定：字节内容是可打印 ASCII 时返回原文（服务端 token 常是文本），否则返回 base64；
+     * 日志只保留长度 + hex 前缀，避免逐条刷屏。
+     */
+    private fun readRecordAddFriendToken(record: Any): String {
+        val bytesField = readPublicField(record, "bytes_token")
+        if (bytesField != null) {
+            val byteString = invokeGetter(bytesField, "get")
+            if (byteString != null) {
+                val raw = runCatching {
+                    byteString.javaClass.getMethod("toByteArray").invoke(byteString) as? ByteArray
+                }.getOrNull()
+                val utf8 = runCatching {
+                    byteString.javaClass.getMethod("toStringUtf8").invoke(byteString) as? String
+                }.getOrNull()
+                if (raw != null && raw.isNotEmpty()) {
+                    val base64 = android.util.Base64.encodeToString(raw, android.util.Base64.NO_WRAP)
+                    val hex = raw.joinToString("") { "%02x".format(it) }
+                    Log.i(TAG, "addFriend: record token len=${raw.size} prefix=${hex.take(16)}")
+                    val printableAscii = utf8 != null && utf8.length == raw.size &&
+                        utf8.all { it.code in 0x20..0x7e }
+                    return if (printableAscii) utf8!! else base64
+                }
+            }
+        }
+        val textToken = listOf("authSig", "auth_sign", "authsig", "token").firstNotNullOfOrNull { name ->
+            val field = readPublicField(record, name) ?: return@firstNotNullOfOrNull null
+            when (field) {
+                is String -> field.takeIf { it.isNotBlank() }
+                else -> (invokeGetter(field, "get") as? String)?.takeIf { it.isNotBlank() }
+            }
+        }
+        if (textToken != null) {
+            Log.i(TAG, "addFriend: record token(authSig) len=${textToken.length}")
+            return textToken
+        }
+        return ""
+    }
+
+    /** 从一个 AccountSearchPb$record 里解析用户并追加（QQ号/手机号精确查找）。 */
+    private fun appendUserFromRecord(record: Any, users: MutableList<AddFriendUser>) {
+        val token = readRecordAddFriendToken(record)
+        val uin = readPbLong(record, "uin").takeIf { it > 0L }
+            ?: readPbLong(record, "account_id").takeIf { it > 0L }
+        if (uin == null) {
+            // 手机号搜索命中的记录没有 uin/account_id，只有 name/mobile/bytes_token：
+            // 手机号用于内核 reqToAddFriends.phoneNumber，token 用于 securityVerify（验证页流程）。
+            val phone = recordPhone(record)
+            val name = readPbString(record, "name").takeIf { it.isNotBlank() }
+            if (phone.isNotBlank() || token.isNotBlank()) {
+                users.add(
+                    AddFriendUser(
+                        uid = "",
+                        uin = 0L,
+                        name = name ?: "手机号用户",
+                        avatarPath = null,
+                        detail = if (phone.isNotBlank()) "手机号: $phone" else "",
+                        phone = phone,
+                        token = token,
+                    ),
+                )
+                Log.i(
+                    TAG,
+                    "addFriend: phone result name=$name phone=$phone tokenLen=${token.length}",
+                )
+            }
+            return
+        }
+        val name = listOf(
+            readPbString(record, "name"),
+            readPbString(record, "accout"),
+        ).firstOrNull { it.isNotBlank() } ?: "QQ用户"
+        val phone = recordPhone(record)
+        val detail = if (phone.isNotBlank()) "QQ号: $uin · 手机: $phone" else "QQ号: $uin"
+        if (users.none { it.uin == uin }) {
+            users.add(
+                AddFriendUser(
+                    uid = "",
+                    uin = uin,
+                    name = name,
+                    avatarPath = userAvatarPath("", uin),
+                    detail = detail,
+                    phone = phone,
+                    token = token,
+                ),
+            )
+            Log.i(TAG, "addFriend: user result name=$name uin=$uin phone=$phone tokenLen=${token.length}")
+        }
+    }
+
+    /** 从一个 AccountSearchPb$record 里解析群并追加（群号精确查找）。 */    /** 从一个 AccountSearchPb$record 里解析群并追加（群号精确查找）。 */
+    private fun appendGroupFromRecord(record: Any, groups: MutableList<AddFriendGroup>) {
+        val code = readPbLong(record, "code")
+        if (code <= 0L) return
+        // 群记录一般没有 uin/account_id（用户记录才有），避免把用户记录误判成群。
+        if (readPbLong(record, "uin") > 0L || readPbLong(record, "account_id") > 0L) {
+            return
+        }
+        val name = readPbString(record, "name").takeIf { it.isNotBlank() } ?: "群聊 $code"
+        val memberCount = readPbInt(record, "number")
+        val detail = if (memberCount > 0) "群号: $code · $memberCount 人" else "群号: $code"
+        if (groups.none { it.groupCode == code }) {
+            groups.add(
+                AddFriendGroup(
+                    groupCode = code,
+                    name = name,
+                    avatarPath = groupAvatarPath(code, false) ?: legacyAvatarPath(4, code),
+                    detail = detail,
+                ),
+            )
+        }
+    }
+
+    /**
+     * 调用 SearchFacade 的包级私有/公开无参方法（g=注册 FriendList observer，h=注销 observer+清回调）。
+     * g() 是 package-private（access=0x10 FINAL），不在 Class.methods 里，需要 declaredMethods + setAccessible。
+     */
+    private fun invokeFacadeNoArg(facadeClass: Class<*>, facade: Any?, name: String): Boolean {
+        facade ?: return false
+        val method = facadeClass.methods.firstOrNull { it.name == name && it.parameterCount == 0 }
+            ?: facadeClass.declaredMethods.firstOrNull { it.name == name && it.parameterCount == 0 }
+                ?.also { runCatching { it.isAccessible = true } }
+            ?: return false
+        return try {
+            method.invoke(facade)
+            true
+        } catch (t: Throwable) {
+            Log.w(TAG, "addFriend: SearchFacade.$name failed: ${t.javaClass.simpleName} ${t.message}")
+            false
+        }
+    }
+
+    /**
+     * TIM 自己的「加好友/群」精确查找（SummaryCard.ReqSearch）：
+     * 反射构造 SearchFacade → p(callback) 设回调 → g() 注册 FriendList observer →
+     * m(keyword, search_list, 0, 0, true, 0) 发送请求；结果通过 e$b.a(...) 回到主线程后解析。
+     * TIM 的 AddFriendActivity.searchFriend()/doSearchTroop() 正是这样调 facade.n(...) 的
+     * （n 内部同样是选 static 数组 → g() → FriendListHandler.searchFriend）。
+     *
+     * 注意：一次请求完成后 SearchFacade 的 observer 会被自动 remove（TIM 分页时重新 n() 注册），
+     * 所以找人/找群两个请求各自建一个独立的 facade，串行执行。
+     */
+    private fun remoteAddFriendSearch(
+        keyword: String,
+        withUsers: Boolean,
+        withGroups: Boolean,
+    ): Pair<List<AddFriendUser>, List<AddFriendGroup>> {
+        val users = java.util.concurrent.CopyOnWriteArrayList<AddFriendUser>()
+        val groups = java.util.concurrent.CopyOnWriteArrayList<AddFriendGroup>()
+        if (withUsers) {
+            searchFacade(
+                keyword = keyword,
+                searchMask = intArrayOf(SUMMARY_CARD_SEARCH_TYPE_USER),
+                wantUsers = true,
+                wantGroups = false,
+                users = users,
+                groups = groups,
+                maxPages = 1,
+            )
+        }
+        if (withGroups) {
+            val numericKeyword = keyword.toLongOrNull() != null
+            val maxPages = if (numericKeyword) 1 else 25 // 群号精确查一页；昵称搜群分页
+            val pages = searchFacade(
+                keyword = keyword,
+                searchMask = intArrayOf(SUMMARY_CARD_SEARCH_TYPE_TROOP),
+                wantUsers = false,
+                wantGroups = true,
+                users = users,
+                groups = groups,
+                maxPages = maxPages,
+            )
+            if (!numericKeyword) {
+                Log.i(TAG, "addFriend: nickname troop pages=$pages groups=${groups.size}")
+            }
+        }
+        return users.toList() to groups.toList()
+    }
+
+    /**
+     * 通过 TIM SearchFacade 发 SummaryCard.ReqSearch（找人/找群统一入口）：
+     * - 精确查找/群号查找传 maxPages=1（只取第一页）；
+     * - 昵称搜群传 maxPages=25，复用同一个 facade 逐页 o(page)+m(...)（TIM 搜索页就是连续翻页，
+     *   每页新建 facade 会重新从第一页返回）。
+     * 返回实际请求的页数。
+     */
+    private fun searchFacade(
+        keyword: String,
+        searchMask: IntArray,
+        wantUsers: Boolean,
+        wantGroups: Boolean,
+        users: MutableList<AddFriendUser>,
+        groups: MutableList<AddFriendGroup>,
+        maxPages: Int,
+    ): Int {
+        val app = appRuntime ?: return 0
+        val cl = hostClassLoader() ?: return 0
+        val typeLabel = if (wantGroups) "troop" else "user"
+        var facade: Any? = null
+        var observerRegistered = false
+        return try {
+            val clazz = Class.forName(
+                "com.tencent.mobileqq.activity.contact.addcontact.e", false, cl,
+            )
+            val appInterfaceClass = Class.forName("com.tencent.common.app.AppInterface", false, cl)
+            val callbackClass = Class.forName(
+                "com.tencent.mobileqq.activity.contact.addcontact.e\$b", false, cl,
+            )
+            var cbLatch = CountDownLatch(1)
+            var cbSuccess = false
+            var cbNew = 0
+            val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, method, args ->
+                if (method.name == "a") {
+                    val page = (args?.getOrNull(0) as? Number)?.toInt() ?: -1
+                    val success = args?.getOrNull(1) as? Boolean ?: false
+                    val data = args?.getOrNull(2)
+                    val rsCode = (args?.getOrNull(3) as? Number)?.toInt() ?: -1
+                    val errMsg = args?.getOrNull(4) as? String ?: ""
+                    val before = users.size + groups.size
+                    if (!success || rsCode != 0) {
+                        Log.w(
+                            TAG,
+                            "addFriend: remoteSearch($typeLabel) failed page=$page " +
+                                "success=$success rsCode=$rsCode errMsg=$errMsg",
+                        )
+                    }
+                    if (success) {
+                        parseSummaryCardSearchData(
+                            data,
+                            users,
+                            groups,
+                            keyword,
+                            wantUsers,
+                            wantGroups,
+                        )
+                    }
+                    cbSuccess = success
+                    cbNew = users.size + groups.size - before
+                    cbLatch.countDown()
+                }
+                defaultValueFor(method.returnType)
+            }
+            val created = clazz.getConstructor(appInterfaceClass).newInstance(app)
+            facade = created
+            val setCallback = clazz.methods.firstOrNull { it.name == "p" && it.parameterCount == 1 }
+            if (setCallback == null) {
+                Log.w(TAG, "addFriend: remoteSearch($typeLabel) SearchFacade.p not found")
+                return 0
+            }
+            setCallback.invoke(created, callback)
+            observerRegistered = invokeFacadeNoArg(clazz, created, "g")
+            if (!observerRegistered) {
+                Log.w(TAG, "addFriend: remoteSearch($typeLabel) register observer failed")
+                return 0
+            }
+            val searchMethod = clazz.methods.firstOrNull { m ->
+                m.name == "m" && m.parameterCount == 6 &&
+                    m.parameterTypes[0] == String::class.java &&
+                    m.parameterTypes[1] == IntArray::class.java
+            } ?: run {
+                Log.w(TAG, "addFriend: remoteSearch($typeLabel) SearchFacade.m not found")
+                return 0
+            }
+            val setPage = clazz.methods.firstOrNull {
+                it.name == "o" && it.parameterCount == 1 &&
+                    it.parameterTypes[0] == Int::class.javaPrimitiveType
+            } ?: run {
+                Log.w(TAG, "addFriend: remoteSearch($typeLabel) SearchFacade.o not found")
+                return 0
+            }
+            var pages = 0
+            var emptyStreak = 0
+            for (page in 0 until maxPages) {
+                cbLatch = CountDownLatch(1)
+                cbSuccess = false
+                cbNew = 0
+                if (page > 0) {
+                    // 上一页回调后 SearchFacade 会清 callback/移除 observer，翻页前要重新挂上。
+                    setCallback.invoke(created, callback)
+                    observerRegistered = invokeFacadeNoArg(clazz, created, "g")
+                    if (!observerRegistered) break
+                }
+                setPage.invoke(created, page)
+                // SearchFacade.m(String,int[],D,D,Z,I)：页码由 o(page) 设置，最后一个 int 是搜索来源
+                // （找人 0 / 找群 1，TIM 原生群搜索路径传 1）。
+                searchMethod.invoke(
+                    created,
+                    keyword,
+                    searchMask,
+                    0.0,
+                    0.0,
+                    true,
+                    if (wantGroups) 1 else 0,
+                )
+                val done = cbLatch.await(6, TimeUnit.SECONDS)
+                pages += 1
+                if (!done || !cbSuccess) break
+                if (cbNew <= 0) {
+                    // 连续 3 页没有新增结果就认为翻到底（服务端偶尔重复返回同一页）。
+                    emptyStreak += 1
+                    if (emptyStreak >= 3) break
+                } else {
+                    emptyStreak = 0
+                }
+            }
+            pages
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "addFriend: remoteSearch($typeLabel) paged failed: " +
+                    "${t.javaClass.simpleName} ${t.message}",
+            )
+            0
+        } finally {
+            if (observerRegistered) {
+                runCatching {
+                    val clazz = Class.forName(
+                        "com.tencent.mobileqq.activity.contact.addcontact.e",
+                        false,
+                        cl,
+                    )
+                    invokeFacadeNoArg(clazz, facade, "h")
+                }
+            }
+        }
+    }
+
+    /** 本地已有会话/联系人按昵称、QQ号、群号匹配（保证搜已存在的账号有结果）。 */
+    private fun collectLocalAddFriendMatches(
+        keyword: String,
+        users: MutableMap<String, AddFriendUser>,
+        groups: MutableMap<Long, AddFriendGroup>,
+    ) {
+        val chats = runCatching { loadRecentChats() }.getOrNull().orEmpty()
+        chats.forEach { chat ->
+            val meta = chatMeta[chat.id] ?: return@forEach
+            val matched = addFriendKeywordMatches(
+                keyword,
+                chat.name,
+                meta.peerUid,
+                if (meta.peerUin != 0L) meta.peerUin.toString() else "",
+                if (meta.groupCode != 0L) meta.groupCode.toString() else "",
+            )
+            if (!matched) return@forEach
+            if (meta.isGroup) {
+                if (meta.groupCode != 0L) {
+                    groups.putIfAbsent(
+                        meta.groupCode,
+                        AddFriendGroup(
+                            meta.groupCode,
+                            chat.name,
+                            chat.avatarPath,
+                            "群号: ${meta.groupCode}",
+                        ),
+                    )
+                }
+            } else if (meta.peerUid.isNotBlank() || meta.peerUin != 0L) {
+                val user = AddFriendUser(
+                    uid = meta.peerUid,
+                    uin = meta.peerUin,
+                    name = chat.name,
+                    avatarPath = chat.avatarPath,
+                    detail = if (meta.peerUin != 0L) "QQ号: ${meta.peerUin}" else "uid: ${meta.peerUid.take(12)}",
+                )
+                users.putIfAbsent(addFriendUserKey(user), user)
+            }
+        }
+        val contacts = if (loadedContacts.isEmpty()) {
+            runCatching { loadContacts() }.getOrNull().orEmpty()
+        } else {
+            loadedContacts
+        }
+        contacts.forEach { contact ->
+            val uid = contact.id.removePrefix("tim_friend_")
+            if (uid.isBlank() || uid == contact.id) return@forEach
+            if (!addFriendKeywordMatches(keyword, contact.name)) return@forEach
+            val uin = uinForUid(uid)
+            val user = AddFriendUser(
+                uid = uid,
+                uin = uin,
+                name = contact.name,
+                avatarPath = contact.avatarPath ?: userAvatarPath(uid, uin),
+                detail = if (uin != 0L) "QQ号: $uin" else "好友",
+            )
+            users.putIfAbsent(addFriendUserKey(user), user)
+        }
+    }
+
+    /** 按 QQ 号查询陌生人资料（native IKernelProfileService.getUserDetailInfoByUin，SummaryCard 的兜底）。 */
+    private fun lookupAddFriendUserByUin(uin: Long): AddFriendUser? {
+        if (uin <= 0L) return null
+        val service = waitForService(timeoutMs = 1_500L) { nativeProfileService() } ?: return null
+        val cl = hostClassLoader() ?: return null
+        val callbackClass = runCatching {
+            Class.forName("com.tencent.qqnt.kernel.nativeinterface.IDetailInfoByUinCallback", false, cl)
+        }.getOrNull() ?: return null
+        val method = reflectMethod(service, "getUserDetailInfoByUin", 2) ?: run {
+            Log.w(TAG, "addFriend: getUserDetailInfoByUin not found on ${service.javaClass.simpleName}")
+            return null
+        }
+        val latch = CountDownLatch(1)
+        var code = -1
+        var message = ""
+        var info: Any? = null
+        val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, m, a ->
+            if (m.name == "onResult") {
+                code = (a?.getOrNull(0) as? Number)?.toInt() ?: -1
+                message = a?.getOrNull(1) as? String ?: ""
+                info = a?.getOrNull(2)
+                latch.countDown()
+            }
+            defaultValueFor(m.returnType)
+        }
+        try {
+            method.invoke(service, uin, callback)
+        } catch (t: Throwable) {
+            Log.w(TAG, "addFriend: getUserDetailInfoByUin invoke failed: ${t.javaClass.simpleName} ${t.message}")
+            return null
+        }
+        latch.await(2, TimeUnit.SECONDS)
+        val data = info
+        Log.i(TAG, "addFriend: lookupUserByUin($uin) code=$code msg=$message found=${data != null}")
+        if (code != 0 || data == null) return null
+        val uid = (invokeGetter(data, "getUid") as? String).orEmpty()
+        val realUin = (invokeGetter(data, "getUin") as? Number)?.toLong()?.takeIf { it > 0L } ?: uin
+        // 搜群号时这个接口会返回「空壳 ProfileDetailInfo」：uid 为空、nick/remark 全空。
+        // 只有 uid 非空且 nick/remark 至少有一个非空白，才算真实用户，否则丢弃（避免出现「QQ用户/QQ号:群号」假卡片）。
+        val nickRaw = listOf("getNick", "getRemark").firstNotNullOfOrNull { getter ->
+            (invokeGetter(data, getter) as? String)?.trim()?.takeIf { it.isNotEmpty() }
+        }
+        Log.i(
+            TAG,
+            "addFriend: lookupUserByUin($uin) profile uid=${uid.take(16)} uin=$realUin " +
+                "nick=$nickRaw avatar=${(invokeGetter(data, "getAvatarUrl") as? String)?.take(40)}",
+        )
+        if (uid.isBlank() || nickRaw == null) {
+            Log.i(
+                TAG,
+                "addFriend: lookupUserByUin($uin) ignore shell profile (uid blank=${uid.isBlank()} " +
+                    "nick blank=${nickRaw == null})",
+            )
+            return null
+        }
+        return AddFriendUser(uid, realUin, nickRaw, userAvatarPath(uid, realUin), "QQ号: $realUin")
+    }
+
+    /** 精确群号兜底：IGroupInfoForJoinCallback 确认群是否存在（拿不到群名时用「群聊 <群号>」）。 */
+    private fun probeAddFriendGroupByCode(groupCode: Long): AddFriendGroup? {
+        val service = waitForService(timeoutMs = 1_500L) { groupKernelService() } ?: return null
+        val cl = hostClassLoader() ?: return null
+        val callbackClass = runCatching {
+            Class.forName("com.tencent.qqnt.kernel.nativeinterface.IGroupInfoForJoinCallback", false, cl)
+        }.getOrNull() ?: return null
+        val method = reflectMethod(service, "getGroupInfoForJoinGroup", 4) ?: return null
+        val latch = CountDownLatch(1)
+        var code = -1
+        var message = ""
+        var rsp: Any? = null
+        val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, m, a ->
+            if (m.name == "onResult") {
+                code = (a?.getOrNull(0) as? Number)?.toInt() ?: -1
+                message = a?.getOrNull(1) as? String ?: ""
+                rsp = a?.getOrNull(2)
+                latch.countDown()
+            }
+            defaultValueFor(m.returnType)
+        }
+        try {
+            // TIM 非群成员场景：isTroopMember=false → (true, 111)（见 TroopInfoRepo.fetchTroopJoinType）。
+            method.invoke(service, groupCode, true, 111, callback)
+        } catch (t: Throwable) {
+            Log.w(TAG, "addFriend: getGroupInfoForJoinGroup invoke failed: ${t.javaClass.simpleName} ${t.message}")
+            return null
+        }
+        latch.await(2, TimeUnit.SECONDS)
+        val rspCode = (rsp?.let { invokeGetter(it, "getGroupCode") } as? Number)?.toLong() ?: 0L
+        Log.i(TAG, "addFriend: getGroupInfoForJoinGroup($groupCode) code=$code msg=$message rspCode=$rspCode")
+        if (code != 0 || rspCode == 0L) return null
+        return AddFriendGroup(
+            groupCode = rspCode,
+            name = "群聊 $rspCode",
+            avatarPath = groupAvatarPath(rspCode, false) ?: legacyAvatarPath(4, rspCode),
+            detail = "群号: $rspCode",
+        )
+    }
+
+    /** 加好友/群搜索：本地会话/联系人匹配 + TIM SummaryCard 精确查找；失败返回 null，空结果返回空对象。 */
+    fun searchAddFriend(keyword: String): AddFriendSearchResult? {
+        if (!isHost) return null
+        val query = keyword.trim()
+        if (query.isEmpty()) return null
+        if (!ensureServices()) return null
+        synchronized(addFriendSearchLock) {
+            val users = LinkedHashMap<String, AddFriendUser>()
+            val groups = LinkedHashMap<Long, AddFriendGroup>()
+            runCatching { collectLocalAddFriendMatches(query, users, groups) }
+                .onFailure {
+                    Log.w(TAG, "addFriend: local search failed: ${it.javaClass.simpleName} ${it.message}")
+                }
+            val numeric = query.toLongOrNull()?.takeIf { it > 0L }
+            // 找人：QQ号 / 手机号 / 邮箱走远程精确查找；纯昵称只匹配本地联系/会话。
+            val looksExact = numeric != null || query.contains('@')
+            // 手机号（11 位、1 开头）只找人；5 位以上数字同时查群号（TIM 的 guessIsTroopUin 规则）。
+            val isPhoneLike = query.matches(Regex("^1\\d{10}$"))
+            // 找群：数字（群号）和纯昵称都走远程 SummaryCard 群搜索（TIM 原生加好友页同样支持按群名搜）。
+            val withGroups = (numeric != null && !isPhoneLike && query.length in 5..12) || numeric == null
+            val (remoteUsers, remoteGroups) = if (looksExact || withGroups) {
+                remoteAddFriendSearch(
+                    query,
+                    withUsers = looksExact,
+                    withGroups = withGroups,
+                )
+            } else {
+                Log.i(TAG, "addFriend: skip remote search (keyword=\"$query\" phone-like)")
+                emptyList<AddFriendUser>() to emptyList<AddFriendGroup>()
+            }
+            remoteUsers.forEach { user -> users.putIfAbsent(addFriendUserKey(user), user) }
+            // 兜底：SummaryCard 没查到人且关键词是数字时，再试内核 profile 接口。
+            if (users.isEmpty() && numeric != null) {
+                runCatching { lookupAddFriendUserByUin(numeric) }.getOrNull()?.let { user ->
+                    users.putIfAbsent(addFriendUserKey(user), user)
+                }
+            }
+            remoteGroups.forEach { group -> groups.putIfAbsent(group.groupCode, group) }
+            if (groups.isEmpty() && withGroups && numeric != null) {
+                runCatching { probeAddFriendGroupByCode(numeric) }.getOrNull()?.let { group ->
+                    groups.putIfAbsent(group.groupCode, group)
+                }
+            }
+            // 同一个 QQ 号可能同时由本地好友和远端结果命中：按 uin 去重，优先保留有 uid 的。
+            val dedupedUsers = LinkedHashMap<Long, AddFriendUser>()
+            val noUinUsers = ArrayList<AddFriendUser>()
+            users.values.forEach { user ->
+                if (user.uin == 0L) {
+                    noUinUsers.add(user)
+                    return@forEach
+                }
+                val existing = dedupedUsers[user.uin]
+                if (existing == null || (existing.uid.isBlank() && user.uid.isNotBlank())) {
+                    dedupedUsers[user.uin] = user
+                }
+            }
+            var uniqueUsers = dedupedUsers.values.toList() + noUinUsers
+            // 兜底占位：5~12 位纯数字关键词、既没找到人也没找到群时，给一张可点击的占位卡片，
+            // 让用户进入「加好友验证页」发送请求（QQ 号搜索在新登录账号上可能 SummaryCard 无结果）。
+            // 注意：已经找到群结果时不再加占位个人，避免出现假个人卡片。
+            if (uniqueUsers.isEmpty() && groups.isEmpty() && query.matches(Regex("^\\d{5,12}$"))) {
+                val number = query.toLongOrNull()
+                if (number != null && number > 0L) {
+                    val phoneLike = query.matches(Regex("^1\\d{10}$"))
+                    val placeholder = if (phoneLike) {
+                        AddFriendUser(
+                            uid = "",
+                            uin = 0L,
+                            name = "手机号用户",
+                            avatarPath = null,
+                            detail = "手机号: $query",
+                            phone = query,
+                        )
+                    } else {
+                        AddFriendUser(
+                            uid = "",
+                            uin = number,
+                            name = "QQ用户",
+                            avatarPath = userAvatarPath("", number),
+                            detail = "QQ号: $query",
+                        )
+                    }
+                    uniqueUsers = listOf(placeholder)
+                    Log.i(
+                        TAG,
+                        "addFriend: search(\"$query\") no result -> placeholder " +
+                            "uin=${placeholder.uin} phone=${placeholder.phone} name=${placeholder.name}",
+                    )
+                }
+            }
+            Log.i(
+                TAG,
+                "addFriend: search(\"$query\") users=${uniqueUsers.size} groups=${groups.size} " +
+                    "remoteUsers=${remoteUsers.size} remoteGroups=${remoteGroups.size}",
+            )
+            return AddFriendSearchResult(uniqueUsers, groups.values.toList())
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 加好友 / 加群 / 扫一扫 / 创建群聊（QRoute 原生页 + 内核请求）
+    // ---------------------------------------------------------------------
+
+    /** 加好友来源：3017=条件查找（与 TIM「搜索结果点加好友」同款参数）。 */
+    private const val ADD_FRIEND_SOURCE_ID = 3017
+    private const val ADD_FRIEND_SOURCE_SUB_ID = 1
+
+    /** 加群来源：sourceId=3 / sourceSubId=0（见 JoinTroopParam.a() → ReqToGroup 的构造）。 */
+    private const val JOIN_GROUP_SOURCE_ID = 3
+    private const val JOIN_GROUP_SOURCE_SUB_ID = 0
+
+    private fun hostContext(): Context? = runCatching { AppEnvironment.context }.getOrNull()
+
+    /**
+     * 取宿主进程里的真实 Activity：UiHost 传给 AppEnvironment 的是 ModuleContext(Activity)，逐层解包即可。
+     * 建群链路需要 Activity（TIM 的 TroopCreateServiceImpl.startCreateTroop 会把 WeakReference(activity) 传进去）。
+     */
+    private fun hostActivity(): Activity? {
+        var ctx: Context? = hostContext() ?: return null
+        var guard = 0
+        while (ctx != null && guard++ < 8) {
+            if (ctx is Activity) return ctx
+            ctx = (ctx as? android.content.ContextWrapper)?.baseContext
+        }
+        return null
+    }
+
+    /** 从 ContactItem.id（tim_friend_<uid>）解析内核 uid。 */
+    private fun contactItemUid(item: ContactItem): String? {
+        val id = item.id
+        val uid = id.removePrefix("tim_friend_")
+        if (uid != id && uid.isNotBlank()) return uid
+        if (id.isNotBlank() && !id.startsWith("tim_")) return id
+        return null
+    }
+
+    /**
+     * 把 QQ 号解析成内核 uid（TIM 搜索结果只有 uin 时，加好友内核路径需要 uid）。
+     * 用 wrapper IKernelProfileService.getUidByUin(callFrom, ArrayList<uin>)：同步返回 HashMap。
+     */
+    private fun resolveUidByUin(uin: Long): String? {
+        if (uin <= 0L) return null
+        val service = profileService ?: return null
+        // 注意：IKernelProfileService.getUidByUin(String, ArrayList<Long>) 的列表元素必须是 Long，
+        // 传 String 会在 native 层抛异常并触发 JNI FatalError（实测进程 SIGABRT 崩溃）。
+        val map = runCatching {
+            service.javaClass.methods
+                .firstOrNull { it.name == "getUidByUin" && it.parameterCount == 2 }
+                ?.invoke(service, "Material3Tim", arrayListOf(uin)) as? Map<*, *>
+        }.getOrNull()
+        if (map == null || map.isEmpty()) {
+            Log.i(TAG, "addFriend: resolveUidByUin($uin) empty")
+            return null
+        }
+        val uid = map.entries.firstNotNullOfOrNull { (key, value) ->
+            when {
+                value is String && value.isNotBlank() -> value
+                key is String && key.startsWith("u_") -> key
+                else -> null
+            }
+        }
+        Log.i(TAG, "addFriend: resolveUidByUin($uin) -> ${uid?.take(16)} (size=${map.size})")
+        return uid
+    }
+
+    /** TIM 加好友 Verify.type（token 型校验）。 */
+    private const val ADD_FRIEND_VERIFY_TYPE = 0
+
+    /** 手机号搜索加好友来源（TIM AddFriendActivity：手机号结果 → startProfileCardActivity → AllInOne(mobile,36,sourceID=3014)）。 */
+    private const val ADD_FRIEND_PHONE_SOURCE_ID = 3014
+    private const val ADD_FRIEND_PHONE_SOURCE_SUB_ID = 0
+
+    /** TIM 原生加好友 NT 命令兜底值（com.tencent.mobileqq.addfriend.api.a.f81140k.a() 在 TIM 4.1 上为 "0x7c2"）。 */
+    private const val ADD_FRIEND_NT_CMD_FALLBACK = "0x7c2"
+
+    /** TIM 查询好友设置 NT 命令兜底值（f81140k.b() 在 TIM 4.1 上为 "0x7c1"，即 NTAddFriendHandler.N1）。 */
+    private const val ADD_FRIEND_SETTING_CMD_FALLBACK = "0x7c1"
+
+    /** 好友设置查询等待超时（方案 A 的 ResultReceiver 捷径）。 */
+    private const val FRIEND_SETTING_QUERY_TIMEOUT_MS = 8_000L
+
+    /**
+     * 内核带验证信息的加好友请求（仅 NT 全失败后的兜底；TIM 产品自身不调用该接口）：
+     * IKernelBuddyService.reqToAddFriends(ReqToFriend{buddyUid/buddyUin/phoneNumber/verifyInfo/remark/
+     * sourceID/sourceSubID/securityVerify=Verify(type,token,ticket,randStr)}, IOperateCallback)。
+     *
+     * @param includePhoneNumber 手机号无 uin 时置 true（带 phoneNumber+token）；解析出 QQ 号后置 false 走纯 QQ 号加好友。
+     * @return 回调 code（0=成功）；本地无法调用返回 -1。
+     */
+    private fun requestAddFriendByKernelVerify(
+        user: AddFriendUser,
+        message: String,
+        sourceId: Int,
+        subSourceId: Int,
+        includePhoneNumber: Boolean,
+        includeToken: Boolean,
+        addFriendSetting: Int,
+    ): Int {
+        val label = "uid=${user.uid.take(16)} uin=${user.uin} " +
+            "phone=${if (includePhoneNumber) user.phone else ""} " +
+            "tokenLen=${if (includeToken) user.token.length else 0} " +
+            "source=$sourceId/$subSourceId friend_setting=$addFriendSetting"
+        val service = waitForService(timeoutMs = 1_500L) { nativeBuddyService() } ?: run {
+            Log.w(TAG, "addFriend: requestAddFriend($label) native buddy service unavailable")
+            return -1
+        }
+        val cl = hostClassLoader() ?: return -1
+        val reqClass = runCatching {
+            Class.forName("com.tencent.qqnt.kernel.nativeinterface.ReqToFriend", false, cl)
+        }.getOrNull() ?: run {
+            Log.w(TAG, "addFriend: requestAddFriend($label) ReqToFriend class missing")
+            return -1
+        }
+        val req = runCatching { reqClass.getConstructor().newInstance() }.getOrNull() ?: return -1
+        try {
+            // 所有 String 字段都显式赋值：ReqToFriend 无参构造只把 buddyUid/phoneNumber 置 ""，
+            // 其余 String 是 null，直接给 JNI 有 NPE/崩溃风险。
+            reqClass.getField("buddyUid").set(req, user.uid)
+            reqClass.getField("buddyUin").setLong(req, user.uin)
+            reqClass.getField("phoneNumber").set(req, if (includePhoneNumber) user.phone else "")
+            reqClass.getField("verifyInfo").set(req, message)
+            // NT AddBuddyReq.answer 才是 TIM 验证消息字段；kernel reqToAddFriends 的 verifyInfo 服务端可能忽略，
+            // 这里同时把 answer 设成 message，作为 NT 失败后的第二尝试。
+            reqClass.getField("answer").set(req, message)
+            reqClass.getField("remark").set(req, user.name)
+            reqClass.getField("sourceID").setInt(req, sourceId)
+            reqClass.getField("sourceSubID").setInt(req, subSourceId)
+            reqClass.getField("addFriendSetting").setInt(req, addFriendSetting)
+            if (includeToken && user.token.isNotBlank()) {
+                val verifyClass = Class.forName(
+                    "com.tencent.qqnt.kernel.nativeinterface.Verify", false, cl,
+                )
+                val verify = verifyClass.getConstructor(
+                    Int::class.javaPrimitiveType,
+                    String::class.java,
+                    String::class.java,
+                    String::class.java,
+                ).newInstance(ADD_FRIEND_VERIFY_TYPE, user.token, "", "")
+                reqClass.getField("securityVerify").set(req, verify)
+                Log.i(
+                    TAG,
+                    "addFriend: requestAddFriend($label) securityVerify type=$ADD_FRIEND_VERIFY_TYPE " +
+                        "token=${user.token.take(96)} ticket=\"\" randStr=\"\"",
+                )
+            } else {
+                Log.i(TAG, "addFriend: requestAddFriend($label) no token, verifyInfo only")
+            }
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "addFriend: requestAddFriend($label) fill ReqToFriend failed: " +
+                    "${t.javaClass.simpleName} ${t.message}",
+            )
+            return -1
+        }
+        val callbackClass = runCatching {
+            Class.forName("com.tencent.qqnt.kernel.nativeinterface.IOperateCallback", false, cl)
+        }.getOrNull() ?: return -1
+        val latch = CountDownLatch(1)
+        var code = -1
+        var message2 = ""
+        val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, m, a ->
+            if (m.name == "onResult") {
+                code = (a?.getOrNull(0) as? Number)?.toInt() ?: -1
+                message2 = a?.getOrNull(1) as? String ?: ""
+                latch.countDown()
+            }
+            defaultValueFor(m.returnType)
+        }
+        val method = reflectMethod(service, "reqToAddFriends", 2) ?: run {
+            Log.w(TAG, "addFriend: requestAddFriend($label) reqToAddFriends not found")
+            return -1
+        }
+        try {
+            method.invoke(service, req, callback)
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "addFriend: requestAddFriend($label) reqToAddFriends invoke failed: " +
+                    "${t.javaClass.simpleName} ${t.message}",
+            )
+            return -1
+        }
+        latch.await(8, TimeUnit.SECONDS)
+        Log.i(TAG, "addFriend: reqToAddFriends code=$code msg=$message2 ($label)")
+        return code
+    }
+
+    /** 取 runtime service（AppRuntime.getRuntimeService(Class, processName)）。 */
+    private fun runtimeService(className: String, process: String = "all"): Any? {
+        val runtime = appRuntime ?: return null
+        val cl = hostClassLoader() ?: return null
+        return runCatching {
+            val cls = Class.forName(className, false, cl)
+            runtime.javaClass.methods
+                .firstOrNull { it.name == "getRuntimeService" && it.parameterCount == 2 }
+                ?.invoke(runtime, cls, process)
+        }.getOrNull()
+    }
+
+    private fun selfUinText(): String {
+        val runtime = appRuntime ?: return ""
+        return (invokeGetter(runtime, "getCurrentUin") as? String)
+            ?: (invokeGetter(runtime, "getAccount") as? String)
+            ?: ""
+    }
+
+    /** IKernelService.getAddOrDelBuddyService()（com.tencent.qqnt.kernel.api.f：addBuddy/requestInfoByAccount 等）。 */
+    private fun addOrDelBuddyService(): Any? {
+        val kernelService = runtimeService("com.tencent.qqnt.kernel.api.IKernelService") ?: return null
+        return kernelService.javaClass.methods
+            .firstOrNull { it.name == "getAddOrDelBuddyService" && it.parameterCount == 0 }
+            ?.invoke(kernelService)
+    }
+
+    /** resolveAccountByPhone 的解析结果。 */
+    private class ResolvedAccount(val uin: Long, val uid: String, val nick: String)
+
+    /** 一次 NT addBuddy 的结果（含服务端返回的 sig，用于失败后带 sig 重试）。 */
+    private class NtAddBuddyOutcome(
+        val code: Int,
+        val result: Int,
+        val errorCode: Int,
+        val errorString: String,
+        val verify: ByteArray?,
+        val sig: ByteArray?,
+        val verifyLen: Int,
+    )
+
+    /**
+     * 用内核 IKernelAddBuddyService.requestInfoByAccount(String callFrom, AccountInfo, byte[] sig,
+     * IGetBuddyInfoCallback) 按手机号解析目标账号：
+     * AccountInfo.phoneNum = 手机号（依次试 纯11位 / "+86"前缀 / "86"前缀），sig=byte[0]；
+     * 回调 IGetBuddyInfoCallback.onResult(code, msg, byte[], AccountInfo 请求体, BuddyInfoRsp)，
+     * BuddyInfoRsp.targetInfo(AccountInfo.uin/uid/phoneNum) + BuddyInfoRsp.nick。
+     * 总超时 8s（多格式共享 deadline）。
+     *
+     * @return 解析出的 uin/uid/nick；失败返回 null。
+     */
+    private fun resolveAccountByPhone(phone: String): ResolvedAccount? {
+        val trimmed = phone.trim()
+        if (trimmed.isBlank()) return null
+        val cl = hostClassLoader() ?: return null
+        val infoClass = runCatching {
+            Class.forName("com.tencent.qqnt.kernel.nativeinterface.AccountInfo", false, cl)
+        }.getOrNull() ?: run {
+            Log.w(TAG, "addFriend: resolveAccountByPhone AccountInfo class missing")
+            return null
+        }
+        val callbackClass = runCatching {
+            Class.forName("com.tencent.qqnt.kernel.nativeinterface.IGetBuddyInfoCallback", false, cl)
+        }.getOrNull() ?: run {
+            Log.w(TAG, "addFriend: resolveAccountByPhone IGetBuddyInfoCallback class missing")
+            return null
+        }
+        val service = addOrDelBuddyService() ?: run {
+            Log.w(TAG, "addFriend: resolveAccountByPhone addOrDelBuddyService unavailable")
+            return null
+        }
+        val method = service.javaClass.methods
+            .firstOrNull { it.name == "requestInfoByAccount" && it.parameterCount == 4 }
+            ?: run {
+                Log.w(TAG, "addFriend: resolveAccountByPhone requestInfoByAccount not found")
+                return null
+            }
+        val deadline = System.currentTimeMillis() + 8_000L
+        val variants = linkedSetOf(trimmed, "+86$trimmed", "86$trimmed")
+        variants.forEach { phoneText ->
+            val remaining = deadline - System.currentTimeMillis()
+            if (remaining <= 0L) return@forEach
+            val latch = CountDownLatch(1)
+            var code = -1
+            var message = ""
+            var rsp: Any? = null
+            val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, m, a ->
+                if (m.name == "onResult") {
+                    code = (a?.getOrNull(0) as? Number)?.toInt() ?: -1
+                    message = a?.getOrNull(1) as? String ?: ""
+                    rsp = a?.getOrNull(4)
+                    latch.countDown()
+                }
+                defaultValueFor(m.returnType)
+            }
+            val accountInfo = infoClass.getConstructor().newInstance()
+            infoClass.getField("phoneNum").set(accountInfo, phoneText)
+            try {
+                method.invoke(service, "Material3Tim", accountInfo, ByteArray(0), callback)
+            } catch (t: Throwable) {
+                Log.w(
+                    TAG,
+                    "addFriend: requestInfoByAccount(phone=$phoneText) invoke failed: " +
+                        "${t.javaClass.simpleName} ${t.message}",
+                )
+                return@forEach
+            }
+            val answered = latch.await(maxOf(500L, remaining), TimeUnit.MILLISECONDS)
+            val buddyRsp = rsp
+            val targetInfo = buddyRsp?.let { invokeGetter(it, "getTargetInfo") }
+            val uin = (targetInfo?.let { invokeGetter(it, "getUin") } as? Number)?.toLong() ?: 0L
+            val uid = (targetInfo?.let { invokeGetter(it, "getUid") } as? String).orEmpty()
+            val nick = (buddyRsp?.let { invokeGetter(it, "getNick") } as? String).orEmpty()
+            Log.i(
+                TAG,
+                "addFriend: requestInfoByAccount(phone=$phoneText) -> answered=$answered " +
+                    "code=$code msg=$message uin=$uin uid=${uid.take(16)} nick=$nick",
+            )
+            if (answered && code == 0 && (uin > 0L || uid.isNotBlank())) {
+                return ResolvedAccount(uin, uid, nick)
+            }
+        }
+        Log.w(TAG, "addFriend: resolveAccountByPhone($trimmed) failed (no uin/uid)")
+        return null
+    }
+
+    /** TIM 原生加好友命令字符串：com.tencent.mobileqq.addfriend.api.a.f81140k.a()（本版本 "0x7c2"）。 */
+    private fun addFriendNtCommand(): String = runCatching {
+        val cl = hostClassLoader() ?: return@runCatching ADD_FRIEND_NT_CMD_FALLBACK
+        val apiClass = Class.forName("com.tencent.mobileqq.addfriend.api.a", false, cl)
+        val companion = apiClass.getField("f81140k").get(null)
+            ?: return@runCatching ADD_FRIEND_NT_CMD_FALLBACK
+        companion.javaClass.methods
+            .firstOrNull { it.name == "a" && it.parameterCount == 0 }
+            ?.invoke(companion) as? String ?: ADD_FRIEND_NT_CMD_FALLBACK
+    }.getOrDefault(ADD_FRIEND_NT_CMD_FALLBACK)
+
+    /**
+     * 查询目标用户的加好友设置（UI 进入验证页前按设置渲染）：
+     * 0=允许任何人；1=需要验证信息；2/3/4=需要回答问题（[AddFriendSettingInfo.questions] 为 TIM user_question）。
+     * - uin>0：必要时用 resolveUidByUin 补 uid；
+     * - uin<=0 且有手机号：先用 resolveAccountByPhone 解析出 uin/uid，失败返回 null；
+     * - 复用 TIM NT getBuddySetting（NTAddFriendHandler.N1 + ResultReceiver 捷径，8s）。
+     * 阻塞，需在 IO 线程调用。
+     */
+    fun queryFriendSettingInfo(user: AddFriendUser): AddFriendSettingInfo? {
+        if (!isHost) return null
+        if (!ensureServices()) return null
+        var effective = user
+        if (effective.uin > 0L) {
+            if (effective.uid.isBlank()) {
+                resolveUidByUin(effective.uin)?.let { uid ->
+                    Log.i(
+                        TAG,
+                        "addFriend: queryFriendSettingInfo resolved uid=${uid.take(16)} " +
+                            "for uin=${effective.uin}",
+                    )
+                    effective = effective.copy(uid = uid)
+                }
+            }
+        } else if (effective.phone.isNotBlank()) {
+            val resolved = runCatching { resolveAccountByPhone(effective.phone) }.getOrNull()
+            if (resolved == null || (resolved.uin <= 0L && resolved.uid.isBlank())) {
+                Log.w(
+                    TAG,
+                    "addFriend: queryFriendSettingInfo(phone=${user.phone}) failed -> null " +
+                        "(resolveAccountByPhone failed)",
+                )
+                return null
+            }
+            Log.i(
+                TAG,
+                "addFriend: queryFriendSettingInfo resolved phone=${user.phone} -> " +
+                    "uin=${resolved.uin} uid=${resolved.uid.take(16)} nick=${resolved.nick}",
+            )
+            effective = effective.copy(uin = resolved.uin, uid = resolved.uid.ifBlank { effective.uid })
+        }
+        if (effective.uin <= 0L) {
+            Log.w(
+                TAG,
+                "addFriend: queryFriendSettingInfo(uid=${effective.uid.take(16)}) failed -> null (no uin)",
+            )
+            return null
+        }
+        val queried = runCatching {
+            queryFriendSetting(
+                effective.uin.toString(),
+                ADD_FRIEND_SOURCE_ID,
+                ADD_FRIEND_SOURCE_SUB_ID,
+            )
+        }.getOrNull()
+        if (queried == null) {
+            Log.w(
+                TAG,
+                "addFriend: queryFriendSettingInfo(uin=${effective.uin} " +
+                    "uid=${effective.uid.take(16)}) failed -> null",
+            )
+            return null
+        }
+        val setting = queried.first
+        val questions = queried.second?.filterNotNull()?.filter { it.isNotBlank() } ?: emptyList()
+        Log.i(
+            TAG,
+            "addFriend: queryFriendSettingInfo(uin=${effective.uin} " +
+                "uid=${effective.uid.take(16)}) -> setting=$setting questions=${questions.size}",
+        )
+        return AddFriendSettingInfo(setting = setting, questions = questions)
+    }
+
+    /** TIM 查询好友设置命令：com.tencent.mobileqq.addfriend.api.a.f81140k.b()（本版本 "0x7c1"）。 */
+    private fun addFriendSettingCommand(): String = runCatching {
+        val cl = hostClassLoader() ?: return@runCatching ADD_FRIEND_SETTING_CMD_FALLBACK
+        val apiClass = Class.forName("com.tencent.mobileqq.addfriend.api.a", false, cl)
+        val companion = apiClass.getField("f81140k").get(null)
+            ?: return@runCatching ADD_FRIEND_SETTING_CMD_FALLBACK
+        companion.javaClass.methods
+            .firstOrNull { it.name == "b" && it.parameterCount == 0 }
+            ?.invoke(companion) as? String ?: ADD_FRIEND_SETTING_CMD_FALLBACK
+    }.getOrDefault(ADD_FRIEND_SETTING_CMD_FALLBACK)
+
+    /**
+     * 查询对方「加好友设置」（等价 TIM AddFriendCheckFragment.b7() → NTAddFriendHandler.N1）：
+     * v.d("friend.add.service", selfUin, f81140k.b()) + Bundle(uin/source_id/sub_source_id/random_key/extra)，
+     * 额外塞入 isFromZPlan=true + zplanResultReceiver（android.os.ResultReceiver）。
+     * TIM 的 addfriend/handler/receiver/g.java 在回包成功时会把 friend_setting/user_question/
+     * contact_bothway/query_friend_uin 放进同一个 Bundle 并 resultReceiver.send(result, bundle)。
+     *
+     * @return (friend_setting, questions)；超时/失败返回 null。
+     */
+    private fun queryFriendSetting(
+        uinText: String,
+        sourceId: Int,
+        subSourceId: Int,
+        extraUin: String = "",
+    ): Pair<Int, ArrayList<String?>?>? {
+        if (uinText.isBlank()) return null
+        val cl = hostClassLoader() ?: return null
+        return try {
+            val vdClass = Class.forName("com.tencent.qqnt.v.d", false, cl)
+            val randomKey = (System.currentTimeMillis() and 0x7fffffff).toInt()
+            val vd = vdClass.getConstructor(
+                String::class.java,
+                String::class.java,
+                String::class.java,
+            ).newInstance("friend.add.service", selfUinText(), addFriendSettingCommand())
+            val bundle = vdClass.getMethod("a").invoke(vd) as? android.os.Bundle
+                ?: return null
+            bundle.putString("uin", uinText)
+            bundle.putInt("source_id", sourceId)
+            bundle.putInt("sub_source_id", subSourceId)
+            bundle.putInt("random_key", randomKey)
+            if (extraUin.isNotBlank()) bundle.putString("extra", extraUin)
+            val latch = CountDownLatch(1)
+            var resultCode = -1
+            var friendSetting = -1
+            var questions: ArrayList<String?>? = null
+            var contactBothWay = false
+            var queryUin = 0L
+            val receiver = AddFriendSettingResultReceiver(
+                android.os.Handler(android.os.Looper.getMainLooper()),
+            ) { code, data ->
+                resultCode = code
+                if (data != null) {
+                    friendSetting = data.getInt("friend_setting", -1)
+                    @Suppress("UNCHECKED_CAST")
+                    questions = data.getStringArrayList("user_question") as? ArrayList<String?>
+                    contactBothWay = data.getBoolean("contact_bothway", false)
+                    queryUin = data.getLong("query_friend_uin", 0L)
+                }
+                latch.countDown()
+            }
+            bundle.putBoolean("isFromZPlan", true)
+            bundle.putParcelable("zplanResultReceiver", receiver)
+            val servletClass = Class.forName(
+                "com.tencent.mobileqq.addfriend.api.impl.AddFriendNTServlet", false, cl,
+            )
+            val servlet = servletClass.getConstructor().newInstance()
+            val send = servletClass.methods.firstOrNull { m ->
+                m.name == "a" && m.parameterCount == 2 &&
+                    m.parameterTypes[0] == String::class.java
+            }
+            if (send == null) {
+                Log.w(TAG, "addFriend: queryFriendSetting($uinText) servlet.a not found")
+                return null
+            }
+            send.invoke(servlet, "Material3Tim", vd)
+            Log.i(
+                TAG,
+                "addFriend: queryFriendSetting(uin=$uinText) sent source=$sourceId/$subSourceId " +
+                    "randomKey=$randomKey cmd=${addFriendSettingCommand()}",
+            )
+            val answered = latch.await(FRIEND_SETTING_QUERY_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            Log.i(
+                TAG,
+                "addFriend: NT getBuddySetting via ResultReceiver($uinText) answered=$answered " +
+                    "resultCode=$resultCode friend_setting=$friendSetting " +
+                    "questions=$questions contact=$contactBothWay queryUin=$queryUin",
+            )
+            if (answered && resultCode == 0 && friendSetting >= 0) {
+                friendSetting to questions
+            } else {
+                null
+            }
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "addFriend: queryFriendSetting($uinText) failed: " +
+                    "${t.javaClass.simpleName} ${t.message}",
+            )
+            null
+        }
+    }
+
+    /**
+     * TIM 原生加好友验证页真实发送链路：
+     * new com.tencent.qqnt.v.d("mobileqq.service", selfUin, cmd) → 填 NTAddFriendHandler.H1 同款 Bundle →
+     * AddFriendNTCoder(com.tencent.mobileqq.addfriend.api.impl.a).g(v.d) 组 AddBuddyReq →
+     * IKernelService.getAddOrDelBuddyService().addBuddy(callFrom, req, byte[0], IAddBuddyCallback)。
+     * 成功判定与 TIM NTFriendAddReceiver 一致：AddBuddyRsp.result == 0。
+     *
+     * 注意 AddFriendNTCoder 对 sourceId 有分支：sourceId=3014（手机号入口）时把 friendUinText 写进
+     * AddBuddyReq.name（手机号+token 校验路径，无 targetInfo）；其它 sourceId（如 3017）则解析成
+     * AccountInfo(targetInfo.uin/uid) 走 QQ 号路径。
+     *
+     * @param friendUinText 手机号路径传手机号，QQ 号路径传 QQ 号。
+     * @param sig AddBuddyReq.sig（TIM 在失败重试时用上一轮 AddBuddyRsp.sig；首轮传 null）。
+     * @return 带服务端 code/result/errorCode/verify/sig；本地失败返回 null。
+     */
+    private fun requestAddFriendByNtAddBuddy(
+        user: AddFriendUser,
+        message: String,
+        sourceId: Int,
+        subSourceId: Int,
+        friendUinText: String,
+        friendUid: String,
+        styleLabel: String,
+        includeToken: Boolean,
+        friendSetting: Int,
+        sig: ByteArray? = null,
+    ): NtAddBuddyOutcome? {
+        val cl = hostClassLoader() ?: return null
+        if (friendUinText.isBlank()) return null
+        val targetUinText = friendUinText
+        val label = "style=$styleLabel uin=$targetUinText uid=${friendUid.take(16)} " +
+            "source=$sourceId/$subSourceId friend_setting=$friendSetting msgLen=${message.length} " +
+            "tokenLen=${if (includeToken) user.token.length else 0} sigLen=${sig?.size ?: 0}"
+        return try {
+            val vdClass = Class.forName("com.tencent.qqnt.v.d", false, cl)
+            val vd = vdClass.getConstructor(
+                String::class.java,
+                String::class.java,
+                String::class.java,
+            ).newInstance("mobileqq.service", selfUinText(), addFriendNtCommand())
+            val bundle = vdClass.getMethod("a").invoke(vd) as? android.os.Bundle
+                ?: return null
+            bundle.putString("uin", targetUinText)
+            bundle.putString("uid", friendUid)
+            bundle.putInt("friend_setting", friendSetting)
+            bundle.putInt("group_id", 0)
+            bundle.putString("msg", message)
+            bundle.putInt("source_id", sourceId)
+            bundle.putByte("show_my_card", 0.toByte())
+            bundle.putInt("sub_source_id", subSourceId)
+            bundle.putString("extra", "")
+            bundle.putBoolean("auto_send", true)
+            // TIM AddFriendSendPart.n5 的 bArr=sig 来自 bundle.getByteArray("sig")（失败重试用上一轮 rsp.sig）。
+            bundle.putByteArray("sig", sig)
+            bundle.putBoolean("contact_bothway", false)
+            bundle.putString("remark", user.name)
+            bundle.putString("src_name", "")
+            bundle.putByteArray("third_source_id", null)
+            if (includeToken && user.token.isNotBlank()) {
+                // TIM 原生链路 token 是 byte[]：record.bytes_token 原始字节，即 token 字符串（ASCII）的 UTF-8 字节。
+                bundle.putByteArray("flc_add_frd_token", user.token.toByteArray(Charsets.UTF_8))
+            }
+            bundle.putString("security_ticket", "")
+            // TIM AddFriendSendPart.n5 调 J1 时 isSupportSecurityTips 固定传 true。
+            bundle.putBoolean("security_ticket_support", true)
+            Log.i(
+                TAG,
+                "addFriend: NT addBuddy prepare ($label) " +
+                    "bundle[uin=${bundle.getString("uin")}, uid=${bundle.getString("uid")}, " +
+                    "msgLen=${bundle.getString("msg")?.length ?: 0}, " +
+                    "source=${bundle.getInt("source_id")}/${bundle.getInt("sub_source_id")}, " +
+                    "friend_setting=${bundle.getInt("friend_setting")}, " +
+                    "remarkLen=${bundle.getString("remark")?.length ?: 0}, " +
+                    "tokenLen=${bundle.getByteArray("flc_add_frd_token")?.size ?: 0}, " +
+                    "sigLen=${bundle.getByteArray("sig")?.size ?: 0}, " +
+                    "answer(AddBuddyReq)=msg]",
+            )
+
+            val coder = Class.forName(
+                "com.tencent.mobileqq.addfriend.api.impl.a", false, cl,
+            ).getConstructor().newInstance()
+            val req = coder.javaClass.getMethod("g", vdClass).invoke(coder, vd)
+            if (req == null) {
+                Log.w(TAG, "addFriend: NT addBuddy($label) AddFriendNTCoder.g returned null")
+                return null
+            }
+            val buddyService = addOrDelBuddyService()
+            if (buddyService == null) {
+                Log.w(TAG, "addFriend: NT addBuddy($label) getAddOrDelBuddyService null")
+                return null
+            }
+            val addBuddyMethod = buddyService.javaClass.methods
+                .firstOrNull { it.name == "addBuddy" && it.parameterCount == 4 }
+            if (addBuddyMethod == null) {
+                Log.w(TAG, "addFriend: NT addBuddy($label) addBuddy method not found")
+                return null
+            }
+            val callbackClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.IAddBuddyCallback", false, cl,
+            )
+            val latch = CountDownLatch(1)
+            var code = -1
+            var errMsg = ""
+            var rsp: Any? = null
+            val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, m, a ->
+                if (m.name == "onResult") {
+                    code = (a?.getOrNull(0) as? Number)?.toInt() ?: -1
+                    errMsg = a?.getOrNull(1) as? String ?: ""
+                    rsp = a?.getOrNull(4)
+                    latch.countDown()
+                }
+                defaultValueFor(m.returnType)
+            }
+            addBuddyMethod.invoke(buddyService, "Material3Tim", req, ByteArray(0), callback)
+            latch.await(12, TimeUnit.SECONDS)
+            val resp = rsp
+            val result = (resp?.let { invokeGetter(it, "getResult") } as? Number)?.toInt() ?: -1
+            val errorCode = (resp?.let { invokeGetter(it, "getErrorCode") } as? Number)?.toInt() ?: 0
+            val errorString = (resp?.let { invokeGetter(it, "getErrorString") } as? String).orEmpty()
+            val addFriendSetting =
+                (resp?.let { invokeGetter(it, "getAddFriendSetting") } as? Number)?.toInt() ?: 0
+            val verify = resp?.let { invokeGetter(it, "getVerify") } as? ByteArray
+            val rspSig = resp?.let { invokeGetter(it, "getSig") } as? ByteArray
+            val targetInfo = resp?.let { invokeGetter(it, "getTargetInfo") }
+            val respUin = (targetInfo?.let { invokeGetter(it, "getUin") } as? Number)?.toLong() ?: 0L
+            Log.i(
+                TAG,
+                "addFriend: NT addBuddy($label) code=$code errMsg=$errMsg result=$result " +
+                    "errorCode=$errorCode errorString=$errorString addFriendSetting=$addFriendSetting " +
+                    "verifyLen=${verify?.size ?: 0} rspSigLen=${rspSig?.size ?: 0} rspUin=$respUin",
+            )
+            val serverError = if (result != 0 || code != 0) {
+                decodeAddBuddyError(cl, verify, errorCode, errorString)
+            } else {
+                null
+            }
+            if (!serverError.isNullOrBlank()) {
+                lastAddFriendError = serverError
+                Log.w(TAG, "addFriend: NT addBuddy($label) serverError=$serverError")
+            }
+            NtAddBuddyOutcome(
+                code = code,
+                result = result,
+                errorCode = errorCode,
+                errorString = errorString,
+                verify = verify,
+                sig = rspSig,
+                verifyLen = verify?.size ?: 0,
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "addFriend: NT addBuddy($label) failed: ${t.javaClass.simpleName} ${t.message}")
+            null
+        }
+    }
+
+    /** 构造 kernel AccountInfo（uin/uid 至少填一个；其它字段留 null，TIM 自己的 coder 同样只填部分字段）。 */
+    private fun buildKernelAccountInfo(uin: Long, uid: String): Any? {
+        val cl = hostClassLoader() ?: return null
+        return runCatching {
+            val infoClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.AccountInfo", false, cl,
+            )
+            val info = infoClass.getConstructor().newInstance()
+            if (uin > 0L) infoClass.getField("uin").set(info, uin)
+            if (uid.isNotBlank()) infoClass.getField("uid").set(info, uid)
+            info
+        }.getOrNull()
+    }
+
+    /**
+     * TIM 原生发送前预检①：`queryUinSafetyFlag(String callFrom, AccountInfo, byte[] sig,
+     * IQueryUinSafetyFlagCallback)`（NT 命令 0xfe1，NTAddFriendHandler.M1；
+     * AddFriendCheckLogicPart 在 uin type==1 时先做）。
+     * 回调 onResult(int code, String msg, byte[] , AccountInfo, int safetyFlag)。
+     *
+     * @return safetyFlag（code==0 时）；失败/超时 null。
+     */
+    private fun queryUinSafetyFlagPrecheck(uin: Long, uid: String): Int? {
+        val cl = hostClassLoader() ?: return null
+        val service = addOrDelBuddyService() ?: return null
+        val method = service.javaClass.methods
+            .firstOrNull { it.name == "queryUinSafetyFlag" && it.parameterCount == 4 }
+            ?: return null
+        val accountInfo = buildKernelAccountInfo(uin, uid) ?: return null
+        val callbackClass = Class.forName(
+            "com.tencent.qqnt.kernel.nativeinterface.IQueryUinSafetyFlagCallback", false, cl,
+        )
+        val latch = CountDownLatch(1)
+        var code = -1
+        var msg = ""
+        var safetyFlag = -1
+        val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, m, a ->
+            if (m.name == "onResult") {
+                code = (a?.getOrNull(0) as? Number)?.toInt() ?: -1
+                msg = a?.getOrNull(1) as? String ?: ""
+                safetyFlag = (a?.getOrNull(4) as? Number)?.toInt() ?: -1
+                latch.countDown()
+            }
+            defaultValueFor(m.returnType)
+        }
+        return try {
+            method.invoke(service, "Material3Tim", accountInfo, ByteArray(0), callback)
+            val answered = latch.await(6, TimeUnit.SECONDS)
+            Log.i(
+                TAG,
+                "addFriend: precheck queryUinSafetyFlag(uin=$uin uid=${uid.take(16)}) " +
+                    "answered=$answered code=$code msg=$msg safetyFlag=$safetyFlag",
+            )
+            if (answered && code == 0) safetyFlag else null
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "addFriend: precheck queryUinSafetyFlag(uin=$uin) failed: " +
+                    "${t.javaClass.simpleName} ${t.message}",
+            )
+            null
+        }
+    }
+
+    /**
+     * TIM 原生发送前预检②：`getAddBuddyRequestTag(String callFrom, AccountInfo, byte[] sig,
+     * IGetBuddyTagCallback)`（NT 命令 0x1004，NTAddFriendHandler.I1；验证页 Header 用来显示标签）。
+     * 回调 BuddyTagRsp{ targetInfo, nickname, tags(ArrayList<PersonTag>) }。
+     * 注意：BuddyTagRsp **不包含 sig 字节**；TIM 的 AddBuddyReq.sig 实际来自上一次 addBuddy 响应
+     * （NTFriendAddReceiver：bundle.putByteArray("sig", addBuddyRsp.sig)）。
+     *
+     * @return Triple(code, tagsCount, nickname)；失败/超时 null。
+     */
+    private fun getAddBuddyRequestTagPrecheck(uin: Long, uid: String): Triple<Int, Int, String>? {
+        val cl = hostClassLoader() ?: return null
+        val service = addOrDelBuddyService() ?: return null
+        val method = service.javaClass.methods
+            .firstOrNull { it.name == "getAddBuddyRequestTag" && it.parameterCount == 4 }
+            ?: return null
+        val accountInfo = buildKernelAccountInfo(uin, uid) ?: return null
+        val callbackClass = Class.forName(
+            "com.tencent.qqnt.kernel.nativeinterface.IGetBuddyTagCallback", false, cl,
+        )
+        val latch = CountDownLatch(1)
+        var code = -1
+        var msg = ""
+        var rsp: Any? = null
+        val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, m, a ->
+            if (m.name == "onResult") {
+                code = (a?.getOrNull(0) as? Number)?.toInt() ?: -1
+                msg = a?.getOrNull(1) as? String ?: ""
+                rsp = a?.getOrNull(4)
+                latch.countDown()
+            }
+            defaultValueFor(m.returnType)
+        }
+        return try {
+            method.invoke(service, "Material3Tim", accountInfo, ByteArray(0), callback)
+            val answered = latch.await(6, TimeUnit.SECONDS)
+            val rspObj = rsp
+            @Suppress("UNCHECKED_CAST")
+            val tags = rspObj?.let { invokeGetter(it, "getTags") } as? List<Any?>
+            val nickname = (rspObj?.let { invokeGetter(it, "getNickname") } as? String).orEmpty()
+            val targetUin = ((rspObj?.let { invokeGetter(it, "getTargetInfo") }
+                ?.let { invokeGetter(it, "getUin") }) as? Number)?.toLong() ?: 0L
+            Log.i(
+                TAG,
+                "addFriend: precheck getAddBuddyRequestTag(uin=$uin uid=${uid.take(16)}) " +
+                    "answered=$answered code=$code msg=$msg tags=${tags?.size ?: 0} " +
+                    "nickname=$nickname targetUin=$targetUin (BuddyTagRsp 无 sig 字节)",
+            )
+            if (answered && code == 0) Triple(code, tags?.size ?: 0, nickname) else null
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "addFriend: precheck getAddBuddyRequestTag(uin=$uin) failed: " +
+                    "${t.javaClass.simpleName} ${t.message}",
+            )
+            null
+        }
+    }
+
+    /** 字节转 hex（最多 [maxLen] 字节），用于打印服务端 verify 原始数据。 */
+    private fun bytesToHex(bytes: ByteArray?, maxLen: Int = 64): String {
+        bytes ?: return "null"
+        val n = minOf(bytes.size, maxLen)
+        val sb = StringBuilder(n * 2)
+        for (i in 0 until n) sb.append("%02x".format(bytes[i]))
+        return sb.toString()
+    }
+
+    /**
+     * 解析 AddBuddyRsp.verify：TIM NTFriendAddReceiver 对 errorCode==168 解析
+     * `trpc.mizarproto.passthrough.FunctionLockMsg$FunctionLockBeatRsp`（功能锁文案 wording），
+     * 其它情况解析 `tencent.im.friend.AddContactVerifyInfo$AddFriendVerifyInfo`（安全验证 url/verify_info）。
+     * 返回给 UI 的可读错误文案；解析失败时退回 errorString/errorCode。
+     */
+    /**
+     * 解析 AddBuddyRsp.verify：TIM NTFriendAddReceiver 对 errorCode==168 解析
+     * `trpc.mizarproto.passthrough.FunctionLockMsg$FunctionLockBeatRsp`（功能锁 wording/btns），
+     * 其它情况解析 `tencent.im.friend.AddContactVerifyInfo$AddFriendVerifyInfo`（安全验证 url/verify_info）。
+     * 同时打印 verify 原始 hex（前 64 字节），解析失败会 log PB 异常类名。
+     * 返回给 UI 的可读错误文案；解析失败时退回 errorString/errorCode。
+     */
+    private fun decodeAddBuddyError(
+        cl: ClassLoader,
+        verify: ByteArray?,
+        errorCode: Int,
+        errorString: String,
+    ): String? {
+        val verifyBytes = verify?.takeIf { it.isNotEmpty() }
+        Log.i(
+            TAG,
+            "addFriend: addBuddy verify errorCode=$errorCode len=${verifyBytes?.size ?: 0} " +
+                "hex32=${bytesToHex(verifyBytes, 32)}",
+        )
+        if (verifyBytes == null) {
+            return errorString.takeIf { it.isNotBlank() } ?: "添加失败（code=$errorCode）"
+        }
+        if (errorCode == 168) {
+            decodeFunctionLockBeatRsp(cl, verifyBytes)?.let { return it }
+        } else {
+            decodeAddFriendVerifyInfo(cl, verifyBytes)?.let { return it }
+        }
+        return errorString.takeIf { it.isNotBlank() } ?: "添加失败（code=$errorCode）"
+    }
+
+    /** 解析 FunctionLockBeatRsp（errorCode=168 的功能锁文案）；失败返回 null。 */
+    private fun decodeFunctionLockBeatRsp(cl: ClassLoader, verifyBytes: ByteArray): String? {
+        return try {
+            val cls = Class.forName(
+                "trpc.mizarproto.passthrough.FunctionLockMsg\$FunctionLockBeatRsp", false, cl,
+            )
+            val rsp = cls.getConstructor().newInstance()
+            val merge = cls.getMethod("mergeFrom", ByteArray::class.java)
+            merge.invoke(rsp, verifyBytes)
+            val wording = (readPublicField(rsp, "wording")?.let { invokeGetter(it, "get") } as? String)
+                .orEmpty()
+            @Suppress("UNCHECKED_CAST")
+            val btns = readPublicField(rsp, "btns")?.let { invokeGetter(it, "get") } as? List<Any?>
+            val btnTexts = ArrayList<String>(btns?.size ?: 0)
+            btns?.forEach { btn ->
+                btn ?: return@forEach
+                val btnWording =
+                    (readPublicField(btn, "woding")?.let { invokeGetter(it, "get") } as? String)
+                        .orEmpty()
+                val btnUrl = (readPublicField(btn, "url")?.let { invokeGetter(it, "get") } as? String)
+                    .orEmpty()
+                val jumpType =
+                    (readPublicField(btn, "jump_type")?.let { invokeGetter(it, "get") } as? Number)
+                        ?.toInt() ?: -1
+                btnTexts.add("wording=$btnWording url=$btnUrl jumpType=$jumpType")
+            }
+            Log.i(
+                TAG,
+                "addFriend: FunctionLockBeatRsp parsed wording=$wording btns=${btnTexts.size} " +
+                    "btnDetails=$btnTexts",
+            )
+            if (wording.isNotBlank()) wording else null
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "addFriend: decode FunctionLockBeatRsp failed: " +
+                    "${t.javaClass.simpleName} ${t.message}",
+            )
+            null
+        }
+    }
+
+    /** 解析 AddFriendVerifyInfo（安全验证提示/url）；失败返回 null。 */
+    private fun decodeAddFriendVerifyInfo(cl: ClassLoader, verifyBytes: ByteArray): String? {
+        return try {
+            val cls = Class.forName(
+                "tencent.im.friend.AddContactVerifyInfo\$AddFriendVerifyInfo", false, cl,
+            )
+            val info = cls.getConstructor().newInstance()
+            val merge = cls.getMethod("mergeFrom", ByteArray::class.java)
+            merge.invoke(info, verifyBytes)
+            fun pbString(name: String): String =
+                (readPublicField(info, name)?.let { invokeGetter(it, "get") } as? String).orEmpty()
+            val tips = pbString("str_verify_info").ifBlank { pbString("str_tips") }
+            val url = pbString("str_url")
+            Log.i(TAG, "addFriend: AddFriendVerifyInfo parsed tips=$tips url=$url")
+            when {
+                tips.isNotBlank() -> tips
+                url.isNotBlank() -> "需要对方向你进行安全验证，请稍后再试"
+                else -> null
+            }
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "addFriend: decode AddFriendVerifyInfo failed: " +
+                    "${t.javaClass.simpleName} ${t.message}",
+            )
+            null
+        }
+    }
+
+    /**
+     * 原生加好友验证流程：带验证消息发送好友请求（手机号结果先解析 QQ 号）。阻塞，需在 IO 线程调用。
+     * 尝试顺序：
+     * 1) 手机号 → QQ 号：优先内核 IKernelAddBuddyService.requestInfoByAccount(AccountInfo.phoneNum)
+     *    （resolveAccountByPhone，8s 超时，依次试 纯11位/+86/86）；失败才走 phone-style 兜底；
+     * 2) TIM 原生 NT addBuddy 优先（AddFriendNTCoder + kernel addBuddy，即验证页真实发送链路）：
+     *    有 QQ 号 → sourceID=3017/sub=1（uin+uid+msg+remark+token）；手机号未解析出 QQ →
+     *    sourceID=3014/sub=0（uin=手机号，coder 写 AddBuddyReq.name）；成功判定 AddBuddyRsp.result==0
+     *    （Bundle "msg" 会变成 AddBuddyReq.answer，即 TIM 侧真正的验证消息）。friend_setting 按查询结果
+     *    原样发送（0/1/2/3/4 均不拦截；2/3/4 问答类由 UI 把答案/多题模板放进 message）；
+     * 3) NT 失败后回退内核 reqToAddFriends + Verify（TIM 产品不使用该接口，仅作最后兜底；
+     *    verifyInfo 与 answer 同时设为验证消息）；
+     * 4) 全部失败返回 false，让 UI 提示发送失败（不启动 TIM 原生加好友页）。
+     */
+    fun requestAddFriend(user: AddFriendUser, message: String): Boolean {
+        if (!isHost) return false
+        lastAddFriendError = null
+        val trimmed = message.trim()
+        Log.i(
+            TAG,
+            "addFriend: requestAddFriend(uid=${user.uid.take(16)}, uin=${user.uin}, " +
+                "phone=${user.phone}, tokenLen=${user.token.length}) message=${trimmed.take(60)}",
+        )
+        if (user.uid.isBlank() && user.uin <= 0L && user.phone.isBlank()) {
+            Log.w(TAG, "addFriend: requestAddFriend invalid target (no uid/uin/phone)")
+            return false
+        }
+        if (!ensureServices()) return false
+
+        // 1) 手机号 → QQ 号：优先用内核 IKernelAddBuddyService.requestInfoByAccount（phoneNum）直接解析；
+        //    解析失败才走 phone-style（source 3014，uin=手机号+token）兜底。QQ 号 → uid。
+        var effective = user
+        if (user.uin <= 0L && user.phone.isNotBlank()) {
+            val resolved = runCatching { resolveAccountByPhone(user.phone) }.getOrNull()
+            if (resolved != null && (resolved.uin > 0L || resolved.uid.isNotBlank())) {
+                effective = effective.copy(
+                    uin = resolved.uin,
+                    uid = resolved.uid.ifBlank { effective.uid },
+                )
+                Log.i(
+                    TAG,
+                    "addFriend: requestAddFriend resolveAccountByPhone -> " +
+                        "uin=${resolved.uin} uid=${resolved.uid.take(16)} nick=${resolved.nick}",
+                )
+            } else {
+                Log.w(
+                    TAG,
+                    "addFriend: requestAddFriend resolveAccountByPhone failed " +
+                        "for phone=${user.phone}, will try phone-style fallback",
+                )
+            }
+        }
+        if (effective.uid.isBlank() && effective.uin > 0L) {
+            resolveUidByUin(effective.uin)?.let { uid ->
+                Log.i(
+                    TAG,
+                    "addFriend: requestAddFriend resolved uid=${uid.take(16)} " +
+                        "for uin=${effective.uin}",
+                )
+                effective = effective.copy(uid = uid)
+            }
+        }
+
+        // 1.5) TIM 原生发送前预检：queryUinSafetyFlag（0xfe1，AddFriendCheckLogicPart 对 uin type==1 先做）
+        //      与 getAddBuddyRequestTag（0x1004，验证页 Header）。内核直接调用可拿回结果；失败不影响发送。
+        if (effective.uin > 0L || effective.uid.isNotBlank()) {
+            runCatching { queryUinSafetyFlagPrecheck(effective.uin, effective.uid) }
+            runCatching { getAddBuddyRequestTagPrecheck(effective.uin, effective.uid) }
+        }
+
+        // 2) 先查对方「加好友设置」friend_setting（TIM AddFriendCheckFragment.b7()/N1 等价流程）。
+        //    目标：有 QQ 号用 QQ 号（source 3017/1）；手机号未解析出 QQ 用手机号（source 3014/0）。
+        val ntStyle = if (effective.uin > 0L) "qq" else "phone"
+        val ntSourceId =
+            if (effective.uin > 0L) ADD_FRIEND_SOURCE_ID else ADD_FRIEND_PHONE_SOURCE_ID
+        val ntSubSourceId =
+            if (effective.uin > 0L) ADD_FRIEND_SOURCE_SUB_ID else ADD_FRIEND_PHONE_SOURCE_SUB_ID
+        val ntUinText = if (effective.uin > 0L) effective.uin.toString() else user.phone
+        val ntUidText = if (effective.uin > 0L) effective.uid else ""
+        if (ntUinText.isBlank()) {
+            Log.w(TAG, "addFriend: requestAddFriend no NT target (no uin/phone)")
+            return false
+        }
+        val queried = runCatching {
+            queryFriendSetting(ntUinText, ntSourceId, ntSubSourceId)
+        }.getOrNull()
+        var lastNtCode = -1
+        var usedSetting = 0
+        var lastSetting = -1
+        var lastOutcome: NtAddBuddyOutcome? = null
+        var retriedWithSig = false
+        fun tryNt(setting: Int): Boolean {
+            lastSetting = setting
+            var outcome = runCatching {
+                requestAddFriendByNtAddBuddy(
+                    user = effective,
+                    message = trimmed,
+                    sourceId = ntSourceId,
+                    subSourceId = ntSubSourceId,
+                    friendUinText = ntUinText,
+                    friendUid = ntUidText,
+                    styleLabel = ntStyle,
+                    includeToken = true,
+                    friendSetting = setting,
+                )
+            }.getOrNull()
+            lastOutcome = outcome
+            lastNtCode = outcome?.code ?: -1
+            if (outcome != null && outcome.result == 0) {
+                Log.i(
+                    TAG,
+                    "addFriend: requestAddFriend ok(by NT addBuddy style=$ntStyle " +
+                        "friend_setting=$setting) msgLen=${trimmed.length} " +
+                        "tokenLen=${user.token.length} sigLen=${outcome.sig?.size ?: 0}",
+                )
+                refreshChatsSoon()
+                return true
+            }
+            // TIM 在 addBuddy 失败（尤其 168/风控）时会用上一轮 AddBuddyRsp.sig 重发一次：
+            // NTFriendAddReceiver 把 addBuddyRsp.sig 放进 bundle("sig")，AddFriendSendPart 重发时取它。
+            val sigBytes = outcome?.sig
+            if (!retriedWithSig && sigBytes != null && sigBytes.isNotEmpty()) {
+                retriedWithSig = true
+                Log.i(
+                    TAG,
+                    "addFriend: retry NT addBuddy with prev rsp.sig sigLen=${sigBytes.size} " +
+                        "style=$ntStyle friend_setting=$setting",
+                )
+                outcome = runCatching {
+                    requestAddFriendByNtAddBuddy(
+                        user = effective,
+                        message = trimmed,
+                        sourceId = ntSourceId,
+                        subSourceId = ntSubSourceId,
+                        friendUinText = ntUinText,
+                        friendUid = ntUidText,
+                        styleLabel = ntStyle,
+                        includeToken = true,
+                        friendSetting = setting,
+                        sig = sigBytes,
+                    )
+                }.getOrNull()
+                if (outcome != null) {
+                    lastOutcome = outcome
+                    lastNtCode = outcome.code
+                    if (outcome.result == 0) {
+                        Log.i(
+                            TAG,
+                            "addFriend: requestAddFriend ok(by NT addBuddy retry-with-sig " +
+                                "style=$ntStyle friend_setting=$setting) " +
+                                "msgLen=${trimmed.length} tokenLen=${user.token.length}",
+                        )
+                        refreshChatsSoon()
+                        return true
+                    }
+                }
+                Log.w(
+                    TAG,
+                    "addFriend: retry NT addBuddy with sig failed result=${outcome?.result} " +
+                        "code=${outcome?.code} errorCode=${outcome?.errorCode} " +
+                        "verifyLen=${outcome?.verifyLen}",
+                )
+            }
+            Log.w(
+                TAG,
+                "addFriend: requestAddFriend NT addBuddy failed style=$ntStyle " +
+                    "friend_setting=$setting code=$lastNtCode result=${outcome?.result} " +
+                    "errorCode=${outcome?.errorCode} verifyLen=${outcome?.verifyLen} " +
+                    "sigLen=${outcome?.sig?.size ?: 0} " +
+                    "msgLen=${trimmed.length} tokenLen=${user.token.length}",
+            )
+            return false
+        }
+        if (queried != null) {
+            val setting = queried.first
+            val questions = queried.second
+            Log.i(
+                TAG,
+                "addFriend: requestAddFriend queried friend_setting=$setting " +
+                    "questions=$questions style=$ntStyle",
+            )
+            // 2/3/4（需要回答问题）同样走 NT addBuddy：friend_setting 用 queried 值，
+            // msg = UI 组装的答案/多题模板（AddBuddyReq.answer），由服务端校验答案。
+            usedSetting = setting
+            // 查询成功后按 TIM 原生流程只发这一次（避免多次失败请求触发/加重 168 风控）；
+            // tryNt 内部在拿到 rsp.sig 时会像 TIM 一样带 sig 重试一次。
+            if (tryNt(setting)) return true
+            Log.w(
+                TAG,
+                "addFriend: requestAddFriend queried setting=$setting send failed, " +
+                    "不再用其它 setting 反复请求（防 168 风控）",
+            )
+        } else {
+            // 方案 B：设置查询失败/超时，直接依次尝试 friend_setting [0, 1, 3]。
+            Log.w(
+                TAG,
+                "addFriend: requestAddFriend queryFriendSetting failed " +
+                    "-> try friend_setting [0,1,3] directly",
+            )
+            for (setting in listOf(0, 1, 3)) {
+                usedSetting = setting
+                if (tryNt(setting)) return true
+            }
+        }
+        Log.w(
+            TAG,
+            "addFriend: requestAddFriend all NT addBuddy attempts failed " +
+                "(style=$ntStyle lastSetting=$lastSetting lastNtCode=$lastNtCode " +
+                "lastResult=${lastOutcome?.result} lastErrorCode=${lastOutcome?.errorCode} " +
+                "lastVerifyLen=${lastOutcome?.verifyLen} lastSigLen=${lastOutcome?.sig?.size ?: 0}) " +
+                "-> fallback kernel",
+        )
+
+        // 3) 回退内核 reqToAddFriends + Verify（verifyInfo 和 answer 同时设成验证消息，addFriendSetting=setting）。
+        val kernelSourceId =
+            if (effective.uin > 0L) ADD_FRIEND_SOURCE_ID else ADD_FRIEND_PHONE_SOURCE_ID
+        val kernelSubSourceId =
+            if (effective.uin > 0L) ADD_FRIEND_SOURCE_SUB_ID else ADD_FRIEND_PHONE_SOURCE_SUB_ID
+        val kernelCode = runCatching {
+            requestAddFriendByKernelVerify(
+                user = effective,
+                message = trimmed,
+                sourceId = kernelSourceId,
+                subSourceId = kernelSubSourceId,
+                includePhoneNumber = effective.uin <= 0L && user.phone.isNotBlank(),
+                includeToken = true,
+                addFriendSetting = usedSetting,
+            )
+        }.getOrDefault(-1)
+        if (kernelCode == 0) {
+            Log.i(
+                TAG,
+                "addFriend: requestAddFriend ok(by kernel reqToAddFriends+Verify) " +
+                    "source=$kernelSourceId/$kernelSubSourceId hasUin=${effective.uin > 0L} " +
+                    "friend_setting=$usedSetting msgLen=${trimmed.length}",
+            )
+            refreshChatsSoon()
+            return true
+        }
+        Log.w(
+            TAG,
+            "addFriend: requestAddFriend kernel reqToAddFriends failed code=$kernelCode " +
+                "source=$kernelSourceId/$kernelSubSourceId friend_setting=$usedSetting",
+        )
+
+        // 4) 全部失败：返回 false 让 UI 提示发送失败（不再回退 addFriend 打开 TIM 原生页）。
+        Log.w(
+            TAG,
+            "addFriend: requestAddFriend all attempts failed " +
+                "(style=$ntStyle lastSetting=$lastSetting lastNtCode=$lastNtCode " +
+                "kernelCode=$kernelCode) -> return false, no native page fallback",
+        )
+        return false
+    }
+
+    /**
+     * QRoute IQRScanAbilityApi.startActivity(Context, isTroop, uinOrTroopUin, performAutoAction)：
+     * 内部打开 legacy AddFriendActivity（可加好友或加群，无需引用被裁剪的 Activity 类）。
+     */
+    private fun launchLegacyAddFriendOrGroup(
+        context: Context,
+        isTroop: Boolean,
+        target: String,
+    ): Boolean = try {
+        val cl = hostClassLoader() ?: return false
+        val apiClass = Class.forName("com.tencent.mobileqq.qrscan.api.IQRScanAbilityApi", false, cl)
+        val api = Class.forName("com.tencent.mobileqq.qroute.QRoute", false, cl)
+            .getMethod("api", Class::class.java)
+            .invoke(null, apiClass) ?: return false
+        val method = apiClass.methods.firstOrNull { m ->
+            m.name == "startActivity" && m.parameterCount == 4 &&
+                m.parameterTypes[0] == Context::class.java &&
+                m.parameterTypes[1] == java.lang.Boolean.TYPE &&
+                m.parameterTypes[2] == String::class.java &&
+                m.parameterTypes[3] == java.lang.Boolean.TYPE
+        } ?: return false
+        method.invoke(api, context, isTroop, target, false)
+        Log.i(TAG, "addFriend: launch legacy AddFriendActivity isTroop=$isTroop target=$target")
+        true
+    } catch (t: Throwable) {
+        Log.w(TAG, "addFriend: launchLegacyAddFriendOrGroup failed: ${t.javaClass.simpleName} ${t.message}")
+        false
+    }
+
+    /** QRoute.api(com.tencent.mobileqq.qrscan.api.IQRJumpApi)：扫码结果分发/QRJumpActivity 跳转。 */
+    private fun qrJumpApi(cl: ClassLoader): Any? = runCatching {
+        val apiClass = Class.forName("com.tencent.mobileqq.qrscan.api.IQRJumpApi", false, cl)
+        Class.forName("com.tencent.mobileqq.qroute.QRoute", false, cl)
+            .getMethod("api", Class::class.java)
+            .invoke(null, apiClass)
+    }.getOrNull()
+
+    /**
+     * mqqapi/mqq/qq 链接交给 TIM JumpAction 分发：
+     * 1) QRoute `com.tencent.mobileqq.jump.api.IJumpApi.doJumpAction(Context, String)`（内部即
+     *    `bp.b(QQAppInterface, context, url)` → `bl.a()`；有 Activity 用 Activity，否则 app context）；
+     * 2) 失败再直接反射 `com.tencent.mobileqq.utils.bp.b(BaseQQAppInterface, Context, String)` →
+     *    `com.tencent.mobileqq.utils.bl.a()`（q.java 对 mqqapi://card/show_pslcard 的同款调用）。
+     * 成功后由 JumpAction 自己启动 TIM 页面（资料卡/加群等）；返回是否已交给 JumpAction。
+     */
+    private fun tryJumpAction(
+        cl: ClassLoader,
+        activity: Activity?,
+        context: Context,
+        text: String,
+    ): Boolean {
+        val jumpContext: Context = activity ?: context
+        // 1) IJumpApi.doJumpAction(Context, String)
+        val viaApi = runCatching {
+            val apiClass = Class.forName("com.tencent.mobileqq.jump.api.IJumpApi", false, cl)
+            val api = Class.forName("com.tencent.mobileqq.qroute.QRoute", false, cl)
+                .getMethod("api", Class::class.java)
+                .invoke(null, apiClass) ?: return@runCatching false
+            val method = apiClass.methods.firstOrNull {
+                it.name == "doJumpAction" && it.parameterCount == 2 &&
+                    it.parameterTypes[0] == Context::class.java
+            } ?: return@runCatching false
+            method.invoke(api, jumpContext, text)
+            true
+        }.getOrElse { t ->
+            Log.w(
+                TAG,
+                "qr: JumpAction via IJumpApi failed: ${t.javaClass.simpleName} ${t.message}",
+            )
+            false
+        }
+        if (viaApi) return true
+        // 2) 兜底：bp.b(BaseQQAppInterface, context, url) → bl.a()
+        return runCatching {
+            val runtime = appRuntime ?: appRuntime() ?: return@runCatching false
+            val baseQQClass = Class.forName(
+                "com.tencent.common.app.business.BaseQQAppInterface", false, cl,
+            )
+            if (!baseQQClass.isInstance(runtime)) {
+                Log.w(
+                    TAG,
+                    "qr: JumpAction via bp.b skipped (runtime=${runtime.javaClass.simpleName} " +
+                        "not BaseQQAppInterface)",
+                )
+                return@runCatching false
+            }
+            val bpClass = Class.forName("com.tencent.mobileqq.utils.bp", false, cl)
+            val blClass = Class.forName("com.tencent.mobileqq.utils.bl", false, cl)
+            val parse = bpClass.getMethod(
+                "b",
+                baseQQClass,
+                Context::class.java,
+                String::class.java,
+            )
+            val action = parse.invoke(null, runtime, jumpContext, text) ?: return@runCatching false
+            if (!blClass.isInstance(action)) return@runCatching false
+            val handled = blClass.getMethod("a").invoke(action) as? Boolean ?: false
+            Log.i(TAG, "qr: JumpAction via bp.b -> bl.a() handled=$handled")
+            handled
+        }.getOrElse { t ->
+            Log.w(
+                TAG,
+                "qr: JumpAction via bp.b failed: ${t.javaClass.simpleName} ${t.message}",
+            )
+            false
+        }
+    }
+
+    /**
+     * 扫一扫结果处理（与 TIM 扫一扫结果一致），按内容 scheme 分发：
+     * 1) mqqapi/mqq/qq scheme：TIM JumpAction 分发——QRoute `IJumpApi.doJumpAction`（内部即
+     *    bp.b(BaseQQAppInterface,...) + bl.a()），失败再直接反射 bp.b→bl.a()（q.java 同款）；
+     * 2) 其它文本：`DispatchScanResultActivity`（extras detectType=1、scannerType 传空、
+     *    scannerResult=text；Activity context 直接 startActivity，非 Activity context 加 NEW_TASK）；
+     * 3) 兜底 `IQRJumpApi.startQRJumpActivity(activity, text, "", true)`（QRJumpActivity）。
+     * 成功返回 true；未宿主/无 context/全部失败返回 false。
+     */
+    fun openQrContent(text: String): Boolean {
+        if (!isHost) return false
+        val content = text.trim()
+        if (content.isEmpty()) {
+            Log.w(TAG, "qr: openQrContent empty text")
+            return false
+        }
+        Log.i(TAG, "qr: openQrContent(text=${content.take(120)})")
+        val cl = hostClassLoader() ?: run {
+            Log.w(TAG, "qr: openQrContent unavailable (no host classloader)")
+            return false
+        }
+        val activity = hostActivity()
+        val context = activity ?: hostContext()
+        if (context == null) {
+            Log.w(TAG, "qr: openQrContent unavailable (no context)")
+            return false
+        }
+        // 1) QQ 功能性链接（mqqapi/mqq/qq）：走 TIM JumpAction，不要落到扫码分发页的浏览器兜底。
+        val scheme = runCatching { android.net.Uri.parse(content).scheme?.lowercase() }.getOrNull()
+        if (scheme == "mqqapi" || scheme == "mqq" || scheme == "qq") {
+            Log.i(
+                TAG,
+                "qr: openQrContent JumpAction attempt (scheme=$scheme, " +
+                    "activity=${activity != null})",
+            )
+            if (tryJumpAction(cl, activity, context, content)) {
+                Log.i(TAG, "qr: openQrContent -> JumpAction (scheme=$scheme)")
+                return true
+            }
+            Log.w(
+                TAG,
+                "qr: openQrContent JumpAction failed (scheme=$scheme), " +
+                    "fallback DispatchScanResultActivity/QRJumpActivity",
+            )
+        }
+
+        val api = qrJumpApi(cl)
+        val dispatchClass = runCatching {
+            api?.javaClass?.methods
+                ?.firstOrNull { it.name == "getDispatchScanResultActivityCls" && it.parameterCount == 0 }
+                ?.invoke(api) as? Class<*>
+        }.getOrNull() ?: runCatching {
+            Class.forName("com.tencent.mobileqq.qrscan.activity.DispatchScanResultActivity", false, cl)
+        }.getOrNull()
+        if (dispatchClass != null) {
+            try {
+                val intent = Intent(context, dispatchClass)
+                intent.putExtra("detectType", 1)
+                intent.putExtra("scannerType", "")
+                intent.putExtra("scannerResult", content)
+                if (activity == null) intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                context.startActivity(intent)
+                Log.i(
+                    TAG,
+                    "qr: openQrContent -> DispatchScanResultActivity " +
+                        if (activity == null) "(app context + NEW_TASK)" else "(activity context)",
+                )
+                return true
+            } catch (t: Throwable) {
+                Log.w(
+                    TAG,
+                    "qr: openQrContent -> DispatchScanResultActivity failed: " +
+                        "${t.javaClass.simpleName} ${t.message}",
+                )
+            }
+        } else {
+            Log.w(TAG, "qr: openQrContent DispatchScanResultActivity not found")
+        }
+        // 兜底：QRJumpActivity（IQRJumpApi.startQRJumpActivity 内部直接 context.startActivity(intent)、
+        // 不带 NEW_TASK，所以必须用 Activity context；没有 Activity 时该兜底不可用）。
+        if (activity == null) {
+            Log.w(TAG, "qr: openQrContent QRJumpActivity fallback skipped (no activity context)")
+            Log.w(TAG, "qr: openQrContent failed (DispatchScanResultActivity + QRJumpActivity)")
+            return false
+        }
+        val fallbackOk = try {
+            val method = api?.javaClass?.methods
+                ?.firstOrNull { it.name == "startQRJumpActivity" && it.parameterCount == 4 }
+            if (method == null) {
+                Log.w(TAG, "qr: openQrContent IQRJumpApi.startQRJumpActivity not found")
+                false
+            } else {
+                method.invoke(api, activity, content, "", true)
+                true
+            }
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "qr: openQrContent -> QRJumpActivity failed: ${t.javaClass.simpleName} ${t.message}",
+            )
+            false
+        }
+        if (fallbackOk) {
+            Log.i(TAG, "qr: openQrContent -> QRJumpActivity (IQRJumpApi fallback)")
+            return true
+        }
+        Log.w(TAG, "qr: openQrContent failed (DispatchScanResultActivity + QRJumpActivity)")
+        return false
+    }
+
+    /**
+     * 内核加群：IKernelGroupService.joinGroup(ReqToGroup(groupCode, sourceId=3, sourceSubId=0, ...),
+     * IJoinGroupCallback)。成功返回 0；失败返回非 0（-1 表示本地调用失败）。
+     */
+    private fun requestJoinGroupByKernel(groupCode: Long): Int {
+        val service = waitForService(timeoutMs = 1_500L) { groupKernelService() } ?: return -1
+        val cl = hostClassLoader() ?: return -1
+        val reqClass = runCatching {
+            Class.forName("com.tencent.qqnt.kernel.nativeinterface.ReqToGroup", false, cl)
+        }.getOrNull() ?: return -1
+        val req = runCatching { reqClass.getConstructor().newInstance() }.getOrNull() ?: return -1
+        try {
+            reqClass.getField("groupCode").setLong(req, groupCode)
+            reqClass.getField("sourceId").setInt(req, JOIN_GROUP_SOURCE_ID)
+            reqClass.getField("sourceSubId").setInt(req, JOIN_GROUP_SOURCE_SUB_ID)
+            reqClass.getField("applyMsg").set(req, "")
+            reqClass.getField("auth").set(req, "")
+            reqClass.getField("noVerifyAuth").set(req, "")
+            reqClass.getField("token").set(req, "")
+        } catch (t: Throwable) {
+            Log.w(TAG, "addFriend: fill ReqToGroup failed: ${t.javaClass.simpleName} ${t.message}")
+            return -1
+        }
+        val callbackClass = runCatching {
+            Class.forName("com.tencent.qqnt.kernel.nativeinterface.IJoinGroupCallback", false, cl)
+        }.getOrNull() ?: return -1
+        val latch = CountDownLatch(1)
+        var code = -1
+        var message = ""
+        var notifyResult = -1
+        val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, m, a ->
+            if (m.name == "onResult") {
+                code = (a?.getOrNull(0) as? Number)?.toInt() ?: -1
+                message = a?.getOrNull(1) as? String ?: ""
+                notifyResult = (a?.getOrNull(2)?.let { invokeGetter(it, "getResult") } as? Number)
+                    ?.toInt() ?: -1
+                latch.countDown()
+            }
+            defaultValueFor(m.returnType)
+        }
+        val method = reflectMethod(service, "joinGroup", 2) ?: run {
+            Log.w(TAG, "addFriend: joinGroup not found on ${service.javaClass.simpleName}")
+            return -1
+        }
+        try {
+            method.invoke(service, req, callback)
+        } catch (t: Throwable) {
+            Log.w(TAG, "addFriend: joinGroup invoke failed: ${t.javaClass.simpleName} ${t.message}")
+            return -1
+        }
+        latch.await(8, TimeUnit.SECONDS)
+        Log.i(
+            TAG,
+            "addFriend: kernel joinGroup($groupCode) code=$code msg=$message result=$notifyResult",
+        )
+        // result==1 表示需要走验证/回答问题流程：交给原生加群页（用户可填答案），不算直接成功。
+        val ok = code == 0 && notifyResult == 0
+        return if (ok) 0 else if (code != 0) code else -1
+    }
+
+    /** 申请加入群聊：先试内核 joinGroup，失败打开 TIM 原生加群页（可填验证问题）。 */
+    fun joinGroup(group: AddFriendGroup): Boolean {
+        if (!isHost) return false
+        val label = "joinGroup(code=${group.groupCode}, name=${group.name})"
+        if (group.groupCode <= 0L) {
+            Log.w(TAG, "addFriend: $label invalid group")
+            return false
+        }
+        val kernelResult = requestJoinGroupByKernel(group.groupCode)
+        if (kernelResult == 0) {
+            Log.i(TAG, "addFriend: $label ok(by kernel joinGroup)")
+            refreshChatsSoon()
+            return true
+        }
+        val context = hostContext() ?: run {
+            Log.w(TAG, "addFriend: $label no context for native page")
+            return false
+        }
+        val legacy = launchLegacyAddFriendOrGroup(
+            context,
+            isTroop = true,
+            target = group.groupCode.toString(),
+        )
+        Log.i(TAG, "addFriend: $label kernel=$kernelResult legacyPage=$legacy")
+        return legacy
+    }
+
+    /** TIM 建群页的群分类（NewTroopContactView.J 的 JSON：classify=10010, group_type=1）。 */
+    private const val CREATE_GROUP_CLASSIFY = 10010
+
+    /**
+     * TIM 真实建群链路（NewTroopContactView.J → refreshCreateInfo → TroopCreateServiceImpl.startCreateTroop）：
+     * 1) TroopCreateInfo 取 reset() 默认值，再按 TIM 建群页设置 troopType=1 / classify=10010 / name；
+     *    inviteMembers 元素 TroopCreateInfo$a.b = 成员 uid（bean.a 只用 .b 当 InviteMemberInfo.uid）；
+     * 2) new com.tencent.qqnt.bean.a() + bean.a(TroopCreateInfo) 填充字段；
+     * 3) QRoute.api(ITroopOperationRepoApi).createGroupV2(bean, LifecycleOwner, from,
+     *    mqq.util.WeakReference(activity), com.tencent.qqnt.troop.b callback)；
+     *    注意 TIM 自己传的 LifecycleOwner 就是 null（TroopCreateServiceImpl.startCreateTroop 里 v5=0），
+     *    from = "TroopCreateServiceImpl"。
+     * 回调 com.tencent.qqnt.troop.b.a(success, code, errMsg, groupCodeStr)：
+     * - success = (code == 0)（TroopExtensionFunKt.d）；
+     * - 群号是 String 参数（result.groupCode 非 0 时才有值）。
+     *
+     * @return (回调 code, 新群群号)；反射/调用失败返回 null。
+     */
+    private fun createGroupByBean(groupName: String, uids: List<String>): Pair<Int, Long>? {
+        val cl = hostClassLoader() ?: return null
+        return try {
+            val infoClass = Class.forName(
+                "com.tencent.mobileqq.troop.data.TroopCreateInfo", false, cl,
+            )
+            val memberClass = Class.forName(
+                "com.tencent.mobileqq.troop.data.TroopCreateInfo\$a", false, cl,
+            )
+            val beanClass = Class.forName("com.tencent.qqnt.bean.a", false, cl)
+            val apiClass = Class.forName("com.tencent.qqnt.troop.ITroopOperationRepoApi", false, cl)
+            val callbackClass = Class.forName("com.tencent.qqnt.troop.b", false, cl)
+            val weakRefClass = Class.forName("mqq.util.WeakReference", false, cl)
+            val qrouteClass = Class.forName("com.tencent.mobileqq.qroute.QRoute", false, cl)
+
+            // TroopCreateInfo 无参构造器会调用 reset()：introduction/location 等已经是非 null 默认值。
+            val info = infoClass.getConstructor().newInstance()
+            runCatching { infoClass.getField("troopType").setInt(info, 1) }
+            runCatching { infoClass.getField("classify").setInt(info, CREATE_GROUP_CLASSIFY) }
+            runCatching { infoClass.getField("name").set(info, groupName) }
+            runCatching { infoClass.getField("isJumpAio").setBoolean(info, true) }
+            // troopSize 是「群成员总数（含自己）」：TIM 建群页 refreshCreateInfo 会按已选人数设置，
+            // 默认 reset() 给的是 1；如果按 1 发给服务端，邀请成员会被服务端忽略（只剩群主）。
+            runCatching { infoClass.getField("troopSize").setInt(info, uids.size + 1) }
+            val memberList = ArrayList<Any>(uids.size)
+            uids.forEach { memberUid ->
+                val member = memberClass.getConstructor().newInstance()
+                memberClass.getField("b").set(member, memberUid) // b = uid（bean.a 只读这个）
+                runCatching {
+                    val uin = uinForUid(memberUid)
+                    if (uin > 0L) memberClass.getField("a").set(member, uin.toString())
+                }
+                memberList.add(member)
+            }
+            // 直接替换可变的 inviteMembers 列表（TroopCreateInfo 的字段是 public List）。
+            infoClass.getField("inviteMembers").set(info, memberList)
+
+            val bean = beanClass.getConstructor().newInstance()
+            beanClass.getMethod("a", infoClass).invoke(bean, info)
+
+            val qrouteApi = qrouteClass.getMethod("api", Class::class.java)
+                .invoke(null, apiClass)
+            if (qrouteApi == null) {
+                Log.w(TAG, "groupCreate: QRoute.api(ITroopOperationRepoApi) returned null")
+                return null
+            }
+            val activity = hostActivity()
+            val weakRef = weakRefClass.getConstructor(Any::class.java).newInstance(activity)
+            val latch = CountDownLatch(1)
+            var success = false
+            var code = -1
+            var message = ""
+            var groupCode = 0L
+            var groupCodeRaw = ""
+            val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, m, a ->
+                if (m.name == "a") {
+                    success = a?.getOrNull(0) as? Boolean ?: false
+                    code = (a?.getOrNull(1) as? Number)?.toInt() ?: -1
+                    message = a?.getOrNull(2) as? String ?: ""
+                    groupCodeRaw = a?.getOrNull(3) as? String ?: ""
+                    groupCode = groupCodeRaw.toLongOrNull() ?: 0L
+                    Log.i(
+                        TAG,
+                        "groupCreate: createGroupV2(bean) callback success=$success code=$code " +
+                            "msg=$message groupCode=$groupCodeRaw",
+                    )
+                    latch.countDown()
+                }
+                defaultValueFor(m.returnType)
+            }
+            val method = apiClass.methods.firstOrNull {
+                it.name == "createGroupV2" && it.parameterCount == 5
+            }
+            if (method == null) {
+                Log.w(TAG, "groupCreate: ITroopOperationRepoApi.createGroupV2 not found")
+                return null
+            }
+            method.invoke(qrouteApi, bean, null, "Material3Tim", weakRef, callback)
+            Log.i(
+                TAG,
+                "groupCreate: createGroupV2(bean) sent members=${uids.size} from=Material3Tim " +
+                    "activity=${activity?.javaClass?.name} weakRef=${weakRef.javaClass.name}",
+            )
+            latch.await(15, TimeUnit.SECONDS)
+            val ok = success && code == 0 && groupCode > 0L
+            Log.i(
+                TAG,
+                "groupCreate: createGroupV2(bean) members=${uids.size} success=$success code=$code " +
+                    "msg=$message groupCode=$groupCode groupName=$groupName ok=$ok",
+            )
+            code to groupCode
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "groupCreate: createGroupV2(bean) failed: ${t.javaClass.simpleName} ${t.message}",
+            )
+            null
+        }
+    }
+
+    /** TIM 建群用的 appId（见 com.tencent.qqnt.bean.a.b() 里的 CreateGroupInfo.appId 常量）。 */
+    private const val CREATE_GROUP_APP_ID = 200000007
+
+    /**
+     * 内核建群（真正会把成员带进去的路径）：
+     * IKernelGroupService.createGroupV2(CreateGroupReq, ArrayList<InviteMemberInfo>, ICreateGroupCallback)。
+     * 参数完全照 TIM 自己的建群链路 com.tencent.qqnt.bean.a.b()/c()：
+     * createOption=1；CreateGroupInfo{ownerUid=当前uid, stringGroupName=UTF8 群名, appId=200000007,
+     * createFlag=16, sourceId=1, groupClass/groupClassExt/groupTypeFlag/groupOption=0}；
+     * membersInfo = ArrayList<InviteMemberInfo>{uid=成员 uid, nick="", groupCode=0}。
+     *
+     * @return (回调 code, 新群群号)；方法缺失/异常返回 null。
+     */
+    private fun createGroupByV2(
+        service: Any,
+        ownerUid: String,
+        groupName: String,
+        uids: List<String>,
+    ): Pair<Int, Long>? {
+        val cl = hostClassLoader() ?: return null
+        return try {
+            val reqClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.CreateGroupReq", false, cl,
+            )
+            val infoClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.CreateGroupInfo", false, cl,
+            )
+            val inviteClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.InviteMemberInfo", false, cl,
+            )
+            val callbackClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.ICreateGroupCallback", false, cl,
+            )
+            val req = reqClass.getConstructor().newInstance()
+            reqClass.getField("createOption").setInt(req, 1)
+            // CreateGroupReq 的构造器已经 new 好了 createGroupInfo / selectGroupCodeInfo / extInfo。
+            val info = reqClass.getField("createGroupInfo").get(req)
+                ?: return null
+            infoClass.getField("ownerUid").set(info, ownerUid)
+            infoClass.getField("stringGroupName").set(info, groupName.toByteArray(Charsets.UTF_8))
+            infoClass.getField("groupCode").setInt(info, 0)
+            infoClass.getField("groupSize").setInt(info, 0)
+            infoClass.getField("groupClass").setInt(info, 0)
+            infoClass.getField("groupClassExt").setInt(info, 0)
+            infoClass.getField("groupTypeFlag").setInt(info, 0)
+            infoClass.getField("groupOption").setInt(info, 0)
+            infoClass.getField("sourceId").setInt(info, 1)
+            infoClass.getField("createFlag").setLong(info, 16L)
+            infoClass.getField("groupFaceFlag").setInt(info, 0)
+            infoClass.getField("appId").setInt(info, CREATE_GROUP_APP_ID)
+            runCatching {
+                val select = reqClass.getField("selectGroupCodeInfo").get(req)
+                select?.javaClass?.getField("ownerUid")?.set(select, ownerUid)
+            }
+            val inviteMembers = ArrayList<Any>(uids.size)
+            uids.forEach { memberUid ->
+                val member = inviteClass.getConstructor().newInstance()
+                inviteClass.getField("uid").set(member, memberUid)
+                inviteClass.getField("nick").set(member, "")
+                inviteClass.getField("groupCode").setLong(member, 0L)
+                inviteMembers.add(member)
+            }
+            val method = reflectMethod(service, "createGroupV2", 3) ?: run {
+                Log.w(
+                    TAG,
+                    "groupCreate: createGroupV2 not found on ${service.javaClass.simpleName}",
+                )
+                return null
+            }
+            val latch = CountDownLatch(1)
+            var code = -1
+            var message = ""
+            var groupCode = 0L
+            val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, m, a ->
+                if (m.name == "onResult") {
+                    code = (a?.getOrNull(0) as? Number)?.toInt() ?: -1
+                    message = a?.getOrNull(1) as? String ?: ""
+                    groupCode = (a?.getOrNull(2)?.let { invokeGetter(it, "getGroupCode") } as? Number)
+                        ?.toLong() ?: 0L
+                    latch.countDown()
+                }
+                defaultValueFor(m.returnType)
+            }
+            method.invoke(service, req, inviteMembers, callback)
+            latch.await(15, TimeUnit.SECONDS)
+            Log.i(
+                TAG,
+                "groupCreate: createGroupV2 members=${uids.size} code=$code msg=$message " +
+                    "groupCode=$groupCode groupName=$groupName",
+            )
+            code to groupCode
+        } catch (t: Throwable) {
+            Log.w(TAG, "groupCreate: createGroupV2 failed: ${t.javaClass.simpleName} ${t.message}")
+            null
+        }
+    }
+
+    /**
+     * 用选中联系人创建群聊。
+     * 首选 TIM 原链路（com.tencent.qqnt.bean.a + QRoute ITroopOperationRepoApi.createGroupV2，见
+     * [createGroupByBean]）；失败再退回直接调 IKernelGroupService.createGroupV2（手工 CreateGroupReq）。
+     * 成功返回 chatId tim_2_<群号>，失败返回 null。
+     */
+    /**
+     * 建群后邀请成员：TIM 的 TroopCreateServiceImpl 在 createGroupV2 成功后会调用
+     * QRoute `com.tencent.qqnt.troop.ITroopMemberOperationRepoApi.inviteMembersToGroup(
+     *   groupUin:String, uids:List, LifecycleOwner=null, from:String, callback:com.tencent.qqnt.troop.h
+     * )`，回调 `onResult(boolean, int, String)`。阻塞等待，返回是否成功。
+     */
+    private fun inviteMembersToNewGroup(groupCode: Long, uids: List<String>): Boolean {
+        if (groupCode <= 0L || uids.isEmpty()) return false
+        val cl = hostClassLoader() ?: return false
+        return try {
+            val apiClass = Class.forName(
+                "com.tencent.qqnt.troop.ITroopMemberOperationRepoApi", false, cl,
+            )
+            val qrouteClass = Class.forName("com.tencent.mobileqq.qroute.QRoute", false, cl)
+            val api = qrouteClass.getMethod("api", Class::class.java)
+                .invoke(null, apiClass) ?: run {
+                Log.w(TAG, "groupCreate: invite api null")
+                return false
+            }
+            val callbackClass = Class.forName("com.tencent.qqnt.troop.h", false, cl)
+            // 逐个用 uid 邀请（Repo 的 inviteToGroup(String groupUin, String uid, ...) 重载）：
+            // 列表重载要求 TroopCreateInfo$a 元素且内部再转 InviteToTroopUserInfo，字段缺失时可能静默丢人。
+            val singleMethod = apiClass.methods.firstOrNull {
+                it.name == "inviteToGroup" && it.parameterCount == 5 &&
+                    it.parameterTypes[1] == String::class.java
+            } ?: run {
+                Log.w(TAG, "groupCreate: inviteToGroup(single) not found")
+                return false
+            }
+            var okCount = 0
+            uids.forEach { uid ->
+                val singleLatch = CountDownLatch(1)
+                var singleOk = false
+                var singleCode = -1
+                var singleMsg = ""
+                val singleCallback = Proxy.newProxyInstance(
+                    cl,
+                    arrayOf(callbackClass),
+                ) { _, method, args ->
+                    if (method.name == "onResult") {
+                        singleOk = args?.getOrNull(0) as? Boolean ?: false
+                        singleCode = (args?.getOrNull(1) as? Number)?.toInt() ?: -1
+                        singleMsg = args?.getOrNull(2) as? String ?: ""
+                        singleLatch.countDown()
+                    }
+                    defaultValueFor(method.returnType)
+                }
+                singleMethod.invoke(api, groupCode.toString(), uid, null, "Material3Tim", singleCallback)
+                val done = singleLatch.await(8, TimeUnit.SECONDS)
+                Log.i(
+                    TAG,
+                    "groupCreate: invite uid=$uid done=$done ok=$singleOk code=$singleCode msg=$singleMsg",
+                )
+                if (singleOk) okCount++
+            }
+            Log.i(TAG, "groupCreate: invite total=${uids.size} okCount=$okCount")
+            okCount > 0
+        } catch (t: Throwable) {
+            val cause = (t as? java.lang.reflect.InvocationTargetException)?.cause ?: t
+            Log.w(
+                TAG,
+                "groupCreate: invite failed: ${cause.javaClass.simpleName} ${cause.message}",
+                cause,
+            )
+            false
+        }
+    }
+
+    fun createGroup(members: List<ContactItem>): String? {
+        if (!isHost) return null
+        if (members.isEmpty()) {
+            Log.w(TAG, "groupCreate: empty members")
+            return null
+        }
+        if (!ensureServices()) return null
+        val uids = members.mapNotNull { contactItemUid(it) }.distinct()
+        if (uids.isEmpty()) {
+            Log.w(TAG, "groupCreate: no uid parsed from members=${members.size}")
+            return null
+        }
+        // 群名只用于本地会话展示（TIM 该链路群名由内核默认生成，bean.b() 不填 stringGroupName）。
+        val groupName = "TIM群聊 " + java.text.SimpleDateFormat(
+            "MM-dd HH:mm",
+            java.util.Locale.getDefault(),
+        ).format(java.util.Date())
+
+        // 1) TIM 原链路：bean.a(TroopCreateInfo) → ITroopOperationRepoApi.createGroupV2(bean, ...)。
+        var result = createGroupByBean(groupName, uids)
+        var source = "bean"
+        var code = result?.first ?: -1
+        var groupCode = result?.second ?: 0L
+        Log.i(
+            TAG,
+            "groupCreate: try createGroupV2(bean) members=${uids.size} code=$code groupCode=$groupCode",
+        )
+        if (result == null || code != 0 || groupCode <= 0L) {
+            // 2) 兜底：直接调 IKernelGroupService.createGroupV2（手工 CreateGroupReq；TIM 不走该接口）。
+            Log.w(
+                TAG,
+                "groupCreate: createGroupV2(bean) failed code=$code groupCode=$groupCode -> fallback kernel",
+            )
+            val service = waitForService(timeoutMs = 1_500L) {
+                groupKernelService() ?: nativeGroupService()
+            }
+            val ownerUid = (appRuntime?.let { invokeGetter(it, "getCurrentUid") } as? String).orEmpty()
+            if (service == null || ownerUid.isBlank()) {
+                Log.w(TAG, "groupCreate: kernel fallback unavailable service=$service uid=$ownerUid")
+            } else {
+                result = createGroupByV2(service, ownerUid, groupName, uids)
+                if (result == null) {
+                    nativeGroupService()?.let { native ->
+                        if (native !== service) {
+                            result = createGroupByV2(native, ownerUid, groupName, uids)
+                        }
+                    }
+                }
+                source = "kernel"
+                code = result?.first ?: -1
+                groupCode = result?.second ?: 0L
+                Log.i(
+                    TAG,
+                    "groupCreate: try createGroupV2(kernel) members=${uids.size} code=$code groupCode=$groupCode",
+                )
+            }
+        }
+        if (result == null || code != 0 || groupCode <= 0L) {
+            Log.w(
+                TAG,
+                "groupCreate: failed members=${uids.size} source=$source code=$code groupCode=$groupCode " +
+                    "(bean/kernel createGroupV2 均失败，未创建群)",
+            )
+            return null
+        }
+        Log.i(TAG, "groupCreate: success source=$source code=$code groupCode=$groupCode")
+        // TIM 的建群流程是「建群 + 邀请成员」两步：createGroupV2 负责建群（部分参数下成员会被忽略），
+        // 建群成功后按 uid 逐个调 ITroopMemberOperationRepoApi.inviteToGroup 把选中成员拉进来
+        // （真机验证：三人群里被选中的好友都会直接进群）。
+        inviteMembersToNewGroup(groupCode, uids)
+        refreshChatsSoon()
+        val chatId = "tim_2_$groupCode"
+        // 新群会话可能还没进最近会话列表：先在本地注册元数据 + 会话项，
+        // 让 UI 创建成功后能立即按 chatId 打开聊天页（消息加载也会用到 contacts[chatId]）。
+        runCatching {
+            val meta = ChatMeta(2, groupCode.toString(), groupCode, groupName, true)
+            cacheContact(chatId, meta)
+            com.material3tim.data.repository.LiveChats.upsert(
+                ChatItem(
+                    id = chatId,
+                    name = groupName,
+                    lastMessage = "",
+                    timeLabel = "",
+                    avatarSeed = (groupCode xor (groupCode ushr 32)).toInt() and 0x7fffffff,
+                    isGroup = true,
+                ),
+            )
+        }.onFailure { Log.w(TAG, "groupCreate: register local chat failed: ${it.message}") }
+        Log.i(TAG, "groupCreate: ok chatId=$chatId members=${uids.size}")
+        return chatId
+    }
+
+
+    // ---------------------------------------------------------------------
+    // 群文件（TIM NT kernel IKernelRichMediaService）
+    // ---------------------------------------------------------------------
+
+    /** 群文件列表请求 pending：getGroupFileList 返回 reqId，结果由 onGroupFileInfoUpdate 回调唤醒。 */
+    private class GroupFileListPending {
+        val latch = CountDownLatch(1)
+        @Volatile
+        var result: Any? = null
+    }
+
+    private val groupFileListPending = ConcurrentHashMap<Int, GroupFileListPending>()
+
+    /** 群文件下载状态（fileId/fileModelId 两种 key 都注册，richmedia 回调按字段匹配）。 */
+    private class GroupFileDownloadState(val fileId: String, val fileModelId: Long) {
+        val keys: List<String> = buildList {
+            if (fileId.isNotBlank()) add("id:$fileId")
+            if (fileModelId != 0L) add("model:$fileModelId")
+        }
+
+        @Volatile
+        var progress: Int = 0
+
+        @Volatile
+        var path: String? = null
+
+        @Volatile
+        var done: Boolean = false
+
+        @Volatile
+        var failed: Boolean = false
+
+        @Volatile
+        var message: String? = null
+
+        @Volatile
+        var lastLoggedProgress: Int = -1
+    }
+
+    private val groupFileDownloadStates = ConcurrentHashMap<String, GroupFileDownloadState>()
+
+    /** canManageGroupFiles 结果变化才打日志。 */
+    private val canManageGroupFilesLogged = ConcurrentHashMap<String, Boolean>()
+
+    private fun groupFileDownloadStateKeys(fileId: String, fileModelId: Long): List<String> {
+        val keys = ArrayList<String>(2)
+        if (fileId.isNotBlank()) keys.add("id:$fileId")
+        if (fileModelId != 0L) keys.add("model:$fileModelId")
+        return keys
+    }
+
+    private fun findGroupFileDownloadState(fileId: String, fileModelId: Long): GroupFileDownloadState? {
+        for (key in groupFileDownloadStateKeys(fileId, fileModelId)) {
+            groupFileDownloadStates[key]?.let { return it }
+        }
+        return null
+    }
+
+    /** 取 IKernelRichMediaService 原生对象：kernelService.getRichMediaService()（wrapper q）→ getService()。 */
+    private fun richMediaNativeService(): Any? {
+        if (!ensureServices()) return null
+        val kernel = kernelService ?: return null
+        val wrapper = runCatching {
+            kernel.javaClass.getMethod("getRichMediaService").invoke(kernel)
+        }.getOrNull() ?: return null
+        return runCatching {
+            wrapper.javaClass.getMethod("getService").invoke(wrapper)
+        }.getOrNull() ?: wrapper
+    }
+
+    /** 群号：chatMeta.peerUin（群 code）优先，退 peerUid.toLong；非群返回 null。 */
+    private fun groupCodeFor(chatId: String): Long? {
+        val meta = chatMeta[chatId] ?: ensureChatContext(chatId) ?: return null
+        if (!meta.isGroup) return null
+        val code = meta.peerUin.takeIf { it != 0L } ?: meta.peerUid.toLongOrNull() ?: 0L
+        return code.takeIf { it != 0L }
+    }
+
+    /** 构造 GroupFileListForm(folderId, sortType, fileCount, startIndex, sortOrder, showOnlinedocFolder)。 */
+    private fun newGroupFileListForm(folderId: String, startIndex: Int, count: Int): Any? {
+        val cl = hostClassLoader() ?: return null
+        return runCatching {
+            val formClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.GroupFileListForm", false, cl,
+            )
+            val sortClass = Class.forName(
+                "com.tencent.qqnt.kernel.nativeinterface.GroupFileSortType", false, cl,
+            )
+            val sortType = (sortClass.enumConstants as Array<*>)
+                .filterIsInstance<Enum<*>>()
+                .firstOrNull { it.name == "KSORTBYTIMESTAMP" }
+                ?: (sortClass.enumConstants as Array<*>).filterIsInstance<Enum<*>>()
+                    .firstOrNull { it.name != "KUNKNOWN" }
+            formClass.getConstructor(
+                String::class.java,
+                sortClass,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+            ).newInstance(folderId, sortType, count, startIndex, 0, 0)
+        }.getOrNull()
+    }
+
+    /** onGroupFileInfoUpdate(GroupFileListResult)：按 reqId 唤醒 listGroupFiles 的等待者。 */
+    private fun handleGroupFileListUpdate(result: Any?) {
+        if (result == null) return
+        val reqId = (invokeGetter(result, "getReqId") as? Number)?.toInt() ?: -1
+        val pending = if (reqId >= 0) groupFileListPending[reqId] else null
+        if (pending == null) {
+            Log.i(
+                TAG,
+                "groupFile: list update (no pending) reqId=$reqId " +
+                    "retCode=${(invokeGetter(result, "getRetCode") as? Number)?.toInt()} " +
+                    "items=${(invokeGetter(result, "getItem") as? List<*>)?.size ?: -1}",
+            )
+            return
+        }
+        pending.result = result
+        pending.latch.countDown()
+    }
+
+    /** GroupItem -> GroupFileEntry（文件/文件夹字段映射；逐条打日志便于真机核对）。 */
+    private fun mapGroupItemToEntry(item: Any?, index: Int, fallbackFolderId: String): GroupFileEntry? {
+        if (item == null) return null
+        val typeName = (invokeGetter(item, "getType") as? Enum<*>)?.name.orEmpty()
+        val isFolder = typeName == "KTYPEFOLDER"
+        if (isFolder) {
+            val info = invokeGetter(item, "getFolderInfo") ?: return null
+            val folderId = (invokeGetter(info, "getFolderId") as? String).orEmpty()
+            val name = (invokeGetter(info, "getFolderName") as? String).orEmpty()
+            val parent = (invokeGetter(info, "getParentFolderId") as? String)
+                ?.takeIf { it.isNotBlank() } ?: fallbackFolderId
+            val count = (invokeGetter(info, "getTotalFileCount") as? Number)?.toInt() ?: 0
+            val createTime = (invokeGetter(info, "getCreateTime") as? Number)?.toLong() ?: 0L
+            val creator = (invokeGetter(info, "getCreatorName") as? String).orEmpty()
+            Log.i(
+                TAG,
+                "groupFile: list item[$index] isFolder=true folderId=$folderId name=$name " +
+                    "parent=$parent count=$count creator=$creator createTime=$createTime",
+            )
+            return GroupFileEntry(
+                folderId = folderId,
+                parentFolderId = parent,
+                name = name,
+                isFolder = true,
+                uploaderName = creator,
+                uploadTime = createTime,
+                fileCount = count,
+            )
+        }
+        val info = invokeGetter(item, "getFileInfo") ?: return null
+        val fileId = (invokeGetter(info, "getFileId") as? String).orEmpty()
+        val name = (invokeGetter(info, "getFileName") as? String).orEmpty()
+        val parent = (invokeGetter(info, "getParentFolderId") as? String)
+            ?.takeIf { it.isNotBlank() } ?: fallbackFolderId
+        val size = (invokeGetter(info, "getFileSize") as? Number)?.toLong() ?: 0L
+        val busId = (invokeGetter(info, "getBusId") as? Number)?.toInt() ?: 0
+        val modelId = (invokeGetter(info, "getFileModelId") as? Number)?.toLong() ?: 0L
+        val uploader = (invokeGetter(info, "getUploaderName") as? String).orEmpty()
+        val uploadTime = (invokeGetter(info, "getUploadTime") as? Number)?.toLong() ?: 0L
+        val downloadTimes = (invokeGetter(info, "getDownloadTimes") as? Number)?.toInt() ?: 0
+        val md5 = (invokeGetter(info, "getMd5") as? String).orEmpty()
+        val localPath = (invokeGetter(info, "getLocalPath") as? String)?.takeIf { it.isNotBlank() }
+        val deadTime = (invokeGetter(info, "getDeadTime") as? Number)?.toInt() ?: 0
+        Log.i(
+            TAG,
+            "groupFile: list item[$index] isFolder=false fileId=$fileId name=$name " +
+                "parent=$parent size=$size busId=$busId modelId=$modelId uploader=$uploader " +
+                "uploadTime=$uploadTime downloads=$downloadTimes md5=${md5.take(12)} " +
+                "local=$localPath deadTime=$deadTime",
+        )
+        return GroupFileEntry(
+            fileId = fileId,
+            parentFolderId = parent,
+            name = name,
+            isFolder = false,
+            fileSize = size,
+            uploaderName = uploader,
+            uploadTime = uploadTime,
+            downloadTimes = downloadTimes,
+            localPath = localPath,
+            md5 = md5,
+            fileModelId = modelId,
+            busId = busId,
+            deadTime = deadTime,
+        )
+    }
+
+    /** GroupFileListResult -> GroupFilePage。 */
+    private fun mapGroupFileListResult(result: Any, fallbackFolderId: String): GroupFilePage {
+        val retCode = (invokeGetter(result, "getRetCode") as? Number)?.toInt() ?: -1
+        val retMsg = (invokeGetter(result, "getRetMsg") as? String).orEmpty()
+        val isEnd = (invokeGetter(result, "getIsEnd") as? Boolean) ?: true
+        val nextIndex = (invokeGetter(result, "getNextIndex") as? Number)?.toInt() ?: 0
+        val allFileCount = (invokeGetter(result, "getAllFileCount") as? Number)?.toInt() ?: 0
+        val reqId = (invokeGetter(result, "getReqId") as? Number)?.toInt() ?: -1
+        @Suppress("UNCHECKED_CAST")
+        val items = (invokeGetter(result, "getItem") as? List<*>) ?: emptyList<Any?>()
+        val entries = ArrayList<GroupFileEntry>(items.size)
+        var folders = 0
+        var files = 0
+        items.forEachIndexed { index, item ->
+            val entry = mapGroupItemToEntry(item, index, fallbackFolderId) ?: return@forEachIndexed
+            entries.add(entry)
+            if (entry.isFolder) folders++ else files++
+        }
+        Log.i(
+            TAG,
+            "groupFile: list result reqId=$reqId retCode=$retCode retMsg=${retMsg.take(120)} " +
+                "items=${items.size} folders=$folders files=$files isEnd=$isEnd " +
+                "nextIndex=$nextIndex allFileCount=$allFileCount",
+        )
+        if (retCode != 0) {
+            return GroupFilePage(
+                entries = emptyList(),
+                isEnd = true,
+                nextIndex = 0,
+                allFileCount = 0,
+                error = "retCode=$retCode $retMsg",
+            )
+        }
+        return GroupFilePage(
+            entries = entries,
+            isEnd = isEnd,
+            nextIndex = nextIndex,
+            allFileCount = allFileCount,
+            error = null,
+        )
+    }
+
+    /** 群文件列表 rsp 的 uint32_role：记录最近一次列表的权限值（仅日志/调试，canManage 仍用群成员信息判定）。 */
+    private val groupFileRoleByGroup = ConcurrentHashMap<Long, Int>()
+
+    /** 群成员列表里“我”的 MemberRole 名称（OWNER/ADMIN/MEMBER…），按 groupCode 记录，日志/权限核对用。 */
+    private val groupMemberSelfRoleByGroupCode = ConcurrentHashMap<Long, String>()
+
+    /** 已下载群文件：fileId -> 本地路径（进程内缓存；列表刷新时回填 localPath，避免又显示「下载」）。 */
+    private val groupFileDownloadedPaths = ConcurrentHashMap<String, String>()
+
+    /** 列表回填缓存命中日志去重（同一 fileId 只打一次）。 */
+    private val loggedGroupFileCacheHits = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /** IProtoReqManager runtime service 缓存。 */
+    @Volatile
+    private var groupFileProtoReqManagerService: Any? = null
+
+    // ------------------------------------------------------------------
+    // OIDB/protobuf 反射工具（TIM 主 dex 的 tencent.im.oidb / mobileqq.pb）
+    // ------------------------------------------------------------------
+
+    private fun pbClass(name: String): Class<*>? = runCatching {
+        val cl = hostClassLoader() ?: return null
+        Class.forName(name, true, cl)
+    }.getOrNull()
+
+    private fun newPb(name: String): Any? = runCatching {
+        pbClass(name)?.getConstructor()?.newInstance()
+    }.getOrNull()
+
+    private fun pbFieldObject(container: Any, fieldName: String): Any? = runCatching {
+        container.javaClass.getField(fieldName).get(container)
+    }.getOrNull()
+
+    /** 取嵌套 message 字段的实例（ReqBody/RspBody 里直接 new 好的对象，无需再构造）。 */
+    private fun pbMessage(container: Any, fieldName: String): Any? = runCatching {
+        container.javaClass.getField(fieldName).get(container)
+    }.getOrNull()
+
+    private fun pbSet(container: Any, fieldName: String, value: Any?) {
+        if (value == null) return
+        val field = pbFieldObject(container, fieldName) ?: run {
+            Log.w(TAG, "groupFile: pb field missing $fieldName on ${container.javaClass.simpleName}")
+            return
+        }
+        val setter = field.javaClass.methods.firstOrNull { m ->
+            if (m.name != "set" || m.parameterCount != 1) return@firstOrNull false
+            val type = m.parameterTypes[0]
+            when (value) {
+                is Int -> type == Int::class.javaPrimitiveType
+                is Long -> type == Long::class.javaPrimitiveType
+                is Boolean -> type == Boolean::class.javaPrimitiveType
+                is String -> type == String::class.java
+                else -> type.isInstance(value)
+            }
+        }
+        if (setter == null) {
+            Log.w(
+                TAG,
+                "groupFile: pb setter missing $fieldName value=${value.javaClass.simpleName} " +
+                    "field=${field.javaClass.simpleName}",
+            )
+            return
+        }
+        runCatching { setter.invoke(field, value) }.onFailure {
+            Log.w(TAG, "groupFile: pb set $fieldName failed: ${it.javaClass.simpleName} ${it.message}")
+        }
+    }
+
+    private fun pbRaw(container: Any, fieldName: String): Any? {
+        val field = pbFieldObject(container, fieldName) ?: return null
+        return runCatching { field.javaClass.getMethod("get").invoke(field) }.getOrNull()
+    }
+
+    private fun pbInt(container: Any, fieldName: String): Int =
+        (pbRaw(container, fieldName) as? Number)?.toInt() ?: 0
+
+    private fun pbLong(container: Any, fieldName: String): Long =
+        (pbRaw(container, fieldName) as? Number)?.toLong() ?: 0L
+
+    private fun pbBool(container: Any, fieldName: String): Boolean =
+        (pbRaw(container, fieldName) as? Boolean) ?: false
+
+    private fun pbString(container: Any, fieldName: String): String =
+        (pbRaw(container, fieldName) as? String).orEmpty()
+
+    /**
+     * 标记嵌套 message 字段“已设置”（PBPrimitiveField.setHasFlag(true)）。
+     * 关键：ReqBody 里 file_list_info_req 等子消息字段是 PBPrimitiveField 包装对象，
+     * 只改其内部值而不置 hasFlag，父消息 writeTo 会因 has()==false 而跳过 → body 0 字节。
+     */
+    private fun pbSetHasFlag(container: Any?, flag: Boolean = true) {
+        container ?: return
+        runCatching {
+            container.javaClass
+                .getMethod("setHasFlag", Boolean::class.javaPrimitiveType)
+                .invoke(container, flag)
+        }.onFailure {
+            Log.w(TAG, "groupFile: setHasFlag failed: ${it.javaClass.simpleName} ${it.message}")
+        }
+    }
+
+    /** protobuf 字段是否在响应里出现过（用于判断 rsp 子消息是否存在/ret_code 是否真的返回）。 */
+    private fun pbHas(container: Any?, fieldName: String): Boolean {
+        container ?: return false
+        val field = pbFieldObject(container, fieldName) ?: return false
+        return runCatching {
+            field.javaClass.getMethod("has").invoke(field) as? Boolean
+        }.getOrNull() ?: false
+    }
+
+    private fun pbByteString(container: Any, fieldName: String): Any? = pbRaw(container, fieldName)
+
+    private fun byteStringBytes(byteString: Any?): ByteArray? {
+        byteString ?: return null
+        return runCatching {
+            byteString.javaClass.getMethod("toByteArray").invoke(byteString) as? ByteArray
+        }.getOrNull()
+    }
+
+    private fun pbBytes(container: Any, fieldName: String): ByteArray? =
+        byteStringBytes(pbByteString(container, fieldName))
+
+    private fun pbByteStringOf(bytes: ByteArray): Any? {
+        val cl = hostClassLoader() ?: return null
+        return runCatching {
+            val cls = Class.forName("com.tencent.mobileqq.pb.ByteStringMicro", true, cl)
+            val method = cls.methods.firstOrNull {
+                it.name == "copyFrom" && it.parameterCount == 1 &&
+                    it.parameterTypes[0] == ByteArray::class.java
+            } ?: return@runCatching null
+            method.invoke(null, bytes)
+        }.getOrNull()
+    }
+
+    private fun pbParse(className: String, bytes: ByteArray): Any? = runCatching {
+        val obj = newPb(className) ?: return@runCatching null
+        obj.javaClass.getMethod("mergeFrom", ByteArray::class.java).invoke(obj, bytes)
+        obj
+    }.getOrElse { t ->
+        Log.w(TAG, "groupFile: pb parse $className failed: ${t.javaClass.simpleName} ${t.message}")
+        null
+    }
+
+    private fun pbBytesOf(message: Any?): ByteArray? {
+        message ?: return null
+        return runCatching {
+            message.javaClass.getMethod("toByteArray").invoke(message) as? ByteArray
+        }.getOrNull()
+    }
+
+    private fun pbRepeatMessages(container: Any, fieldName: String): List<Any> {
+        val field = pbFieldObject(container, fieldName) ?: return emptyList()
+        val value = runCatching { field.javaClass.getMethod("get").invoke(field) }.getOrNull()
+        @Suppress("UNCHECKED_CAST")
+        return (value as? List<Any?>).orEmpty().filterNotNull()
+    }
+
+    private fun hexLower(bytes: ByteArray): String =
+        bytes.joinToString("") { "%02x".format(it) }
+
+    /** body 前缀 hex（最多 [max] 字节）。 */
+    private fun hexLowerPrefix(bytes: ByteArray, max: Int): String =
+        hexLower(bytes.copyOf(minOf(max, bytes.size)))
+
+    private fun hexLower(text: String): String = hexLower(text.toByteArray(Charsets.UTF_8))
+
+    // ------------------------------------------------------------------
+    // OIDB 请求发送（IProtoReqManager + ProtoReq + IProtoRespBack Proxy）
+    // ------------------------------------------------------------------
+
+    private class OidbResponse(val result: Int, val errorMsg: String, val body: ByteArray)
+
+    private fun groupFileProtoReqManager(): Any? {
+        groupFileProtoReqManagerService?.let { return it }
+        if (!ensureServices()) return null
+        val runtime = appRuntime ?: appRuntime() ?: return null
+        val cl = hostClassLoader() ?: return null
+        val service = runCatching {
+            val iface = Class.forName(
+                "com.tencent.mobileqq.transfile.api.IProtoReqManager", true, cl,
+            )
+            runtime.javaClass
+                .getMethod("getRuntimeService", Class::class.java, String::class.java)
+                .invoke(runtime, iface, "")
+        }.getOrNull() ?: return null
+        groupFileProtoReqManagerService = service
+        return service
+    }
+
+    /** 包 OIDBSSOPkg：command + serviceType + bodybuffer + str_client_version(AppSetting.n())。 */
+    private fun buildOidbPackage(command: Int, serviceType: Int, body: ByteArray): ByteArray? {
+        val pkg = newPb("tencent.im.oidb.oidb_sso\$OIDBSSOPkg") ?: run {
+            Log.w(TAG, "groupFile: OIDBSSOPkg class missing")
+            return null
+        }
+        pbSet(pkg, "uint32_command", command)
+        pbSet(pkg, "uint32_service_type", serviceType)
+        val byteString = pbByteStringOf(body) ?: run {
+            Log.w(TAG, "groupFile: ByteStringMicro.copyFrom failed")
+            return null
+        }
+        pbSet(pkg, "bytes_bodybuffer", byteString)
+        val clientVersion = runCatching {
+            val cl = hostClassLoader() ?: return@runCatching ""
+            Class.forName("com.tencent.common.config.AppSetting", true, cl)
+                .getMethod("n").invoke(null) as? String
+        }.getOrNull().orEmpty()
+        if (clientVersion.isNotBlank()) pbSet(pkg, "str_client_version", clientVersion)
+        return pbBytesOf(pkg)
+    }
+
+    /**
+     * 发送 OIDB 请求并阻塞等响应（≤[timeoutMs]）；返回解包后的 OIDBSSOPkg（result/error/body）。
+     * 回调可能在内核线程，CountDownLatch 唤醒；网络失败/超时返回 null。
+     */
+    private fun sendOidbRequest(
+        cmd: String,
+        command: Int,
+        serviceType: Int,
+        body: ByteArray,
+        timeoutMs: Long = 8_000L,
+    ): OidbResponse? {
+        if (!isHost) return null
+        val manager = groupFileProtoReqManager() ?: run {
+            Log.w(TAG, "groupFile: IProtoReqManager unavailable cmd=$cmd")
+            return null
+        }
+        val cl = hostClassLoader() ?: return null
+        val pkg = buildOidbPackage(command, serviceType, body) ?: return null
+        Log.i(
+            TAG,
+            "groupFile: oidb req cmd=$cmd command=$command svc=$serviceType " +
+                "bytes=${body.size} bodyLen=${body.size} pkgBytes=${pkg.size} " +
+                "bodyHex=${hexLowerPrefix(body, 32)}",
+        )
+        val reqClass = runCatching {
+            Class.forName(
+                "com.tencent.mobileqq.transfile.api.impl.ProtoReqManagerImpl\$ProtoReq", true, cl,
+            )
+        }.getOrNull() ?: run {
+            Log.w(TAG, "groupFile: ProtoReq class missing")
+            return null
+        }
+        val callbackClass = runCatching {
+            Class.forName(
+                "com.tencent.mobileqq.transfile.api.impl.ProtoReqManagerImpl\$IProtoRespBack",
+                true,
+                cl,
+            )
+        }.getOrNull() ?: run {
+            Log.w(TAG, "groupFile: IProtoRespBack class missing")
+            return null
+        }
+        val req = runCatching { reqClass.getConstructor().newInstance() }.getOrNull() ?: return null
+        val latch = CountDownLatch(1)
+        val responseHolder = arrayOfNulls<ByteArray>(1)
+        val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, method, methodArgs ->
+            if (method.name == "onProtoResp") {
+                runCatching {
+                    val protoResp = methodArgs?.getOrNull(0)
+                    val fromServiceMsg = protoResp?.javaClass?.getField("resp")?.get(protoResp)
+                    val wup = fromServiceMsg?.javaClass
+                        ?.getMethod("getWupBuffer")
+                        ?.invoke(fromServiceMsg) as? ByteArray
+                    responseHolder[0] = wup
+                }.onFailure {
+                    Log.w(TAG, "groupFile: parse ProtoResp failed: ${it.javaClass.simpleName} ${it.message}")
+                }
+                latch.countDown()
+            }
+            null
+        }
+        runCatching {
+            reqClass.getField("ssoCmd").set(req, cmd)
+            reqClass.getField("reqBody").set(req, pkg)
+            reqClass.getField("callback").set(req, callback)
+        }.onFailure {
+            Log.w(TAG, "groupFile: fill ProtoReq failed: ${it.javaClass.simpleName} ${it.message}")
+            return null
+        }
+        val sendMethod = manager.javaClass.methods.firstOrNull {
+            it.name == "sendProtoReq" && it.parameterCount == 1
+        } ?: run {
+            Log.w(TAG, "groupFile: sendProtoReq not found")
+            return null
+        }
+        runCatching { sendMethod.invoke(manager, req) }.onFailure { t ->
+            val cause = (t as? java.lang.reflect.InvocationTargetException)?.targetException ?: t
+            Log.w(TAG, "groupFile: sendProtoReq failed cmd=$cmd: ${cause.javaClass.simpleName} ${cause.message}")
+            return null
+        }
+        val finished = latch.await(timeoutMs, TimeUnit.MILLISECONDS)
+        if (!finished) {
+            Log.w(TAG, "groupFile: oidb timeout cmd=$cmd (${timeoutMs}ms)")
+            return null
+        }
+        val rawBytes = responseHolder[0]
+        if (rawBytes == null || rawBytes.isEmpty()) {
+            Log.w(TAG, "groupFile: oidb empty response cmd=$cmd")
+            return null
+        }
+        val rspPkg = pbParse("tencent.im.oidb.oidb_sso\$OIDBSSOPkg", rawBytes)
+        val looksLikeSsoPkg = rspPkg != null && (
+            pbHas(rspPkg, "uint32_command") ||
+                pbHas(rspPkg, "uint32_result") ||
+                pbHas(rspPkg, "bytes_bodybuffer")
+            )
+        if (!looksLikeSsoPkg) {
+            // 某些通道返回的 wupBuffer 可能已经是 body（不带 OIDBSSOPkg），按 body 透传。
+            Log.w(
+                TAG,
+                "groupFile: oidb rsp without sso pkg cmd=$cmd bytes=${rawBytes.size} " +
+                    "-> treat as body",
+            )
+            return OidbResponse(0, "", rawBytes)
+        }
+        val result = pbInt(rspPkg, "uint32_result")
+        val errMsg = pbString(rspPkg, "str_error_msg")
+        val respBody = pbBytes(rspPkg, "bytes_bodybuffer") ?: ByteArray(0)
+        Log.i(
+            TAG,
+            "groupFile: oidb rsp cmd=$cmd result=$result errMsg=${errMsg.take(120)} " +
+                "bytes=${respBody.size} rspBytes=${rawBytes.size} " +
+                "rspHex=${hexLowerPrefix(rawBytes, 128)}",
+        )
+        return OidbResponse(result, errMsg, respBody)
+    }
+
+    /** 通用群文件 OIDB 操作：ReqBody.{field} + group_code/app_id，解 RspBody.{rspField}.int32_ret_code。 */
+    private fun oidbGroupFileOp(
+        chatId: String,
+        op: String,
+        cmd: String,
+        command: Int,
+        serviceType: Int,
+        reqBodyClass: String,
+        reqFieldName: String,
+        rspBodyClass: String,
+        rspFieldName: String,
+        fill: (Any) -> Unit,
+    ): Pair<Int, String>? {
+        val groupCode = groupCodeFor(chatId) ?: run {
+            Log.w(TAG, "groupFile: $op failed (not a group / no groupCode) chat=$chatId")
+            return null
+        }
+        return try {
+            val reqBody = newPb(reqBodyClass) ?: run {
+                Log.w(TAG, "groupFile: $op req class missing $reqBodyClass")
+                return null
+            }
+            val nested = pbMessage(reqBody, reqFieldName) ?: run {
+                Log.w(TAG, "groupFile: $op req field missing $reqFieldName")
+                return null
+            }
+            pbSet(nested, "uint64_group_code", groupCode)
+            pbSet(nested, "uint32_app_id", 3)
+            fill(nested)
+            // 必须显式置 hasFlag，否则父 ReqBody 序列化时会跳过子消息（body=0 字节）。
+            pbSetHasFlag(nested, true)
+            val reqBytes = pbBytesOf(reqBody) ?: run {
+                Log.w(TAG, "groupFile: $op encode req failed")
+                return null
+            }
+            if (reqBytes.isEmpty()) {
+                Log.w(TAG, "groupFile: $op empty body! cmd=$cmd group=$groupCode subHasFlag=true")
+            }
+            Log.i(
+                TAG,
+                "groupFile: $op req cmd=$cmd command=$command svc=$serviceType " +
+                    "group=$groupCode bytes=${reqBytes.size} bodyLen=${reqBytes.size} " +
+                    "bodyHex=${hexLowerPrefix(reqBytes, 32)}",
+            )
+            val rsp = sendOidbRequest(cmd, command, serviceType, reqBytes) ?: run {
+                Log.w(TAG, "groupFile: $op failed (oidb send failed) cmd=$cmd")
+                return null
+            }
+            if (rsp.result != 0) {
+                Log.w(TAG, "groupFile: $op oidb result=${rsp.result} msg=${rsp.errorMsg.take(120)}")
+                return rsp.result to rsp.errorMsg
+            }
+            val rspBody = pbParse(rspBodyClass, rsp.body) ?: run {
+                Log.w(TAG, "groupFile: $op parse rsp failed (${rsp.body.size}B)")
+                return null
+            }
+            val nestedRsp = pbMessage(rspBody, rspFieldName)
+            val retHas = pbHas(nestedRsp, "int32_ret_code")
+            val retCode = nestedRsp?.let { pbInt(it, "int32_ret_code") } ?: 0
+            val retMsg = nestedRsp?.let { pbString(it, "str_ret_msg") }.orEmpty()
+            Log.i(
+                TAG,
+                "groupFile: $op retCode=$retCode retHas=$retHas msg=${retMsg.take(120)} " +
+                    "oidbResult=0 rspBytes=${rsp.body.size}",
+            )
+            retCode to retMsg
+        } catch (t: Throwable) {
+            Log.w(TAG, "groupFile: $op failed: ${t.javaClass.simpleName} ${t.message}")
+            null
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 0x6d8 列表
+    // ------------------------------------------------------------------
+
+    private fun mapOidbFolderEntry(
+        folderInfo: Any?,
+        index: Int,
+        fallbackFolderId: String,
+    ): GroupFileEntry? {
+        folderInfo ?: return null
+        val folderId = pbString(folderInfo, "str_folder_id")
+        val name = pbString(folderInfo, "str_folder_name")
+        val parent = pbString(folderInfo, "str_parent_folder_id")
+            .takeIf { it.isNotBlank() } ?: fallbackFolderId
+        val count = pbInt(folderInfo, "uint32_total_file_count")
+        val createTime = pbLong(folderInfo, "uint32_create_time")
+        val creator = pbString(folderInfo, "str_creator_name")
+        Log.i(
+            TAG,
+            "groupFile: list item[$index] type=2(folder) folderId=$folderId name=$name " +
+                "parent=$parent count=$count creator=$creator createTime=$createTime",
+        )
+        return GroupFileEntry(
+            folderId = folderId,
+            parentFolderId = parent,
+            name = name,
+            isFolder = true,
+            uploaderName = creator,
+            uploadTime = createTime,
+            fileCount = count,
+        )
+    }
+
+    /** 群文件下载缓存目录：cacheDir/group_files。 */
+    private fun groupFileCacheDir(context: Context): java.io.File =
+        java.io.File(context.cacheDir, "group_files")
+
+    /** 统一规范化文件名（下载与列表缓存回填必须一致）：替换非法路径字符，空则用 fileId 前 8 位。 */
+    private fun sanitizeGroupFileName(rawName: String, fileId: String): String =
+        rawName.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim()
+            .ifBlank { "group_file_${fileId.take(8)}" }
+
+    /**
+     * 查已下载缓存并回填 localPath：
+     * 1) 进程内 fileId->path 映射命中；
+     * 2) cacheDir/group_files/<sanitize(fileName)> 存在且大小匹配（fileSize<=0 时仅按文件名）；
+     * 3) 文件名对不上时按大小在缓存目录里找（下载 rsp 的 str_save_file_name 可能与列表 fileName 不同）。
+     */
+    private fun findCachedGroupFile(fileId: String, fileName: String, fileSize: Long): String? {
+        if (fileId.isBlank()) return null
+        groupFileDownloadedPaths[fileId]?.takeIf { pathUsable(it) }?.let { return it }
+        val context = appContext() ?: return null
+        val dir = groupFileCacheDir(context)
+        if (!dir.isDirectory) return null
+        val byName = java.io.File(dir, sanitizeGroupFileName(fileName, fileId))
+        if (byName.isFile && byName.length() > 0L &&
+            (fileSize <= 0L || byName.length() == fileSize)
+        ) {
+            groupFileDownloadedPaths[fileId] = byName.absolutePath
+            return byName.absolutePath
+        }
+        if (fileSize > 0L) {
+            val bySize = runCatching { dir.listFiles() }.getOrNull()
+                ?.firstOrNull { it.isFile && it.length() == fileSize }
+            if (bySize != null) {
+                groupFileDownloadedPaths[fileId] = bySize.absolutePath
+                return bySize.absolutePath
+            }
+        }
+        return null
+    }
+
+    private fun mapOidbFileEntry(
+        fileInfo: Any?,
+        index: Int,
+        fallbackFolderId: String,
+    ): GroupFileEntry? {
+        fileInfo ?: return null
+        val fileId = pbString(fileInfo, "str_file_id")
+        val name = pbString(fileInfo, "str_file_name")
+        val parent = pbString(fileInfo, "str_parent_folder_id")
+            .takeIf { it.isNotBlank() } ?: fallbackFolderId
+        val size = pbLong(fileInfo, "uint64_file_size")
+        val busId = pbInt(fileInfo, "uint32_bus_id")
+        val uploader = pbString(fileInfo, "str_uploader_name")
+        val uploadTime = pbLong(fileInfo, "uint32_upload_time")
+        val deadTime = pbInt(fileInfo, "uint32_dead_time")
+        val downloadTimes = pbInt(fileInfo, "uint32_download_times")
+        val md5 = pbBytes(fileInfo, "bytes_md5")?.let { hexLower(it) }.orEmpty()
+        val serverLocalPath = pbString(fileInfo, "str_local_path").takeIf { pathUsable(it) }
+        if (serverLocalPath != null) groupFileDownloadedPaths[fileId] = serverLocalPath
+        // 服务端 localPath 常为空：列表刷新时回填我们自己下载到 cacheDir/group_files 的文件。
+        val localPath = serverLocalPath
+            ?: findCachedGroupFile(fileId, name, size)?.also { path ->
+                if (loggedGroupFileCacheHits.add(fileId)) {
+                    Log.i(
+                        TAG,
+                        "groupFile: local cache hit file=$name fileId=$fileId " +
+                            "size=$size path=${path.take(140)}",
+                    )
+                }
+            }
+        Log.i(
+            TAG,
+            "groupFile: list item[$index] type=1(file) fileId=$fileId name=$name " +
+                "parent=$parent size=$size busId=$busId uploader=$uploader uploadTime=$uploadTime " +
+                "downloads=$downloadTimes deadTime=$deadTime md5=${md5.take(16)} " +
+                "local=${localPath?.take(100)}",
+        )
+        return GroupFileEntry(
+            fileId = fileId,
+            parentFolderId = parent,
+            name = name,
+            isFolder = false,
+            fileSize = size,
+            uploaderName = uploader,
+            uploadTime = uploadTime,
+            downloadTimes = downloadTimes,
+            localPath = localPath,
+            md5 = md5,
+            busId = busId,
+            deadTime = deadTime,
+        )
+    }
+
+    private class OidbGroupFileListData(
+        val reqFrom: Int,
+        val filterCode: Int,
+        val retCode: Int,
+        val retMsg: String,
+        val isEnd: Boolean,
+        val nextIndex: Int,
+        val allFileCount: Int,
+        val role: Int,
+        val items: List<Any>,
+        val bytesContext: ByteArray,
+        val rspBodyHex: String,
+    )
+
+    /**
+     * 单次 0x6d8_1 请求（列表）。
+     * TIM 原版参数（反编译 com.tencent.biz.troop.file.a.g 调用方）：根目录 str_folder_id="/"、
+     * req_from=3、filter_code=1、app_id=3、sort_by=1、sort_order=0、show_onlinedoc_folder=0。
+     * 返回 null 表示发送/解析失败；ret_code 非 0 由调用方处理。
+     */
+    private fun requestOidbGroupFileList(
+        chatId: String,
+        groupCode: Long,
+        folderId: String,
+        startIndex: Int,
+        safeCount: Int,
+        reqFrom: Int,
+        filterCode: Int,
+        bytesContext: ByteArray = ByteArray(0),
+        fieldFlag: Int? = null,
+    ): OidbGroupFileListData? {
+        return try {
+            val reqBody = newPb("tencent.im.oidb.cmd0x6d8.oidb_0x6d8\$ReqBody") ?: run {
+                Log.w(TAG, "groupFile: list req class missing")
+                return null
+            }
+            val listReq = pbMessage(reqBody, "file_list_info_req") ?: run {
+                Log.w(TAG, "groupFile: list req field missing")
+                return null
+            }
+            pbSet(listReq, "uint64_group_code", groupCode)
+            pbSet(listReq, "uint32_app_id", 3)
+            pbSet(listReq, "str_folder_id", folderId)
+            pbSet(listReq, "uint32_file_count", safeCount)
+            pbSet(listReq, "uint32_start_index", startIndex)
+            pbSet(listReq, "uint32_all_file_count", 0)
+            pbSet(listReq, "uint32_req_from", reqFrom)
+            pbSet(listReq, "uint32_filter_code", filterCode)
+            pbSet(listReq, "uint32_sort_by", 1) // 1 = 按时间
+            pbSet(listReq, "uint32_sort_order", 0)
+            pbSet(listReq, "uint32_show_onlinedoc_folder", 0)
+            pbSet(listReq, "bytes_context", pbByteStringOf(bytesContext))
+            if (fieldFlag != null) pbSet(listReq, "uint32_field_flag", fieldFlag)
+            // 必须显式置 hasFlag，否则 0x6d8 ReqBody 序列化时跳过 file_list_info_req → body=0 字节。
+            pbSetHasFlag(listReq, true)
+            Log.i(
+                TAG,
+                "groupFile: list body sub fields group=$groupCode folder=$folderId " +
+                    "count=$safeCount start=$startIndex reqFrom=$reqFrom filterCode=$filterCode " +
+                    "contextLen=${bytesContext.size} fieldFlag=${fieldFlag ?: "default"} " +
+                    "sortBy=1 sortOrder=0 subHasFlag=true",
+            )
+            val reqBytes = pbBytesOf(reqBody) ?: run {
+                Log.w(TAG, "groupFile: list encode req failed")
+                return null
+            }
+            if (reqBytes.isEmpty()) {
+                Log.w(TAG, "groupFile: list empty body! chat=$chatId group=$groupCode")
+            }
+            Log.i(
+                TAG,
+                "groupFile: list req chat=$chatId group=$groupCode folder=$folderId " +
+                    "start=$startIndex count=$safeCount reqFrom=$reqFrom filterCode=$filterCode " +
+                    "bytes=${reqBytes.size} bodyLen=${reqBytes.size} " +
+                    "bodyHex=${hexLowerPrefix(reqBytes, 32)}",
+            )
+            // 群文件页用户等待：单次 OIDB 最多 2.5s（原默认 8s，组合矩阵失败时会白等很久）。
+            val rsp = sendOidbRequest("OidbSvc.0x6d8_1", 1752, 1, reqBytes, timeoutMs = 2_500L) ?: run {
+                Log.w(TAG, "groupFile: list failed (oidb send failed) reqFrom=$reqFrom filterCode=$filterCode")
+                return null
+            }
+            if (rsp.result != 0) {
+                Log.w(
+                    TAG,
+                    "groupFile: list oidb result=${rsp.result} msg=${rsp.errorMsg.take(120)} " +
+                        "reqFrom=$reqFrom filterCode=$filterCode",
+                )
+                return OidbGroupFileListData(
+                    reqFrom = reqFrom,
+                    filterCode = filterCode,
+                    retCode = rsp.result,
+                    retMsg = rsp.errorMsg,
+                    isEnd = true,
+                    nextIndex = 0,
+                    allFileCount = 0,
+                    role = 0,
+                    items = emptyList(),
+                    bytesContext = ByteArray(0),
+                    rspBodyHex = hexLowerPrefix(rsp.body, 128),
+                )
+            }
+            val rspBody = pbParse("tencent.im.oidb.cmd0x6d8.oidb_0x6d8\$RspBody", rsp.body) ?: run {
+                Log.w(TAG, "groupFile: list parse rsp failed (${rsp.body.size}B)")
+                return null
+            }
+            val listRsp = pbMessage(rspBody, "file_list_info_rsp") ?: run {
+                Log.w(TAG, "groupFile: list rsp field missing")
+                return null
+            }
+            val retHas = pbHas(listRsp, "int32_ret_code")
+            val retCode = pbInt(listRsp, "int32_ret_code")
+            val retMsg = pbString(listRsp, "str_ret_msg")
+            val isEnd = pbBool(listRsp, "bool_is_end")
+            val nextIndex = pbInt(listRsp, "uint32_next_index")
+            val allFileCount = pbInt(listRsp, "uint32_all_file_count")
+            val role = pbInt(listRsp, "uint32_role")
+            val items = pbRepeatMessages(listRsp, "rpt_item_list")
+            val bodyHex = hexLowerPrefix(rsp.body, 128)
+            Log.i(
+                TAG,
+                "groupFile: list rsp reqFrom=$reqFrom filterCode=$filterCode ret=$retCode " +
+                    "retHas=$retHas msg=${retMsg.take(120)} isEnd=$isEnd next=$nextIndex " +
+                    "all=$allFileCount role=$role items=${items.size} " +
+                    "contextLen=${(pbBytes(listRsp, "bytes_context") ?: ByteArray(0)).size} " +
+                    "fieldFlag=${fieldFlag ?: "default"} " +
+                    "rspBodyBytes=${rsp.body.size} rspBodyHex=$bodyHex",
+            )
+            OidbGroupFileListData(
+                reqFrom = reqFrom,
+                filterCode = filterCode,
+                retCode = retCode,
+                retMsg = retMsg,
+                isEnd = isEnd,
+                nextIndex = nextIndex,
+                allFileCount = allFileCount,
+                role = role,
+                items = items,
+                bytesContext = pbBytes(listRsp, "bytes_context") ?: ByteArray(0),
+                rspBodyHex = bodyHex,
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "groupFile: list request failed: ${t.javaClass.simpleName} ${t.message}")
+            null
+        }
+    }
+
+    /** GroupItem 列表 → GroupFileEntry（逐条 item 日志在 mapOidbFolderEntry/mapOidbFileEntry 内）。 */
+    private fun mapOidbListEntries(
+        data: OidbGroupFileListData,
+        parentFolderId: String,
+    ): List<GroupFileEntry> {
+        val entries = ArrayList<GroupFileEntry>(data.items.size)
+        data.items.forEachIndexed { index, item ->
+            val type = pbInt(item, "uint32_type")
+            val folderInfo = pbMessage(item, "folder_info")
+            val fileInfo = pbMessage(item, "file_info")
+            val folderId = folderInfo?.let { pbString(it, "str_folder_id") }.orEmpty()
+            val fileId = fileInfo?.let { pbString(it, "str_file_id") }.orEmpty()
+            Log.i(
+                TAG,
+                "groupFile: list item[$index] raw type=$type folderId=${folderId.take(64)} " +
+                    "fileId=${fileId.take(64)}",
+            )
+            val entry = when {
+                type == 2 -> mapOidbFolderEntry(folderInfo, index, parentFolderId)
+                type == 1 -> mapOidbFileEntry(fileInfo, index, parentFolderId)
+                folderId.isNotBlank() && fileId.isBlank() ->
+                    mapOidbFolderEntry(folderInfo, index, parentFolderId)
+                else -> mapOidbFileEntry(fileInfo, index, parentFolderId)
+            } ?: return@forEachIndexed
+            entries.add(entry)
+        }
+        return entries
+    }
+
+    /**
+     * 列群文件/文件夹（旧版 OIDB 0x6d8_1，command 1752 / service 1）：
+     * req oidb_0x6d8$ReqBody.file_list_info_req；rsp file_list_info_rsp（rpt_item_list /
+     * is_end / next_index / all_file_count / uint32_role）。Item.uint32_type：TIM 源码确认 1=文件、2=文件夹。
+     */
+    fun listGroupFiles(
+        chatId: String,
+        parentFolderId: String,
+        startIndex: Int = 0,
+        count: Int = 50,
+    ): GroupFilePage? {
+        if (!isHost) return null
+        return try {
+            val groupCode = groupCodeFor(chatId) ?: run {
+                Log.w(TAG, "groupFile: list failed (not a group / no groupCode) chat=$chatId")
+                return GroupFilePage(error = "not a group")
+            }
+            val safeCount = count.coerceIn(1, 200)
+            val start = startIndex.coerceAtLeast(0)
+            // TIM 原版：根目录 str_folder_id="/"；默认 filter_code=3、req_from=3、sort_by=1、sort_order=0。
+            val requestFolderId = parentFolderId.ifBlank { "/" }
+            // 组合矩阵：主参数 filter=3/reqFrom=3 优先；再按 Lead 要求依次对比，直到某组能返回文件（files>0）。
+            val combos = linkedSetOf<Pair<Int, Int>>()
+            listOf(
+                3 to 3, 0 to 0, 3 to 0, 0 to 3,
+                1 to 3, 1 to 0, 5 to 3, 5 to 0,
+                2 to 3, 2 to 0, 4 to 3, 4 to 0,
+                3 to 1, 0 to 1, 1 to 1, 5 to 1, 2 to 1, 4 to 1,
+            ).forEach { combos.add(it) }
+            var best: OidbGroupFileListData? = null
+            var bestEntries: List<GroupFileEntry> = emptyList()
+            var bestFiles = 0
+            var bestFolders = 0
+            var tried = 0
+            var lastError = "no attempt"
+            for ((filterCode, reqFrom) in combos) {
+                tried++
+                val data = requestOidbGroupFileList(
+                    chatId = chatId,
+                    groupCode = groupCode,
+                    folderId = requestFolderId,
+                    startIndex = start,
+                    safeCount = safeCount,
+                    reqFrom = reqFrom,
+                    filterCode = filterCode,
+                ) ?: run {
+                    Log.w(TAG, "groupFile: list try filter=$filterCode reqFrom=$reqFrom failed (send/parse)")
+                    continue
+                }
+                if (data.retCode != 0) {
+                    Log.i(
+                        TAG,
+                        "groupFile: list try filter=$filterCode reqFrom=$reqFrom " +
+                            "ret=${data.retCode} msg=${data.retMsg.take(80)} items=${data.items.size}",
+                    )
+                    lastError = "ret=${data.retCode}"
+                    continue
+                }
+                val entries = mapOidbListEntries(data, parentFolderId)
+                val folders = entries.count { it.isFolder }
+                val files = entries.size - folders
+                Log.i(
+                    TAG,
+                    "groupFile: list try filter=$filterCode reqFrom=$reqFrom " +
+                        "items=${data.items.size} folders=$folders files=$files " +
+                        "all=${data.allFileCount} isEnd=${data.isEnd} next=${data.nextIndex}",
+                )
+                if (best == null || files > bestFiles || (files == bestFiles && entries.size > bestEntries.size)) {
+                    best = data
+                    bestEntries = entries
+                    bestFiles = files
+                    bestFolders = folders
+                }
+                if (files > 0) {
+                    Log.i(
+                        TAG,
+                        "groupFile: list try hit filter=$filterCode reqFrom=$reqFrom " +
+                            "files=$files folders=$folders",
+                    )
+                    break
+                }
+            }
+            // 所有组合 files 都 0：若是分页响应（isEnd=false）再按 bytes_context/next_index 翻一次页。
+            if (bestFiles == 0 && best != null && !best!!.isEnd && best!!.bytesContext.isNotEmpty()) {
+                val current = best!!
+                Log.i(
+                    TAG,
+                    "groupFile: list paging fallback start=${current.nextIndex} " +
+                        "contextLen=${current.bytesContext.size} filter=${current.filterCode} " +
+                        "reqFrom=${current.reqFrom}",
+                )
+                val paged = requestOidbGroupFileList(
+                    chatId = chatId,
+                    groupCode = groupCode,
+                    folderId = requestFolderId,
+                    startIndex = current.nextIndex,
+                    safeCount = safeCount,
+                    reqFrom = current.reqFrom,
+                    filterCode = current.filterCode,
+                    bytesContext = current.bytesContext,
+                )
+                if (paged != null && paged.retCode == 0) {
+                    val entries2 = mapOidbListEntries(paged, parentFolderId)
+                    val folders2 = entries2.count { it.isFolder }
+                    val files2 = entries2.size - folders2
+                    Log.i(
+                        TAG,
+                        "groupFile: list paging try items=${paged.items.size} " +
+                            "folders=$folders2 files=$files2 isEnd=${paged.isEnd}",
+                    )
+                    if (files2 > bestFiles || (files2 == bestFiles && entries2.size > bestEntries.size)) {
+                        best = paged
+                        bestEntries = entries2
+                        bestFiles = files2
+                        bestFolders = folders2
+                    }
+                } else {
+                    Log.w(TAG, "groupFile: list paging fallback failed")
+                }
+            }
+            // 仍无文件：额外用显式 field_flag=0xFFFFFF 试一次（TIM 默认值，日志便于对比）。
+            if (bestFiles == 0 && best != null) {
+                val current = best!!
+                val fieldFlag = 0xFFFFFF
+                Log.i(
+                    TAG,
+                    "groupFile: list fieldFlag retry filter=${current.filterCode} " +
+                        "reqFrom=${current.reqFrom} fieldFlag=$fieldFlag",
+                )
+                val extra = requestOidbGroupFileList(
+                    chatId = chatId,
+                    groupCode = groupCode,
+                    folderId = requestFolderId,
+                    startIndex = start,
+                    safeCount = safeCount,
+                    reqFrom = current.reqFrom,
+                    filterCode = current.filterCode,
+                    bytesContext = current.bytesContext,
+                    fieldFlag = fieldFlag,
+                )
+                if (extra != null && extra.retCode == 0) {
+                    val entries3 = mapOidbListEntries(extra, parentFolderId)
+                    val folders3 = entries3.count { it.isFolder }
+                    val files3 = entries3.size - folders3
+                    Log.i(
+                        TAG,
+                        "groupFile: list fieldFlag try items=${extra.items.size} " +
+                            "folders=$folders3 files=$files3",
+                    )
+                    if (files3 > bestFiles || (files3 == bestFiles && entries3.size > bestEntries.size)) {
+                        best = extra
+                        bestEntries = entries3
+                        bestFiles = files3
+                        bestFolders = folders3
+                    }
+                }
+            }
+            val finalData = best ?: run {
+                Log.w(TAG, "groupFile: list failed (no valid attempt, tried=$tried lastError=$lastError)")
+                return GroupFilePage(error = "list failed: $lastError")
+            }
+            groupFileRoleByGroup[groupCode] = finalData.role
+            // 最终生效参数（Lead 要求）
+            Log.i(
+                TAG,
+                "groupFile: list result filter=${finalData.filterCode} reqFrom=${finalData.reqFrom} " +
+                    "ret=${finalData.retCode} reqItems=${finalData.items.size} isEnd=${finalData.isEnd} " +
+                    "next=${finalData.nextIndex} all=${finalData.allFileCount} role=${finalData.role} " +
+                    "folders=$bestFolders files=$bestFiles entries=${bestEntries.size} tried=$tried",
+            )
+            if (bestEntries.isEmpty() && finalData.allFileCount > 0) {
+                Log.w(
+                    TAG,
+                    "groupFile: list no entries mapped (items=${finalData.items.size}) " +
+                        "rspBodyHex=${finalData.rspBodyHex}",
+                )
+            }
+            GroupFilePage(
+                entries = bestEntries,
+                isEnd = finalData.isEnd,
+                nextIndex = finalData.nextIndex,
+                allFileCount = finalData.allFileCount,
+                error = null,
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "groupFile: list failed: ${t.javaClass.simpleName} ${t.message}")
+            GroupFilePage(error = "list failed: ${t.javaClass.simpleName} ${t.message}")
+        }
+    }
+
+    /** 群文件管理权限：沿用群成员信息（群主/管理员）判定；列表 rsp 的 role 仅打日志辅助核对。 */
+    fun canManageGroupFiles(chatId: String): Boolean {
+        if (!isHost) return false
+        val groupCode = runCatching { groupCodeFor(chatId) }.getOrNull()
+        val role = groupCode?.let { groupFileRoleByGroup[it] }
+        val memberSelfRole = groupCode?.let { groupMemberSelfRoleByGroupCode[it] }
+        return runCatching {
+            val meta = chatMeta[chatId] ?: ensureChatContext(chatId)
+            if (meta?.isGroup != true) {
+                logCanManageGroupFiles(chatId, false, false, false, false)
+                Log.i(
+                    TAG,
+                    "groupFile: canManage chat=$chatId listRole=$role " +
+                        "memberSelfRole=$memberSelfRole -> false (not group)",
+                )
+                return false
+            }
+            val me = ensureGroupMembersForManage(chatId).firstOrNull { it.isMe }
+            val owner = me?.isOwner == true
+            val admin = me?.isAdmin == true
+            val allowed = me != null && (owner || admin)
+            logCanManageGroupFiles(chatId, me != null, owner, admin, allowed)
+            Log.i(
+                TAG,
+                "groupFile: canManage chat=$chatId listRole=$role memberSelfRole=$memberSelfRole " +
+                    "me=${me != null} owner=$owner admin=$admin -> $allowed",
+            )
+            allowed
+        }.getOrElse { t ->
+            Log.w(TAG, "groupFile: canManage failed chat=$chatId: ${t.javaClass.simpleName} ${t.message}")
+            false
+        }
+    }
+
+    private fun logCanManageGroupFiles(
+        chatId: String,
+        meFound: Boolean,
+        owner: Boolean,
+        admin: Boolean,
+        allowed: Boolean,
+    ) {
+        if (canManageGroupFilesLogged.put(chatId, allowed) != allowed) {
+            Log.i(
+                TAG,
+                "groupFile: canManageChanged chat=$chatId me=$meFound owner=$owner admin=$admin -> $allowed",
+            )
+        }
+    }
+
+    private fun handleGroupFileTransfer(info: Any?, complete: Boolean) {
+        if (info == null || groupFileDownloadStates.isEmpty()) return
+        val fileId = (invokeGetter(info, "getFileId") as? String).orEmpty()
+        val fileModelId = (invokeGetter(info, "getFileModelId") as? Number)?.toLong() ?: 0L
+        if (fileId.isBlank() && fileModelId == 0L) return
+        val state = findGroupFileDownloadState(fileId, fileModelId) ?: return
+        val progressRaw = (invokeGetter(info, "getFileProgress") as? Number)?.toLong() ?: 0L
+        val totalSize = (invokeGetter(info, "getTotalSize") as? Number)?.toLong() ?: 0L
+        val status = (invokeGetter(info, "getTrasferStatus") as? Number)?.toInt() ?: 0
+        val errCode = (invokeGetter(info, "getFileErrCode") as? Number)?.toLong() ?: 0L
+        val errMsg = (invokeGetter(info, "getFileErrMsg") as? String).orEmpty()
+        val rawPath = invokeGetter(info, "getFilePath") as? String
+        val pct = if (totalSize > 0L) {
+            (progressRaw * 100L / totalSize).toInt().coerceIn(0, 100)
+        } else {
+            progressRaw.toInt().coerceIn(0, 100)
+        }
+        if (rawPath != null && pathUsable(rawPath)) state.path = rawPath
+        if (errCode != 0L) {
+            state.progress = pct
+            state.failed = true
+            state.message = "errCode=$errCode $errMsg"
+            Log.w(
+                TAG,
+                "groupFile: download failed fileId=$fileId model=$fileModelId " +
+                    "errCode=$errCode msg=$errMsg path=${rawPath?.take(100)}",
+            )
+            return
+        }
+        if (complete || pct >= 100 || (state.path != null && status >= 2)) {
+            state.done = true
+            state.progress = 100
+            Log.i(
+                TAG,
+                "groupFile: download done fileId=$fileId model=$fileModelId " +
+                    "status=$status path=${state.path?.take(120)}",
+            )
+        } else {
+            state.progress = pct
+            // 回调频率高：每 5% 或状态变化才打一条，避免刷屏。
+            if (pct - state.lastLoggedProgress >= 5 || pct == 0) {
+                state.lastLoggedProgress = pct
+                Log.i(
+                    TAG,
+                    "groupFile: download progress fileId=$fileId model=$fileModelId " +
+                        "pct=$pct progress=$progressRaw total=$totalSize status=$status",
+                )
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 0x6d6_2 下载
+    // ------------------------------------------------------------------
+
+    private fun buildGroupFileDownloadUrl(
+        scheme: String,
+        host: String,
+        downloadUrlHex: String,
+        fileId: String,
+    ): String = "$scheme://$host/ftn_handler/$downloadUrlHex/?fname=${hexLower(fileId)}"
+
+    private fun downloadHttpToFile(
+        fileId: String,
+        url: String,
+        target: java.io.File,
+        cookieHex: String,
+        expectedSize: Long,
+        onProgress: (GroupFileDownload) -> Unit,
+    ): GroupFileDownload? {
+        return try {
+            Log.i(
+                TAG,
+                "groupFile: download http try url=${url.take(220)} cookie=${cookieHex.take(24)} " +
+                    "target=${target.absolutePath}",
+            )
+            val connection = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+            connection.connectTimeout = 15_000
+            connection.readTimeout = 30_000
+            connection.instanceFollowRedirects = true
+            connection.setRequestProperty("User-Agent", "TroopFile")
+            if (cookieHex.isNotBlank()) connection.setRequestProperty("Cookie", "FTN5K=$cookieHex")
+            connection.setRequestProperty("Accept-Encoding", "identity")
+            val code = connection.responseCode
+            if (code !in 200..299) {
+                Log.w(TAG, "groupFile: download http status=$code url=${url.take(200)}")
+                connection.disconnect()
+                return null
+            }
+            val contentLength = connection.contentLengthLong.takeIf { it > 0L } ?: 0L
+            val totalSize = if (contentLength > 0L) contentLength else expectedSize
+            var lastReported = -1
+            java.io.FileOutputStream(target).use { output ->
+                connection.inputStream.use { input ->
+                    val buffer = ByteArray(64 * 1024)
+                    var downloaded = 0L
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read <= 0) break
+                        output.write(buffer, 0, read)
+                        downloaded += read
+                        val pct = if (totalSize > 0L) {
+                            (downloaded * 100L / totalSize).toInt().coerceIn(0, 100)
+                        } else {
+                            0
+                        }
+                        if (pct - lastReported >= 5 || pct == 100) {
+                            lastReported = pct
+                            runCatching {
+                                onProgress(
+                                    GroupFileDownload(
+                                        fileId = fileId,
+                                        progress = pct,
+                                        path = null,
+                                        done = false,
+                                    ),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            connection.disconnect()
+            val size = target.length()
+            if (expectedSize > 0L && size != expectedSize) {
+                Log.w(
+                    TAG,
+                    "groupFile: download size mismatch fileId=$fileId got=$size expected=$expectedSize",
+                )
+                target.delete()
+                return null
+            }
+            val result = GroupFileDownload(
+                fileId = fileId,
+                progress = 100,
+                path = target.absolutePath,
+                done = true,
+            )
+            runCatching { onProgress(result) }
+            result
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "groupFile: download http failed url=${url.take(160)}: " +
+                    "${t.javaClass.simpleName} ${t.message}",
+            )
+            runCatching { target.delete() }
+            null
+        }
+    }
+
+    /**
+     * 下载群文件（旧版 OIDB 0x6d6_2，command 1750 / service 2）：
+     * req download_file_req；rsp DownloadFileRspBody 给 download_url/ip/dns/cookie，
+     * URL = http(s)://<ip|dns>/ftn_handler/<hex(bytes_download_url)>/?fname=<hex(fileId)>，
+     * Header Cookie=FTN5K=<hex(bytes_cookie_val)>（与 TIM TroopFileDownloadWorker 一致）。
+     */
+    fun downloadGroupFile(
+        chatId: String,
+        entry: GroupFileEntry,
+        onProgress: (GroupFileDownload) -> Unit = {},
+    ): GroupFileDownload? {
+        if (!isHost) return null
+        if (entry.isFolder) {
+            Log.w(TAG, "groupFile: download skipped (entry is folder) name=${entry.name}")
+            return null
+        }
+        return try {
+            entry.localPath?.takeIf { pathUsable(it) }?.let { localPath ->
+                val done = GroupFileDownload(
+                    fileId = entry.fileId,
+                    progress = 100,
+                    path = localPath,
+                    done = true,
+                )
+                runCatching { onProgress(done) }
+                groupFileDownloadedPaths[entry.fileId] = localPath
+                Log.i(TAG, "groupFile: download already local fileId=${entry.fileId} path=${localPath.take(120)}")
+                return done
+            }
+            // 列表刷新后 entry.localPath 可能丢失：先查缓存（fileId 映射/规范化文件名/大小），命中直接 done。
+            findCachedGroupFile(entry.fileId, entry.name, entry.fileSize)?.let { cachedPath ->
+                if (loggedGroupFileCacheHits.add(entry.fileId)) {
+                    Log.i(
+                        TAG,
+                        "groupFile: local cache hit file=${entry.name} fileId=${entry.fileId} " +
+                            "size=${entry.fileSize} path=${cachedPath.take(140)}",
+                    )
+                }
+                val done = GroupFileDownload(
+                    fileId = entry.fileId,
+                    progress = 100,
+                    path = cachedPath,
+                    done = true,
+                )
+                runCatching { onProgress(done) }
+                return done
+            }
+            val context = appContext() ?: hostContext() ?: run {
+                Log.w(TAG, "groupFile: download failed (no context)")
+                return null
+            }
+            val groupCode = groupCodeFor(chatId) ?: run {
+                Log.w(TAG, "groupFile: download failed (not a group / no groupCode) chat=$chatId")
+                return null
+            }
+            val reqBody = newPb("tencent.im.oidb.cmd0x6d6.oidb_0x6d6\$ReqBody") ?: run {
+                Log.w(TAG, "groupFile: download req class missing")
+                return null
+            }
+            val nested = pbMessage(reqBody, "download_file_req") ?: run {
+                Log.w(TAG, "groupFile: download req field missing")
+                return null
+            }
+            pbSet(nested, "uint64_group_code", groupCode)
+            pbSet(nested, "uint32_app_id", 3)
+            pbSet(nested, "uint32_bus_id", entry.busId)
+            pbSet(nested, "str_file_id", entry.fileId)
+            pbSet(nested, "uint32_url_type", 0)
+            pbSet(nested, "bool_thumbnail_req", false)
+            pbSet(nested, "bool_preview_req", false)
+            pbSetHasFlag(nested, true)
+            val reqBytes = pbBytesOf(reqBody) ?: run {
+                Log.w(TAG, "groupFile: download encode req failed")
+                return null
+            }
+            if (reqBytes.isEmpty()) {
+                Log.w(TAG, "groupFile: download empty body! fileId=${entry.fileId}")
+            }
+            Log.i(
+                TAG,
+                "groupFile: download req chat=$chatId group=$groupCode busId=${entry.busId} " +
+                    "fileId=${entry.fileId} name=${entry.name} size=${entry.fileSize} " +
+                    "bytes=${reqBytes.size} bodyLen=${reqBytes.size} " +
+                    "bodyHex=${hexLowerPrefix(reqBytes, 32)}",
+            )
+            val rsp = sendOidbRequest("OidbSvc.0x6d6_2", 1750, 2, reqBytes) ?: run {
+                Log.w(TAG, "groupFile: download failed (oidb send failed)")
+                return GroupFileDownload(
+                    fileId = entry.fileId,
+                    failed = true,
+                    message = "oidb 0x6d6_2 send failed",
+                )
+            }
+            if (rsp.result != 0) {
+                return GroupFileDownload(
+                    fileId = entry.fileId,
+                    failed = true,
+                    message = "oidb result=${rsp.result} ${rsp.errorMsg}",
+                )
+            }
+            val rspBody = pbParse("tencent.im.oidb.cmd0x6d6.oidb_0x6d6\$RspBody", rsp.body) ?: run {
+                Log.w(TAG, "groupFile: download parse rsp failed (${rsp.body.size}B)")
+                return GroupFileDownload(fileId = entry.fileId, failed = true, message = "parse rsp failed")
+            }
+            val dl = pbMessage(rspBody, "download_file_rsp") ?: run {
+                Log.w(TAG, "groupFile: download rsp field missing")
+                return GroupFileDownload(fileId = entry.fileId, failed = true, message = "download_file_rsp missing")
+            }
+            val retHas = pbHas(dl, "int32_ret_code")
+            val retCode = pbInt(dl, "int32_ret_code")
+            val retMsg = pbString(dl, "str_ret_msg")
+            val downloadIp = pbString(dl, "str_download_ip")
+            val downloadDns = pbBytes(dl, "str_download_dns")?.toString(Charsets.UTF_8).orEmpty()
+            val downloadDnsHttps = pbString(dl, "str_download_dns_https")
+            val downloadUrlHex = pbBytes(dl, "bytes_download_url")?.let { hexLower(it) }.orEmpty()
+            val cookieHex = pbBytes(dl, "bytes_cookie_val")?.let { hexLower(it) }.orEmpty()
+            val md5Hex = pbBytes(dl, "bytes_md5")?.let { hexLower(it) }.orEmpty()
+            val saveFileName = pbString(dl, "str_save_file_name")
+            Log.i(
+                TAG,
+                "groupFile: download rsp ret=$retCode retHas=$retHas msg=${retMsg.take(120)} " +
+                    "ip=$downloadIp dns=$downloadDns dnsHttps=$downloadDnsHttps " +
+                    "saveName=$saveFileName urlHexLen=${downloadUrlHex.length} " +
+                    "cookieLen=${cookieHex.length} md5=${md5Hex.take(16)} " +
+                    "previewPort=${pbInt(dl, "uint32_preview_port")} " +
+                    "previewPortHttps=${pbInt(dl, "uint32_preview_port_https")}",
+            )
+            if (retCode != 0) {
+                return GroupFileDownload(
+                    fileId = entry.fileId,
+                    failed = true,
+                    message = "ret=$retCode ${retMsg.take(120)}",
+                )
+            }
+            if (downloadUrlHex.isBlank()) {
+                Log.w(TAG, "groupFile: download failed (empty bytes_download_url)")
+                return GroupFileDownload(
+                    fileId = entry.fileId,
+                    failed = true,
+                    message = "empty download url",
+                )
+            }
+            val dir = groupFileCacheDir(context).apply { mkdirs() }
+            val rawName = saveFileName.ifBlank { entry.name }
+            val safeName = sanitizeGroupFileName(rawName, entry.fileId)
+            val target = java.io.File(dir, safeName)
+            if (target.isFile && target.length() > 0L &&
+                (entry.fileSize <= 0L || target.length() == entry.fileSize)
+            ) {
+                val done = GroupFileDownload(
+                    fileId = entry.fileId,
+                    progress = 100,
+                    path = target.absolutePath,
+                    done = true,
+                )
+                runCatching { onProgress(done) }
+                groupFileDownloadedPaths[entry.fileId] = target.absolutePath
+                Log.i(TAG, "groupFile: download cache hit fileId=${entry.fileId} path=${target.absolutePath}")
+                return done
+            }
+            val candidates = ArrayList<Pair<String, String>>()
+            if (downloadIp.isNotBlank()) candidates.add("http" to downloadIp)
+            if (downloadDns.isNotBlank()) candidates.add("http" to downloadDns)
+            if (downloadDnsHttps.isNotBlank()) candidates.add("https" to downloadDnsHttps)
+            if (downloadDns.isNotBlank()) candidates.add("https" to downloadDns)
+            if (candidates.isEmpty()) {
+                Log.w(TAG, "groupFile: download failed (no ip/dns in rsp)")
+                return GroupFileDownload(
+                    fileId = entry.fileId,
+                    failed = true,
+                    message = "no download ip/dns",
+                )
+            }
+            var lastMessage = "download failed"
+            for ((scheme, host) in candidates) {
+                val url = buildGroupFileDownloadUrl(scheme, host, downloadUrlHex, entry.fileId)
+                val result = downloadHttpToFile(
+                    fileId = entry.fileId,
+                    url = url,
+                    target = target,
+                    cookieHex = cookieHex,
+                    expectedSize = entry.fileSize,
+                    onProgress = onProgress,
+                )
+                if (result != null) {
+                    result.path?.takeIf { pathUsable(it) }?.let { path ->
+                        groupFileDownloadedPaths[entry.fileId] = path
+                    }
+                    Log.i(
+                        TAG,
+                        "groupFile: download finish fileId=${entry.fileId} path=${result.path} " +
+                            "size=${target.length()} url=${url.take(200)}",
+                    )
+                    return result
+                }
+                lastMessage = "http download failed for $scheme://$host"
+            }
+            runCatching { target.delete() }
+            Log.w(TAG, "groupFile: download failed fileId=${entry.fileId}: $lastMessage")
+            GroupFileDownload(fileId = entry.fileId, failed = true, message = lastMessage)
+        } catch (t: Throwable) {
+            Log.w(TAG, "groupFile: download failed: ${t.javaClass.simpleName} ${t.message}")
+            GroupFileDownload(
+                fileId = entry.fileId,
+                failed = true,
+                message = "${t.javaClass.simpleName}: ${t.message}",
+            )
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 0x6d7 / 0x6d6 管理操作
+    // ------------------------------------------------------------------
+
+    /** 群文件上传：单帧大小（TaskHttpUpload 用 1KB 起，这里取 128KB 平衡速度/内存）。 */
+    private val GROUP_FILE_UPLOAD_CHUNK = 128 * 1024
+
+    /** 群文件上传大小上限：200MB（本实现单帧 ByteArray，流式读取，不会整文件进内存）。 */
+    private val GROUP_FILE_UPLOAD_MAX_BYTES = 200L * 1024L * 1024L
+
+    /** 一次性算 MD5 + SHA1（两次读文件不如一次流式算；上传时再按 128KB 分片读）。 */
+    private fun groupFileDigests(file: java.io.File): Pair<ByteArray, ByteArray>? = runCatching {
+        val md5 = java.security.MessageDigest.getInstance("MD5")
+        val sha1 = java.security.MessageDigest.getInstance("SHA-1")
+        val buffer = ByteArray(64 * 1024)
+        java.io.FileInputStream(file).use { input ->
+            while (true) {
+                val read = input.read(buffer)
+                if (read <= 0) break
+                md5.update(buffer, 0, read)
+                sha1.update(buffer, 0, read)
+            }
+        }
+        md5.digest() to sha1.digest()
+    }.getOrElse { t ->
+        Log.w(TAG, "groupFile: upload digest failed: ${t.javaClass.simpleName} ${t.message}")
+        null
+    }
+
+    /**
+     * UFT 二进制上传帧（照抄 TIM TroopFileTransferManager.TaskHttpUpload）：
+     * magic(-1412589450) / 1007 / 0 / length2 / short(checkKeyLen)+checkKey / short(shaLen)+sha /
+     * totalSizeLo / offsetLo / readLen / totalSizeHi / offsetHi / data。
+     */
+    private fun buildUftUploadFrame(
+        checkKey: ByteArray,
+        sha: ByteArray,
+        totalSize: Long,
+        offset: Long,
+        readLen: Int,
+        data: ByteArray,
+    ): ByteArray {
+        val length2 = checkKey.size + 2 + 2 + sha.size + 20 + readLen
+        val byteArrayOutputStream = java.io.ByteArrayOutputStream(length2 + 16)
+        val out = java.io.DataOutputStream(byteArrayOutputStream)
+        out.writeInt(-1412589450)
+        out.writeInt(1007)
+        out.writeInt(0)
+        out.writeInt(length2)
+        out.writeShort(checkKey.size)
+        out.write(checkKey)
+        out.writeShort(sha.size)
+        out.write(sha)
+        out.writeInt(totalSize.toInt())
+        out.writeInt(offset.toInt())
+        out.writeInt(readLen)
+        out.writeInt((totalSize ushr 32).toInt())
+        out.writeInt((offset ushr 32).toInt())
+        out.write(data, 0, readLen)
+        out.flush()
+        out.close()
+        return byteArrayOutputStream.toByteArray()
+    }
+
+    /**
+     * 上传一个分片：POST http://<ip>[:port]/ftn_handler?range=start-end（TIM 只走 80；这里先试 ip，
+     * 失败且 rsp 带非 80 端口时再带端口重试）。返回 HTTP status（异常/连接失败返回 -1）。
+     */
+    private fun uploadUftChunk(
+        uploadIp: String,
+        uploadPort: Int,
+        withPort: Boolean,
+        offset: Long,
+        readLen: Int,
+        frame: ByteArray,
+    ): Int {
+        val host = if (withPort) "$uploadIp:$uploadPort" else uploadIp
+        val url = "http://$host/ftn_handler?range=$offset-${offset + readLen}"
+        var connection: java.net.HttpURLConnection? = null
+        return try {
+            connection = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+            connection.requestMethod = "POST"
+            connection.connectTimeout = 15_000
+            connection.readTimeout = 30_000
+            connection.doOutput = true
+            connection.instanceFollowRedirects = false
+            connection.setRequestProperty("User-Agent", "TroopFile")
+            connection.setRequestProperty("Content-Type", "text/octet")
+            connection.setRequestProperty("Connection", "keep-alive")
+            connection.setRequestProperty("Net-type", "wifi")
+            connection.outputStream.use { it.write(frame) }
+            val status = connection.responseCode
+            val userReturnCode = connection.getHeaderField("User-ReturnCode").orEmpty()
+            Log.i(
+                TAG,
+                "groupFile: upload http chunk offset=$offset len=$readLen status=$status " +
+                    "usrRet=$userReturnCode port=$withPort url=$url",
+            )
+            val stream = if (status in 200..299) connection.inputStream else connection.errorStream
+            stream?.use { input ->
+                val buffer = ByteArray(4096)
+                var drained = 0
+                while (drained < 8192) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    drained += read
+                }
+            }
+            status
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "groupFile: upload http chunk failed offset=$offset: " +
+                    "${t.javaClass.simpleName} ${t.message} port=$withPort url=$url",
+            )
+            -1
+        } finally {
+            runCatching { connection?.disconnect() }
+        }
+    }
+
+    /**
+     * 群文件库上传（UFT OIDB 0x6d6_0 + 二进制 HTTP 分片，照 TIM TaskHttpUpload）：
+     * 1) 算 md5/sha1 → 0x6d6_0 拿 upload_ip/check_key/file_id/bus_id（bool_file_exist=true 为秒传直接成功）；
+     * 2) 每 128KB 组 UFT 帧 POST 到 http://<upload_ip>/ftn_handler?range=start-end（200/206 成功）；
+     * 3) 全部片成功返回 true（不发 0x6d9_4 feeds，先看列表是否自动出现）。
+     * 阻塞，需在 IO 线程调用；限制 200MB（单帧内存只占 128KB）。
+     */
+    fun uploadGroupFile(
+        chatId: String,
+        parentFolderId: String,
+        localPath: String,
+        fileName: String,
+    ): Boolean {
+        if (!isHost) return false
+        val startedAt = android.os.SystemClock.uptimeMillis()
+        val file = java.io.File(localPath)
+        if (!file.isFile || file.length() <= 0L) {
+            Log.w(TAG, "groupFile: upload failed (file missing/empty) path=$localPath")
+            return false
+        }
+        if (file.length() > GROUP_FILE_UPLOAD_MAX_BYTES) {
+            Log.w(
+                TAG,
+                "groupFile: upload failed (file too large, limit=${GROUP_FILE_UPLOAD_MAX_BYTES / 1024 / 1024}MB) " +
+                    "size=${file.length()} path=$localPath",
+            )
+            return false
+        }
+        val displayName = fileName.ifBlank { file.name }
+        val groupCode = groupCodeFor(chatId) ?: run {
+            Log.w(TAG, "groupFile: upload failed (not a group / no groupCode) chat=$chatId")
+            return false
+        }
+        val digests = groupFileDigests(file) ?: return false
+        val md5 = digests.first
+        val sha1 = digests.second
+        val totalSize = file.length()
+        Log.i(
+            TAG,
+            "groupFile: upload start chat=$chatId group=$groupCode " +
+                "parent=${parentFolderId.ifBlank { "root" }} name=$displayName size=$totalSize " +
+                "md5=${hexLower(md5)} sha=${hexLower(sha1)}",
+        )
+        return try {
+            // ---- 0x6d6_0 请求 ----
+            val reqBody = newPb("tencent.im.oidb.cmd0x6d6.oidb_0x6d6\$ReqBody") ?: run {
+                Log.w(TAG, "groupFile: upload req class missing")
+                return false
+            }
+            val nested = pbMessage(reqBody, "upload_file_req") ?: run {
+                Log.w(TAG, "groupFile: upload req field missing")
+                return false
+            }
+            pbSet(nested, "uint64_group_code", groupCode)
+            pbSet(nested, "uint32_app_id", 3)
+            pbSet(nested, "uint32_bus_id", 102) // 102 = 群文件 busId（0 会被服务端判 param error: bus_id）
+            pbSet(nested, "uint32_entrance", 4) // 4=文件页上传（AIO 是 5）
+            pbSet(nested, "str_parent_folder_id", parentFolderId.ifBlank { "/" })
+            pbSet(nested, "str_file_name", displayName)
+            pbSet(nested, "str_local_path", file.absolutePath)
+            pbSet(nested, "uint64_file_size", totalSize)
+            pbSet(nested, "bytes_md5", pbByteStringOf(md5))
+            pbSet(nested, "bytes_sha", pbByteStringOf(sha1))
+            pbSetHasFlag(nested, true)
+            val reqBytes = pbBytesOf(reqBody) ?: run {
+                Log.w(TAG, "groupFile: upload encode req failed")
+                return false
+            }
+            if (reqBytes.isEmpty()) {
+                Log.w(TAG, "groupFile: upload empty req body! chat=$chatId")
+                return false
+            }
+            Log.i(
+                TAG,
+                "groupFile: upload 0x6d6_0 req bytes=${reqBytes.size} bodyLen=${reqBytes.size} " +
+                    "bodyHex=${hexLowerPrefix(reqBytes, 32)}",
+            )
+            val rsp = sendOidbRequest("OidbSvc.0x6d6_0", 1750, 0, reqBytes) ?: run {
+                Log.w(TAG, "groupFile: upload failed (0x6d6_0 send failed)")
+                return false
+            }
+            if (rsp.result != 0) {
+                Log.w(
+                    TAG,
+                    "groupFile: upload failed (0x6d6_0 oidb result=${rsp.result} msg=${rsp.errorMsg.take(120)})",
+                )
+                return false
+            }
+            val rspBody = pbParse("tencent.im.oidb.cmd0x6d6.oidb_0x6d6\$RspBody", rsp.body) ?: run {
+                Log.w(TAG, "groupFile: upload parse 0x6d6_0 rsp failed (${rsp.body.size}B)")
+                return false
+            }
+            val uploadRsp = pbMessage(rspBody, "upload_file_rsp") ?: run {
+                Log.w(TAG, "groupFile: upload rsp field (upload_file_rsp) missing")
+                return false
+            }
+            val retCode = pbInt(uploadRsp, "int32_ret_code")
+            val retMsg = pbString(uploadRsp, "str_ret_msg")
+            val fileExist = pbBool(uploadRsp, "bool_file_exist")
+            val uploadIp = pbString(uploadRsp, "str_upload_ip")
+            val uploadPort = pbInt(uploadRsp, "uint32_upload_port")
+            val checkKey = pbBytes(uploadRsp, "bytes_check_key") ?: ByteArray(0)
+            val fileId = pbString(uploadRsp, "str_file_id")
+            val busId = pbInt(uploadRsp, "uint32_bus_id")
+            val serverDns = pbString(uploadRsp, "str_server_dns")
+            Log.i(
+                TAG,
+                "groupFile: upload 0x6d6_0 rsp ret=$retCode msg=${retMsg.take(120)} " +
+                    "exist=$fileExist ip=$uploadIp port=$uploadPort fileId=$fileId busId=$busId " +
+                    "dns=$serverDns checkKeyLen=${checkKey.size} rspBytes=${rsp.body.size}",
+            )
+            if (retCode < 0) {
+                Log.w(TAG, "groupFile: upload failed at 0x6d6_0 ret=$retCode msg=${retMsg.take(120)}")
+                return false
+            }
+            if (fileExist) {
+                // 秒传：服务端已有相同 md5 文件，不需要传二进制。
+                Log.i(
+                    TAG,
+                    "groupFile: upload finish (秒传) fileId=$fileId busId=$busId total=$totalSize " +
+                        "elapsedMs=${android.os.SystemClock.uptimeMillis() - startedAt}",
+                )
+                return true
+            }
+            if (uploadIp.isBlank()) {
+                Log.w(TAG, "groupFile: upload failed (0x6d6_0 rsp upload_ip empty)")
+                return false
+            }
+            if (totalSize == 0L) {
+                Log.i(TAG, "groupFile: upload finish (empty file) fileId=$fileId")
+                return true
+            }
+            // ---- 二进制分片上传 ----
+            var offset = 0L
+            var lastProgress = -1
+            var chunkIndex = 0
+            java.io.FileInputStream(file).use { input ->
+                val buffer = ByteArray(GROUP_FILE_UPLOAD_CHUNK)
+                while (offset < totalSize) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    chunkIndex++
+                    val frame = buildUftUploadFrame(checkKey, sha1, totalSize, offset, read, buffer)
+                    var status = -1
+                    var usedPort = false
+                    for (withPort in listOf(false, true)) {
+                        if (withPort && !(uploadPort > 0 && uploadPort != 80)) continue
+                        status = uploadUftChunk(uploadIp, uploadPort, withPort, offset, read, frame)
+                        usedPort = withPort
+                        if (status in 200..299) break
+                    }
+                    if (status !in 200..299) {
+                        Log.w(
+                            TAG,
+                            "groupFile: upload failed at chunk#$chunkIndex offset=$offset len=$read " +
+                                "status=$status port=$usedPort",
+                        )
+                        return false
+                    }
+                    offset += read
+                    val pct = (offset * 100L / totalSize).toInt()
+                    if (pct >= lastProgress + 10 || offset >= totalSize) {
+                        lastProgress = pct
+                        Log.i(
+                            TAG,
+                            "groupFile: upload progress $pct% ($offset/$totalSize) " +
+                                "chunk#$chunkIndex port=$usedPort",
+                        )
+                    }
+                }
+            }
+            if (offset != totalSize) {
+                Log.w(TAG, "groupFile: upload failed (uploaded=$offset expected=$totalSize)")
+                return false
+            }
+            Log.i(
+                TAG,
+                "groupFile: upload finish fileId=$fileId busId=$busId total=$totalSize " +
+                    "chunks=$chunkIndex elapsedMs=${android.os.SystemClock.uptimeMillis() - startedAt}",
+            )
+            true
+        } catch (t: Throwable) {
+            Log.w(TAG, "groupFile: upload failed: ${t.javaClass.simpleName} ${t.message}")
+            false
+        }
+    }
+
+    /** 新建文件夹：OidbSvc.0x6d7_0（1751/0）。 */
+    fun createGroupFolder(chatId: String, folderName: String): Boolean {
+        if (!isHost || folderName.isBlank()) return false
+        val result = oidbGroupFileOp(
+            chatId = chatId,
+            op = "createFolder",
+            cmd = "OidbSvc.0x6d7_0",
+            command = 1751,
+            serviceType = 0,
+            reqBodyClass = "tencent.im.oidb.cmd0x6d7.oidb_0x6d7\$ReqBody",
+            reqFieldName = "create_folder_req",
+            rspBodyClass = "tencent.im.oidb.cmd0x6d7.oidb_0x6d7\$RspBody",
+            rspFieldName = "create_folder_rsp",
+        ) { nested ->
+            pbSet(nested, "str_parent_folder_id", "")
+            pbSet(nested, "str_folder_name", folderName)
+        }
+        Log.i(TAG, "groupFile: createFolder chat=$chatId name=$folderName result=$result")
+        return result?.first == 0
+    }
+
+    /** 重命名文件/文件夹：0x6d7_2（文件夹）/ 0x6d6_4（文件）。 */
+    fun renameGroupFile(chatId: String, entry: GroupFileEntry, newName: String): Boolean {
+        if (!isHost || newName.isBlank()) return false
+        val result = if (entry.isFolder) {
+            oidbGroupFileOp(
+                chatId = chatId,
+                op = "renameFolder",
+                cmd = "OidbSvc.0x6d7_2",
+                command = 1751,
+                serviceType = 2,
+                reqBodyClass = "tencent.im.oidb.cmd0x6d7.oidb_0x6d7\$ReqBody",
+                reqFieldName = "rename_folder_req",
+                rspBodyClass = "tencent.im.oidb.cmd0x6d7.oidb_0x6d7\$RspBody",
+                rspFieldName = "rename_folder_rsp",
+            ) { nested ->
+                pbSet(nested, "str_folder_id", entry.folderId)
+                pbSet(nested, "str_new_folder_name", newName)
+            }
+        } else {
+            oidbGroupFileOp(
+                chatId = chatId,
+                op = "renameFile",
+                cmd = "OidbSvc.0x6d6_4",
+                command = 1750,
+                serviceType = 4,
+                reqBodyClass = "tencent.im.oidb.cmd0x6d6.oidb_0x6d6\$ReqBody",
+                reqFieldName = "rename_file_req",
+                rspBodyClass = "tencent.im.oidb.cmd0x6d6.oidb_0x6d6\$RspBody",
+                rspFieldName = "rename_file_rsp",
+            ) { nested ->
+                pbSet(nested, "uint32_bus_id", entry.busId)
+                pbSet(nested, "str_file_id", entry.fileId)
+                pbSet(nested, "str_parent_folder_id", entry.parentFolderId)
+                pbSet(nested, "str_new_file_name", newName)
+            }
+        }
+        Log.i(
+            TAG,
+            "groupFile: rename chat=$chatId name=${entry.name} -> $newName " +
+                "isFolder=${entry.isFolder} result=$result",
+        )
+        return result?.first == 0
+    }
+
+    /** 移动文件到目标文件夹（仅文件；文件夹跳过）：OidbSvc.0x6d6_5（1750/5），每个文件一条请求。 */
+    fun moveGroupFiles(
+        chatId: String,
+        entries: List<GroupFileEntry>,
+        destFolderId: String,
+    ): Boolean {
+        if (!isHost || entries.isEmpty()) return false
+        val folders = entries.filter { it.isFolder }
+        if (folders.isNotEmpty()) {
+            Log.i(
+                TAG,
+                "groupFile: move skip folders n=${folders.size} names=${folders.map { it.name }.take(5)}",
+            )
+        }
+        val files = entries.filter { !it.isFolder }
+        if (files.isEmpty()) {
+            Log.i(TAG, "groupFile: move failed (no files, folders unsupported) chat=$chatId")
+            return false
+        }
+        var allOk = true
+        for (entry in files) {
+            val result = oidbGroupFileOp(
+                chatId = chatId,
+                op = "moveFile(name=${entry.name})",
+                cmd = "OidbSvc.0x6d6_5",
+                command = 1750,
+                serviceType = 5,
+                reqBodyClass = "tencent.im.oidb.cmd0x6d6.oidb_0x6d6\$ReqBody",
+                reqFieldName = "move_file_req",
+                rspBodyClass = "tencent.im.oidb.cmd0x6d6.oidb_0x6d6\$RspBody",
+                rspFieldName = "move_file_rsp",
+            ) { nested ->
+                pbSet(nested, "uint32_bus_id", entry.busId)
+                pbSet(nested, "str_file_id", entry.fileId)
+                pbSet(nested, "str_parent_folder_id", entry.parentFolderId)
+                pbSet(nested, "str_dest_folder_id", destFolderId)
+            }
+            if (result?.first != 0) allOk = false
+        }
+        Log.i(
+            TAG,
+            "groupFile: move chat=$chatId n=${files.size} dest=${destFolderId.ifBlank { "root" }} ok=$allOk",
+        )
+        return allOk
+    }
+
+    /** 删除文件/文件夹：文件逐个 0x6d6_3，文件夹逐个 0x6d7_1；全部成功才 true。 */
+    fun deleteGroupFiles(chatId: String, entries: List<GroupFileEntry>): Boolean {
+        if (!isHost || entries.isEmpty()) return false
+        var allOk = true
+        val files = entries.filter { !it.isFolder }
+        val folders = entries.filter { it.isFolder }
+        for (entry in files) {
+            val result = oidbGroupFileOp(
+                chatId = chatId,
+                op = "deleteFile(name=${entry.name})",
+                cmd = "OidbSvc.0x6d6_3",
+                command = 1750,
+                serviceType = 3,
+                reqBodyClass = "tencent.im.oidb.cmd0x6d6.oidb_0x6d6\$ReqBody",
+                reqFieldName = "delete_file_req",
+                rspBodyClass = "tencent.im.oidb.cmd0x6d6.oidb_0x6d6\$RspBody",
+                rspFieldName = "delete_file_rsp",
+            ) { nested ->
+                pbSet(nested, "uint32_bus_id", entry.busId)
+                pbSet(nested, "str_file_id", entry.fileId)
+                pbSet(nested, "str_parent_folder_id", entry.parentFolderId)
+            }
+            if (result?.first != 0) allOk = false
+        }
+        for (folder in folders) {
+            val result = oidbGroupFileOp(
+                chatId = chatId,
+                op = "deleteFolder(name=${folder.name})",
+                cmd = "OidbSvc.0x6d7_1",
+                command = 1751,
+                serviceType = 1,
+                reqBodyClass = "tencent.im.oidb.cmd0x6d7.oidb_0x6d7\$ReqBody",
+                reqFieldName = "delete_folder_req",
+                rspBodyClass = "tencent.im.oidb.cmd0x6d7.oidb_0x6d7\$RspBody",
+                rspFieldName = "delete_folder_rsp",
+            ) { nested ->
+                pbSet(nested, "str_folder_id", folder.folderId)
+            }
+            if (result?.first != 0) allOk = false
+        }
+        Log.i(
+            TAG,
+            "groupFile: delete chat=$chatId files=${files.size} folders=${folders.size} ok=$allOk",
+        )
+        return allOk
+    }
+
+    /** 用系统应用打开已下载的群文件（复用 openLocalFile 的 TIM FileProvider 逻辑）。 */
+    fun openGroupFile(path: String): Boolean = openLocalFile(path)
+
+    // ---------------------------------------------------------------------
+    // 系统通知 / 后台提醒（新消息通知 + 点击直达会话）
+    // ---------------------------------------------------------------------
+
+    private const val NOTIFY_CHANNEL_ID = "m3tim_messages"
+
+    private data class NotifyChatInfo(val name: String, val at: Long)
+
+    /** 通知免打扰判定缓存（已知值才缓存；未知不缓存，下条消息重试）。 */
+    private data class CachedNotifyMute(val muted: Boolean, val at: Long)
+
+    private val notifyMuteCache = ConcurrentHashMap<String, CachedNotifyMute>()
+    private const val NOTIFY_MUTE_CACHE_TTL_MS = 60_000L
+
+    private class NotifyAgg(var count: Int, var at: Long)
+
+    /** 会话信息（名称/免打扰）缓存：30s TTL（loadRecentChats 可能较慢，避开 push 线程阻塞）。 */
+    private val notifyChatInfoCache = ConcurrentHashMap<String, NotifyChatInfo>()
+
+    /** 同一会话 1s 内多条新消息合并计数。 */
+    private val notifyAggByChat = ConcurrentHashMap<String, NotifyAgg>()
+
+    /** 已发过通知的 msgId 去重（限长，避免内存增长）。 */
+    private val notifiedMsgIds = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
+
+    private val notifyExecutor =
+        java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, "m3tim-notify").apply { isDaemon = true }
+        }
+
+    private val notifyChannelCreated = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val notifyPermissionLogged = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** 通知用的 Context：模块 Context 优先，TIM Application/ActivityThread 兜底（后台时模块 Context 可能还在）。 */
+    private fun notifyContext(): Context? =
+        runCatching { AppEnvironment.context }.getOrNull()
+            ?: timApplicationContext()
+            ?: appContext()
+            ?: hostContext()
+            ?: runCatching {
+                Class.forName("android.app.ActivityThread")
+                    .getMethod("currentApplication")
+                    .invoke(null) as? Context
+            }.getOrNull()
+
+    private fun ensureNotifyChannel(context: Context) {
+        if (android.os.Build.VERSION.SDK_INT < 26) return
+        if (!notifyChannelCreated.compareAndSet(false, true)) return
+        runCatching {
+            val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? android.app.NotificationManager
+                ?: return@runCatching
+            val channel = android.app.NotificationChannel(
+                NOTIFY_CHANNEL_ID,
+                "消息提醒",
+                android.app.NotificationManager.IMPORTANCE_HIGH,
+            )
+            channel.description = "Material3Tim 新消息提醒"
+            channel.enableVibration(true)
+            manager.createNotificationChannel(channel)
+            Log.i(TAG, "notify: channel created id=$NOTIFY_CHANNEL_ID")
+        }.onFailure { Log.w(TAG, "notify: create channel failed: ${it.javaClass.simpleName} ${it.message}") }
+    }
+
+    /** 会话名称（30s 缓存，只用内存快照，不触发 loadRecentChats 阻塞）。免打扰单独由 [resolveNotifyMute] 判定。 */
+    private fun notifyChatInfo(chatId: String): NotifyChatInfo {
+        val now = android.os.SystemClock.uptimeMillis()
+        notifyChatInfoCache[chatId]?.takeIf { now - it.at < 30_000L }?.let { return it }
+        val cachedChat = recentChatsCache?.firstOrNull { it.id == chatId }
+        val meta = chatMeta[chatId]
+        val info = NotifyChatInfo(
+            name = cachedChat?.name?.takeIf { it.isNotBlank() }
+                ?: meta?.name?.takeIf { it.isNotBlank() }
+                ?: "新消息",
+            at = now,
+        )
+        notifyChatInfoCache[chatId] = info
+        if (notifyChatInfoCache.size > 200) {
+            val expire = now - 30_000L
+            notifyChatInfoCache.entries.removeAll { it.value.at < expire }
+        }
+        return info
+    }
+
+    /**
+     * 通知免打扰判定（独立于 loadRecentChats，通知线程同步调用，≤3s）：
+     * - 群聊：**只信权威来源** — [cachedGroupMute]（TTL 内且 mask 解析成功）→ 内核
+     *   `batchQueryCachedGroupDetailInfo`（cmdUinMsgMask，≤3s）→ `TroopInfo.troopmask`；
+     *   全部未知返回 null（调用方跳过通知，宁漏勿扰）。
+     *   绝不再信任 `recentChatsCache.isMuted`：mapRecentContact 在批量 mask 超时/冷启动时会兜底 false，
+     *   曾导致免打扰群成批误发通知。
+     * - 单聊：recentChatsCache 的 isMuted；未知按现有默认「可通知」。
+     */
+    private fun resolveNotifyMute(chatId: String): Boolean? {
+        val now = perfUptime()
+        // 群助手伪会话（或 chatType=7/peerUin=9994 的会话）始终免打扰：
+        // 必须放在缓存判断之前，避免历史上缓存过 muted=false 时误发通知。
+        val rawMeta = chatMeta[chatId]
+        val isAssistantChat = chatId == "tim_troop_assistant" ||
+            rawMeta?.let { it.chatType == 7 || it.peerUin == troopAssistantUin } == true
+        if (isAssistantChat) {
+            notifyMuteCache[chatId] = CachedNotifyMute(true, now)
+            Log.i(TAG, "notify: mute resolved chat=$chatId group=0 muted=true source=assistant")
+            return true
+        }
+        val meta = chatMeta[chatId] ?: runCatching { ensureChatContext(chatId) }.getOrNull()
+        val groupCode = meta?.groupCode?.takeIf { it != 0L } ?: groupCodeFor(chatId) ?: 0L
+        val isGroup = meta?.isGroup == true || groupCode != 0L
+        // 1) 通知结果缓存：true 直接返回；群聊的 false 缓存必须先用权威群 mask 复核，防历史污染。
+        val cachedNotify = notifyMuteCache[chatId]?.takeIf { now - it.at < NOTIFY_MUTE_CACHE_TTL_MS }
+        if (cachedNotify != null) {
+            if (!isGroup) {
+                Log.i(
+                    TAG,
+                    "notify: mute resolved chat=$chatId group=$groupCode " +
+                        "muted=${cachedNotify.muted} source=cache",
+                )
+                return cachedNotify.muted
+            }
+            if (cachedNotify.muted) {
+                Log.i(
+                    TAG,
+                    "notify: mute resolved chat=$chatId group=$groupCode muted=true source=cache",
+                )
+                return true
+            }
+            val authoritative = cachedGroupMute(groupCode)
+            if (authoritative != null) {
+                if (authoritative != cachedNotify.muted) {
+                    notifyMuteCache[chatId] = CachedNotifyMute(authoritative, now)
+                    Log.i(
+                        TAG,
+                        "notify: mute cache corrected chat=$chatId group=$groupCode " +
+                            "false->$authoritative",
+                    )
+                }
+                Log.i(
+                    TAG,
+                    "notify: mute resolved chat=$chatId group=$groupCode " +
+                        "muted=$authoritative source=authoritative-cache",
+                )
+                return authoritative
+            }
+            Log.i(
+                TAG,
+                "notify: mute cache=false but no authoritative mask chat=$chatId " +
+                    "group=$groupCode, re-resolve",
+            )
+        }
+        var muted: Boolean?
+        val source: String
+        if (isGroup) {
+            if (groupCode == 0L) {
+                Log.w(TAG, "notify: mute unknown chat=$chatId (no groupCode, skip)")
+                return null
+            }
+            // 2) 权威内存缓存（mask 已解析）→ 3) 内核批量 mask 查询 → 4) TIM 本地 TroopInfo.troopmask
+            val cachedMute = cachedGroupMute(groupCode)
+            if (cachedMute != null) {
+                muted = cachedMute
+                source = "cache"
+            } else {
+                val batch = batchQueryGroupMuteMasks(listOf(groupCode), 3_000L)
+                val fromKernel = batch[groupCode]
+                if (fromKernel != null) {
+                    muted = fromKernel
+                    source = "kernel"
+                } else {
+                    val fromTroopInfo = troopInfoGroupMute(groupCode)
+                    if (fromTroopInfo != null) {
+                        muted = fromTroopInfo
+                        source = "troopinfo"
+                        groupMuteCache[groupCode] = CachedGroupMute(
+                            muted,
+                            troopInfoGroupMaskName(groupCode).orEmpty(),
+                            now,
+                        )
+                    } else {
+                        Log.w(
+                            TAG,
+                            "notify: mute unknown chat=$chatId group=$groupCode " +
+                                "(kernel+troopinfo failed, skip)",
+                        )
+                        return null
+                    }
+                }
+            }
+            // 收进群助手的群（mask=ASSISTANT）必须免打扰。
+            if (muted != true && cachedGroupMaskName(groupCode) == "ASSISTANT") {
+                muted = true
+                Log.i(TAG, "notify: chat=$chatId mask=ASSISTANT => muted")
+            }
+        } else {
+            val recent = recentChatsCache?.firstOrNull { it.id == chatId }
+            muted = recent?.isMuted == true
+            source = if (recent != null) "cache" else "default"
+        }
+        // 只缓存权威结果；未知（null）在上面的分支已 return，不会写缓存。
+        notifyMuteCache[chatId] = CachedNotifyMute(muted, now)
+        if (notifyMuteCache.size > 300) {
+            val expire = now - NOTIFY_MUTE_CACHE_TTL_MS
+            notifyMuteCache.entries.removeAll { it.value.at < expire }
+        }
+        Log.i(
+            TAG,
+            "notify: mute resolved chat=$chatId group=$groupCode muted=$muted source=$source",
+        )
+        return muted
+    }
+
+    /** 轻量解析 MsgRecord 的发送者与内容摘要（不调 mapMsgRecord，避免 push 线程做重活）。 */
+    private data class NotifyPreview(val isMe: Boolean, val sender: String, val summary: String)
+
+    private fun notifyPreview(record: Any?): NotifyPreview? {
+        record ?: return null
+        val senderUid = invokeGetter(record, "getSenderUid") as? String ?: ""
+        val senderUin = (invokeGetter(record, "getSenderUin") as? Number)?.toLong() ?: 0L
+        val isMe = (myUid != null && senderUid == myUid) ||
+            (senderUin != 0L && senderUin.toString() == myUin)
+        val sender = listOf(
+            invokeGetter(record, "getSendRemarkName") as? String,
+            invokeGetter(record, "getSendMemberName") as? String,
+            invokeGetter(record, "getSendNickName") as? String,
+            invokeGetter(record, "getPeerName") as? String,
+        ).firstOrNull { !it.isNullOrBlank() } ?: "对方"
+        @Suppress("UNCHECKED_CAST")
+        val elements = invokeGetter(record, "getElements") as? List<*> ?: emptyList<Any?>()
+        var summary = ""
+        for (element in elements) {
+            element ?: continue
+            val type = (invokeGetter(element, "getElementType") as? Number)?.toInt() ?: 0
+            summary = when (type) {
+                ELEMENT_TYPE_TEXT -> {
+                    val text = invokeGetter(element, "getTextElement")
+                    (text?.let { invokeGetter(it, "getContent") } as? String).orEmpty()
+                }
+                ELEMENT_TYPE_PIC -> "[图片]"
+                ELEMENT_TYPE_FILE -> "[文件]"
+                ELEMENT_TYPE_PTT -> "[语音]"
+                ELEMENT_TYPE_VIDEO -> "[视频]"
+                ELEMENT_TYPE_WALLET -> "[红包]"
+                ELEMENT_TYPE_ARK -> "[卡片]"
+                else -> ""
+            }
+            if (summary.isNotBlank()) break
+        }
+        // 灰条/系统提示不作为新消息通知（例如“撤回了一条消息”“入群提示”）。
+        val hasGrayTip = elements.any { element ->
+            element != null &&
+                (invokeGetter(element, "getElementType") as? Number)?.toInt() == ELEMENT_TYPE_GRAY_TIP
+        }
+        if (summary.isBlank() && hasGrayTip) return null
+        if (summary.isBlank()) {
+            summary = if (invokeGetter(record, "getMultiForwardMsgElement") != null) "[聊天记录]" else "[新消息]"
+        }
+        return NotifyPreview(isMe = isMe, sender = sender, summary = summary.replace('\n', ' ').take(60))
+    }
+
+    private fun notificationPendingIntent(context: Context, chatId: String): android.app.PendingIntent? = runCatching {
+        val cl = hostClassLoader() ?: return@runCatching null
+        val splashClass = Class.forName(
+            "com.tencent.mobileqq.activity.SplashActivity", false, cl,
+        )
+        val intent = Intent(context, splashClass).apply {
+            putExtra(com.material3tim.data.source.NavigationRequests.EXTRA_CHAT_ID, chatId)
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or
+                Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val flags = android.app.PendingIntent.FLAG_UPDATE_CURRENT or
+            (if (android.os.Build.VERSION.SDK_INT >= 23) android.app.PendingIntent.FLAG_IMMUTABLE else 0)
+        android.app.PendingIntent.getActivity(context, chatId.hashCode(), intent, flags)
+    }.getOrNull()
+
+    /** push 线程只做入队；真正判断/发通知在单线程 executor 里（可安全阻塞查会话缓存）。 */
+    private fun enqueueMessageNotification(chatId: String, record: Any?) {
+        if (chatId.isBlank() || record == null) return
+        val msgId = (invokeGetter(record, "getMsgId") as? Number)?.toLong() ?: 0L
+        if (msgId != 0L) {
+            if (!notifiedMsgIds.add(msgId)) return
+            if (notifiedMsgIds.size > 500) notifiedMsgIds.clear()
+        }
+        runCatching {
+            notifyExecutor.execute {
+                runCatching { maybePostMessageNotification(chatId, record) }
+                    .onFailure {
+                        Log.w(TAG, "notify: failed chat=$chatId: ${it.javaClass.simpleName} ${it.message}")
+                    }
+            }
+        }.onFailure { Log.w(TAG, "notify: enqueue failed: ${it.javaClass.simpleName} ${it.message}") }
+    }
+
+    private fun maybePostMessageNotification(chatId: String, record: Any?) {
+        // 前台且正在看该会话：不提醒。
+        if (AppUiState.isForeground && AppUiState.currentChatId == chatId) {
+            Log.i(TAG, "notify: skip chat=$chatId (foreground in this chat)")
+            return
+        }
+        val preview = notifyPreview(record) ?: return
+        if (preview.isMe) return
+        val info = notifyChatInfo(chatId)
+        // 免打扰独立判定（不依赖 recent 加载完成；群聊未知时跳过通知，宁漏勿扰）。
+        val muted = resolveNotifyMute(chatId)
+        if (muted == null) {
+            Log.i(TAG, "notify: skip chat=$chatId (mute unknown)")
+            return
+        }
+        if (muted) {
+            Log.i(TAG, "notify: skip chat=$chatId (muted, name=${info.name})")
+            return
+        }
+        val context = notifyContext() ?: run {
+            Log.w(TAG, "notify: no context, skip chat=$chatId")
+            return
+        }
+        val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? android.app.NotificationManager
+            ?: run {
+                Log.w(TAG, "notify: notification manager unavailable")
+                return
+            }
+        ensureNotifyChannel(context)
+        if (android.os.Build.VERSION.SDK_INT >= 24 &&
+            notifyPermissionLogged.compareAndSet(false, true) &&
+            !manager.areNotificationsEnabled()
+        ) {
+            Log.w(TAG, "notify: notifications disabled (TIM 未授予通知权限，需用户在系统设置里允许)")
+        }
+        val nowMs = System.currentTimeMillis()
+        val agg = notifyAggByChat[chatId]
+        val count = if (agg != null && nowMs - agg.at <= 1_000L) {
+            agg.count + 1
+        } else {
+            1
+        }
+        notifyAggByChat[chatId] = NotifyAgg(count, nowMs)
+        val summaryText = if (count > 1) {
+            "$count 条新消息（最近：${preview.sender}: ${preview.summary}）"
+        } else {
+            "${preview.sender}: ${preview.summary}"
+        }.take(80)
+        val builder = if (android.os.Build.VERSION.SDK_INT >= 26) {
+            android.app.Notification.Builder(context, NOTIFY_CHANNEL_ID)
+        } else {
+            @Suppress("DEPRECATION")
+            android.app.Notification.Builder(context)
+        }
+        builder.setSmallIcon(android.R.drawable.stat_notify_chat)
+            .setContentTitle(info.name.take(40))
+            .setContentText(summaryText)
+            .setNumber(count)
+            .setWhen(nowMs)
+            .setShowWhen(true)
+            .setAutoCancel(true)
+            .setOnlyAlertOnce(false)
+            .setGroup("m3tim_$chatId")
+        // 每个会话一条独立通知，不用 group summary 标记（否则系统会当成摘要吞掉）。
+        .setGroupSummary(false)
+        notificationPendingIntent(context, chatId)?.let { builder.setContentIntent(it) }
+        val notification = builder.build()
+        runCatching {
+            manager.notify(chatId.hashCode(), notification)
+            Log.i(
+                TAG,
+                "notify: post chat=$chatId title=${info.name.take(30)} body=$summaryText " +
+                    "count=$count id=${chatId.hashCode()} channel=$NOTIFY_CHANNEL_ID",
+            )
+        }.onFailure { Log.w(TAG, "notify: notify() failed chat=$chatId: ${it.javaClass.simpleName} ${it.message}") }
+    }
+
+    // ---------------------------------------------------------------------
+    // 群管理（IKernelGroupService：踢人/禁言/管理员/群名片/群名/全员禁言/公告/退群/解散）
+    // ---------------------------------------------------------------------
+
+    /** 群管理 API 方法清单是否已打印过（首次调用时打一次，便于真机核对 TIM 版本差异）。 */
+    private val groupManageMethodsLogged = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** 方法在 native/wrapper 都找不到时的详细清单只打一次（避免刷屏）。 */
+    private val groupManageMissingMethodLogged = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private val groupManageKnownMethodNames = listOf(
+        "kickMember", "setMemberShutUp", "modifyMemberRole", "modifyMemberCardName",
+        "modifyGroupName", "setGroupShutUp", "publishGroupBulletin", "quitGroup", "destroyGroup",
+    )
+
+    private fun groupManageMethodsOf(service: Any?): List<String> {
+        service ?: return emptyList()
+        return runCatching {
+            groupManageKnownMethodNames.mapNotNull { name ->
+                service.javaClass.methods
+                    .filter { it.name == name }
+                    .minByOrNull { it.parameterCount }
+                    ?.let { "${it.name}/${it.parameterCount}" }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    private fun groupManageLogMethodsIfNeeded(native: Any?, wrapper: Any?) {
+        if (!groupManageMethodsLogged.compareAndSet(false, true)) return
+        runCatching {
+            Log.i(
+                TAG,
+                "groupManage: impl ready nativeMethods=${groupManageMethodsOf(native)} " +
+                    "wrapperMethods=${groupManageMethodsOf(wrapper)}",
+            )
+        }.onFailure { Log.w(TAG, "groupManage: method list failed: ${it.javaClass.simpleName}") }
+    }
+
+    private fun groupManageSetField(obj: Any, fieldName: String, value: Any?) {
+        runCatching { obj.javaClass.getField(fieldName).set(obj, value) }
+            .onFailure {
+                Log.w(
+                    TAG,
+                    "groupManage: set field $fieldName on ${obj.javaClass.simpleName} failed: " +
+                        "${it.javaClass.simpleName} ${it.message}",
+                )
+            }
+    }
+
+    private fun groupManageStaticField(cl: ClassLoader, className: String, fieldName: String): Any? =
+        runCatching { Class.forName(className, true, cl).getField(fieldName).get(null) }
+            .getOrElse { t ->
+                Log.w(
+                    TAG,
+                    "groupManage: static field $className.$fieldName failed: " +
+                        "${t.javaClass.simpleName} ${t.message}",
+                )
+                null
+            }
+
+    /**
+     * 通用群管理操作：解析 groupCode → 找 IKernelGroupService 方法 → awaitCallback(IOperateCallback/
+     * IKickMemberOperateCallback) 等 onResult(code,msg,...)。code==0 返回 true，超时/异常返回 false。
+     */
+    private fun groupManageOpResult(
+        op: String,
+        chatId: String,
+        methodName: String,
+        parameterCount: Int,
+        callbackInterface: String,
+        timeoutMs: Long = 8_000L,
+        fillArgs: (service: Any, groupCode: Long, cl: ClassLoader) -> Array<Any?>?,
+    ): Pair<Boolean, Int> {
+        if (!isHost) return false to -1
+        val started = android.os.SystemClock.uptimeMillis()
+        // native IKernelGroupService（CppProxy）才有 modifyMemberRole/kickMember/publishGroupBulletin 等；
+        // wrapper com.tencent.qqnt.kernel.api.q 只有部分方法 → 优先 native，找不到再回退 wrapper。
+        val wrapperService = groupKernelService()
+        val nativeService = nativeGroupService()
+        val candidates = ArrayList<Pair<String, Any>>(2)
+        if (nativeService != null) candidates.add("native" to nativeService)
+        if (wrapperService != null && candidates.none { it.second === wrapperService }) {
+            candidates.add("wrapper" to wrapperService)
+        }
+        if (candidates.isEmpty()) {
+            Log.w(TAG, "groupManage: $op failed (group service unavailable) chat=$chatId")
+            return false to -1
+        }
+        groupManageLogMethodsIfNeeded(nativeService, wrapperService)
+        val groupCode = groupCodeFor(chatId) ?: run {
+            Log.w(TAG, "groupManage: $op failed (not a group / no groupCode) chat=$chatId")
+            return false to -1
+        }
+        val cl = hostClassLoader() ?: run {
+            Log.w(TAG, "groupManage: $op failed (no host classloader)")
+            return false to -1
+        }
+        var serviceLabel: String? = null
+        var service: Any? = null
+        var method: java.lang.reflect.Method? = null
+        for ((label, svc) in candidates) {
+            val candidateMethod = runCatching {
+                svc.javaClass.methods.firstOrNull {
+                    it.name == methodName && it.parameterCount == parameterCount
+                }
+            }.getOrNull()
+            if (candidateMethod != null) {
+                serviceLabel = label
+                service = svc
+                method = candidateMethod
+                break
+            }
+        }
+        if (method == null || service == null) {
+            if (groupManageMissingMethodLogged.compareAndSet(false, true)) {
+                Log.w(
+                    TAG,
+                    "groupManage: $op method $methodName/$parameterCount not found on native/wrapper; " +
+                        "nativeMethods=${groupManageMethodsOf(nativeService)} " +
+                        "wrapperMethods=${groupManageMethodsOf(wrapperService)}",
+                )
+            }
+            Log.w(
+                TAG,
+                "groupManage: $op failed (method $methodName/$parameterCount not found on native/wrapper) " +
+                    "chat=$chatId",
+            )
+            return false to -1
+        }
+        Log.i(
+            TAG,
+            "groupManage: $op attempt=kernel service=$serviceLabel method=$methodName/$parameterCount " +
+                "chat=$chatId group=$groupCode",
+        )
+        val args = runCatching { fillArgs(service, groupCode, cl) }.getOrElse { t ->
+            Log.w(TAG, "groupManage: $op build args failed: ${t.javaClass.simpleName} ${t.message}")
+            null
+        } ?: return false to -1
+        val result = awaitCallback(cl, callbackInterface, timeoutMs) { proxy ->
+            method.invoke(service, *(args.toList() + proxy).toTypedArray())
+        }
+        val code = (result?.getOrNull(0) as? Number)?.toInt() ?: -1
+        val msg = result?.getOrNull(1) as? String ?: ""
+        val ok = result != null && code == 0
+        Log.i(
+            TAG,
+            "groupManage: $op attempt=kernel service=$serviceLabel chat=$chatId group=$groupCode " +
+                "rsp code=$code msg=${msg.take(120)} ok=$ok " +
+                "elapsedMs=${android.os.SystemClock.uptimeMillis() - started}",
+        )
+        if (result == null) {
+            Log.w(TAG, "groupManage: $op failed (callback timeout/none) chat=$chatId")
+        }
+        return ok to code
+    }
+
+    private fun groupManageOp(
+        op: String,
+        chatId: String,
+        methodName: String,
+        parameterCount: Int,
+        callbackInterface: String,
+        timeoutMs: Long = 8_000L,
+        fillArgs: (service: Any, groupCode: Long, cl: ClassLoader) -> Array<Any?>?,
+    ): Boolean = groupManageOpResult(
+        op = op,
+        chatId = chatId,
+        methodName = methodName,
+        parameterCount = parameterCount,
+        callbackInterface = callbackInterface,
+        timeoutMs = timeoutMs,
+        fillArgs = fillArgs,
+    ).first
+
+    // ---------------------------------------------------------------------
+    // 群管理 legacy 通道（内核 -10122 / 120101203 时回退 TIM 旧版协议）
+    // ---------------------------------------------------------------------
+
+    private fun groupManageServerTimeSeconds(): Long = runCatching {
+        val cl = hostClassLoader() ?: return@runCatching null
+        (Class.forName("com.tencent.mobileqq.msf.core.NetConnInfoCenter", true, cl)
+            .getMethod("getServerTime").invoke(null) as? Number)?.toLong()?.takeIf { it > 0L }
+    }.getOrNull() ?: (System.currentTimeMillis() / 1000L)
+
+    /** uid → uin：群成员缓存优先，回退 ProfileService.getUinByUid。 */
+    private fun groupManageUinForUid(chatId: String, uid: String): Long {
+        if (uid.isBlank()) return 0L
+        val fromInfo = runCatching {
+            loadChatInfo(chatId)?.members?.firstOrNull { it.uid == uid }?.uin?.toLongOrNull()
+        }.getOrNull()
+        if (fromInfo != null && fromInfo != 0L) return fromInfo
+        return runCatching { uinForUid(uid) }.getOrDefault(0L)
+    }
+
+    /** QRoute.api(Class) 反射取 TIM 旧版 API（host classLoader）。 */
+    private fun groupManageQRouteApi(interfaceName: String): Any? = runCatching {
+        val cl = hostClassLoader() ?: return@runCatching null
+        val apiClass = Class.forName(interfaceName, false, cl)
+        val qrouteClass = Class.forName("com.tencent.mobileqq.qroute.QRoute", true, cl)
+        val apiMethod = qrouteClass.methods.firstOrNull {
+            it.name == "api" && it.parameterCount == 1 &&
+                it.parameterTypes[0] == Class::class.java
+        } ?: return@runCatching null
+        apiMethod.invoke(null, apiClass)
+    }.getOrElse { t ->
+        Log.w(TAG, "groupManage: QRoute.api($interfaceName) failed: ${t.javaClass.simpleName} ${t.message}")
+        null
+    }
+
+    /** 等任意回调接口（方法名可自定义，如 com.tencent.qqnt.troop.c 的方法叫 a(boolean,int,ArrayList)）。 */
+    private fun groupManageAwaitHostCallback(
+        cl: ClassLoader,
+        interfaceName: String,
+        methodNames: Set<String>,
+        timeoutMs: Long,
+        invoke: (Any) -> Unit,
+    ): Array<Any?>? {
+        val iface = runCatching { Class.forName(interfaceName, false, cl) }.getOrNull() ?: run {
+            Log.w(TAG, "groupManage: callback interface missing $interfaceName")
+            return null
+        }
+        val latch = java.util.concurrent.CountDownLatch(1)
+        var result: Array<Any?>? = null
+        val proxy = java.lang.reflect.Proxy.newProxyInstance(cl, arrayOf(iface)) { _, method, methodArgs ->
+            if (method.name in methodNames) {
+                result = methodArgs
+                latch.countDown()
+            }
+            defaultValueFor(method.returnType)
+        }
+        runCatching { invoke(proxy) }.onFailure {
+            Log.w(TAG, "groupManage: invoke $interfaceName failed: ${it.javaClass.simpleName} ${it.message}")
+            return null
+        }
+        val ok = runCatching {
+            latch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        }.getOrDefault(false)
+        if (!ok) Log.w(TAG, "groupManage: callback timeout $interfaceName")
+        return if (ok) result else null
+    }
+
+    private fun groupManageAddRepeatMessage(container: Any?, fieldName: String, child: Any?) {
+        container ?: return
+        child ?: return
+        runCatching {
+            val field = container.javaClass.getField(fieldName).get(container)
+            field.javaClass.methods.firstOrNull { it.name == "add" && it.parameterCount == 1 }
+                ?.invoke(field, child)
+        }.onFailure {
+            Log.w(TAG, "groupManage: add repeat $fieldName failed: ${it.javaClass.simpleName} ${it.message}")
+        }
+    }
+
+    /** 发旧版 OIDB（复用群文件的 OIDBSSOPkg/IProtoReqManager 发送器）。 */
+    private fun groupManageLegacyOidb(
+        op: String,
+        cmd: String,
+        command: Int,
+        serviceType: Int,
+        body: ByteArray,
+    ): OidbResponse? {
+        val rsp = sendOidbRequest(cmd, command, serviceType, body) ?: run {
+            Log.w(TAG, "groupManage: $op attempt=legacy-oidb cmd=$cmd failed (send)")
+            return null
+        }
+        Log.i(
+            TAG,
+            "groupManage: $op attempt=legacy-oidb cmd=$cmd command=$command svc=$serviceType " +
+                "result=${rsp.result} msg=${rsp.errorMsg.take(80)} rspBytes=${rsp.body.size} " +
+                "rspHex=${hexLowerPrefix(rsp.body, 32)}",
+        )
+        return rsp
+    }
+
+    // ---- 踢人：TRPC deleteTroopMember(kickMemberV2) / 旧版 OIDB 0x8a0_0 ----
+
+    private fun groupManageKickViaTrpc(
+        chatId: String,
+        groupCode: Long,
+        targets: List<String>,
+    ): Boolean {
+        val cl = hostClassLoader() ?: return false
+        val api = groupManageQRouteApi("com.tencent.qqnt.troop.ITroopMemberOperationRepoApi")
+            ?: return false
+        val param = runCatching {
+            Class.forName("com.tencent.qqnt.bean.b", true, cl).getConstructor().newInstance()
+        }.getOrNull() ?: run {
+            Log.w(TAG, "groupManage: kick attempt=trpc failed (param class missing)")
+            return false
+        }
+        runCatching {
+            param.javaClass.getField("f176949a").set(param, groupCode.toString())
+            param.javaClass.getField("f176950b").set(param, false)
+            val uidField = param.javaClass.getDeclaredField("f176952d").apply { isAccessible = true }
+            uidField.set(param, ArrayList<String>().apply { targets.forEach { add(it) } })
+            val mapField = param.javaClass.getDeclaredField("f176953e").apply { isAccessible = true }
+            mapField.set(
+                param,
+                HashMap<String, String>().apply { targets.forEach { put(it, it) } },
+            )
+        }.onFailure {
+            Log.w(TAG, "groupManage: kick attempt=trpc param build failed: ${it.javaClass.simpleName}")
+            return false
+        }
+        val method = api.javaClass.methods.firstOrNull {
+            it.name == "deleteTroopMember" && it.parameterCount == 4
+        } ?: run {
+            Log.w(TAG, "groupManage: kick attempt=trpc method missing")
+            return false
+        }
+        val started = android.os.SystemClock.uptimeMillis()
+        val results = groupManageAwaitHostCallback(
+            cl,
+            "com.tencent.qqnt.troop.c",
+            setOf("a"),
+            8_000L,
+        ) { proxy -> method.invoke(api, param, null, "m3tim", proxy) }
+        val ok = (results?.getOrNull(0) as? Boolean) == true
+        Log.i(
+            TAG,
+            "groupManage: kick attempt=trpc method=deleteTroopMember code=${(results?.getOrNull(1) as? Number)?.toInt()} " +
+                "ok=$ok elapsedMs=${android.os.SystemClock.uptimeMillis() - started}",
+        )
+        return ok
+    }
+
+    private fun groupManageKickViaOidb(
+        chatId: String,
+        groupCode: Long,
+        targets: List<String>,
+    ): Boolean {
+        val req = newPb("tencent.im.oidb.cmd0x8a0.oidb_0x8a0\$ReqBody") ?: run {
+            Log.w(TAG, "groupManage: kick attempt=legacy-oidb req class missing")
+            return false
+        }
+        pbSet(req, "opt_uint64_group_code", groupCode)
+        var added = 0
+        targets.forEach { uid ->
+            val uin = groupManageUinForUid(chatId, uid)
+            if (uin == 0L) {
+                Log.w(TAG, "groupManage: kick legacy skip uid=$uid (no uin)")
+                return@forEach
+            }
+            val info = newPb("tencent.im.oidb.cmd0x8a0.oidb_0x8a0\$KickMemberInfo")
+                ?: return@forEach
+            pbSet(info, "opt_uint32_operate", 5)
+            pbSet(info, "opt_uint64_member_uin", uin)
+            pbSet(info, "opt_uint32_flag", 0)
+            pbSetHasFlag(info, true)
+            groupManageAddRepeatMessage(req, "rpt_msg_kick_list", info)
+            added++
+            Log.i(TAG, "groupManage: kick legacy uin uid=$uid uin=$uin")
+        }
+        if (added == 0) {
+            Log.w(TAG, "groupManage: kick attempt=legacy-oidb failed (no uin resolved)")
+            return false
+        }
+        val reqBytes = pbBytesOf(req) ?: return false
+        val rsp = groupManageLegacyOidb("kick", "OidbSvc.0x8a0_0", 2208, 0, reqBytes) ?: return false
+        if (rsp.result != 0) return false
+        val body = pbParse("tencent.im.oidb.cmd0x8a0.oidb_0x8a0\$RspBody", rsp.body)
+        val results = body?.let { pbRepeatMessages(it, "rpt_msg_kick_result") } ?: emptyList()
+        val ok = results.isNotEmpty() && results.all { pbInt(it, "opt_uint32_result") == 0 }
+        Log.i(TAG, "groupManage: kick attempt=legacy-oidb members=${results.size} ok=$ok")
+        return ok
+    }
+
+    // ---- 禁言：TRPC setMemberShutUp / 旧版 OIDB 0x570_8 ----
+
+    private fun groupManageMuteViaTrpc(
+        op: String,
+        groupCode: Long,
+        uid: String,
+        timeStamp: Long,
+    ): Boolean {
+        val cl = hostClassLoader() ?: return false
+        val api = groupManageQRouteApi("com.tencent.qqnt.troop.ITroopMemberOperationRepoApi")
+            ?: return false
+        val method = api.javaClass.methods.firstOrNull {
+            it.name == "setMemberShutUp" && it.parameterCount == 6
+        } ?: run {
+            Log.w(TAG, "groupManage: $op attempt=trpc method missing")
+            return false
+        }
+        val started = android.os.SystemClock.uptimeMillis()
+        val results = groupManageAwaitHostCallback(
+            cl,
+            "com.tencent.qqnt.troop.h",
+            setOf("onResult"),
+            8_000L,
+        ) { proxy -> method.invoke(api, groupCode.toString(), uid, timeStamp, null, "m3tim", proxy) }
+        val code = (results?.getOrNull(1) as? Number)?.toInt() ?: -1
+        val ok = (results?.getOrNull(0) as? Boolean) == true || (results != null && code == 0)
+        Log.i(
+            TAG,
+            "groupManage: $op attempt=trpc method=setMemberShutUp timeStamp=$timeStamp code=$code " +
+                "ok=$ok elapsedMs=${android.os.SystemClock.uptimeMillis() - started}",
+        )
+        return ok
+    }
+
+    private fun groupManageMuteViaOidb(
+        op: String,
+        chatId: String,
+        groupCode: Long,
+        uid: String,
+        endTimeSeconds: Long,
+    ): Boolean {
+        val uin = groupManageUinForUid(chatId, uid)
+        if (uin == 0L) {
+            Log.w(TAG, "groupManage: $op attempt=legacy-oidb failed (no uin for uid=$uid)")
+            return false
+        }
+        // TIM MemberSettingHandler.C1: int(groupUin) + byte 0x20 + short(count) + [int(memberUin), int(endTime)]
+        val body = java.nio.ByteBuffer.allocate(15)
+        body.putInt(groupCode.toInt())
+        body.put(0x20.toByte())
+        body.putShort(1.toShort())
+        body.putInt(uin.toInt())
+        body.putInt(endTimeSeconds.toInt())
+        Log.i(
+            TAG,
+            "groupManage: $op attempt=legacy-oidb group=$groupCode uid=$uid uin=$uin " +
+                "endTime=$endTimeSeconds",
+        )
+        val rsp = groupManageLegacyOidb(op, "OidbSvc.0x570_8", 1392, 8, body.array()) ?: return false
+        return rsp.result == 0
+    }
+
+    // ---- 管理员：旧版 OIDB 0x55c_1（com.tencent.mobileqq.app.cw servlet）----
+
+    private fun groupManageAdminViaOidb(
+        op: String,
+        chatId: String,
+        groupCode: Long,
+        uid: String,
+        admin: Boolean,
+    ): Boolean {
+        val uin = groupManageUinForUid(chatId, uid)
+        if (uin == 0L) {
+            Log.w(TAG, "groupManage: $op attempt=legacy-oidb failed (no uin for uid=$uid)")
+            return false
+        }
+        // TIM app.cw: int(troopUin) + int(memberUin) + byte(operation: 1=add admin, 0=delete)
+        val body = java.nio.ByteBuffer.allocate(9)
+        body.putInt(groupCode.toInt())
+        body.putInt(uin.toInt())
+        body.put(if (admin) 1.toByte() else 0.toByte())
+        Log.i(
+            TAG,
+            "groupManage: $op attempt=legacy-oidb group=$groupCode uid=$uid uin=$uin " +
+                "operation=${if (admin) 1 else 0}",
+        )
+        val rsp = groupManageLegacyOidb(op, "OidbSvc.0x55c_1", 1372, 1, body.array()) ?: return false
+        return rsp.result == 0
+    }
+
+    // ---- 退群/解散：TRPC TroopOperationRepo（quitGroup/destroyGroup V2）----
+
+    private fun groupManageQuitDestroyViaTrpc(
+        op: String,
+        groupCode: Long,
+        destroy: Boolean,
+    ): Boolean {
+        val cl = hostClassLoader() ?: return false
+        var api = groupManageQRouteApi("com.tencent.qqnt.troop.ITroopOperationRepoApi")
+        if (api == null) {
+            api = runCatching {
+                Class.forName("com.tencent.qqnt.troop.TroopOperationRepo", true, cl)
+                    .getField("INSTANCE").get(null)
+            }.getOrNull()
+        }
+        api ?: run {
+            Log.w(TAG, "groupManage: $op attempt=trpc failed (repo/api missing)")
+            return false
+        }
+        val methodName = if (destroy) "destroyGroup" else "quitGroup"
+        val method = api.javaClass.methods.firstOrNull {
+            it.name == methodName && it.parameterCount == 5
+        } ?: run {
+            Log.w(TAG, "groupManage: $op attempt=trpc method $methodName/5 missing")
+            return false
+        }
+        val started = android.os.SystemClock.uptimeMillis()
+        val results = groupManageAwaitHostCallback(
+            cl,
+            "com.tencent.qqnt.troop.h",
+            setOf("onResult"),
+            10_000L,
+        ) { proxy -> method.invoke(api, groupCode.toString(), false, null, "m3tim", proxy) }
+        val code = (results?.getOrNull(1) as? Number)?.toInt() ?: -1
+        val ok = (results?.getOrNull(0) as? Boolean) == true || (results != null && code == 0)
+        Log.i(
+            TAG,
+            "groupManage: $op attempt=trpc method=$methodName code=$code msg=" +
+                "${(results?.getOrNull(2) as? String).orEmpty().take(80)} ok=$ok " +
+                "elapsedMs=${android.os.SystemClock.uptimeMillis() - started}",
+        )
+        return ok
+    }
+
+    fun kickGroupMembers(chatId: String, uids: List<String>): Boolean {
+        val targets = uids.map { it.trim() }.filter { it.isNotBlank() }
+        if (targets.isEmpty()) {
+            Log.w(TAG, "groupManage: kick failed (empty uids) chat=$chatId")
+            return false
+        }
+        val groupCode = groupCodeFor(chatId) ?: run {
+            Log.w(TAG, "groupManage: kick failed (not a group / no groupCode) chat=$chatId")
+            return false
+        }
+        Log.i(TAG, "groupManage: kick start chat=$chatId uids=$targets")
+        val kernelOk = groupManageOp(
+            op = "kick",
+            chatId = chatId,
+            methodName = "kickMember",
+            parameterCount = 5,
+            callbackInterface = "com.tencent.qqnt.kernel.nativeinterface.IKickMemberOperateCallback",
+        ) { _, groupCodeArg, _ ->
+            arrayOf(groupCodeArg, ArrayList<Any>().apply { targets.forEach { add(it) } }, false, "")
+        }
+        if (kernelOk) return true
+        Log.i(TAG, "groupManage: kick attempt=kernel failed -> fallback trpc/legacy-oidb")
+        if (groupManageKickViaTrpc(chatId, groupCode, targets)) return true
+        return groupManageKickViaOidb(chatId, groupCode, targets)
+    }
+
+    fun setGroupMemberMuted(chatId: String, uid: String, muted: Boolean, seconds: Int = 0): Boolean {
+        if (uid.isBlank()) {
+            Log.w(TAG, "groupManage: mute failed (empty uid) chat=$chatId")
+            return false
+        }
+        val groupCode = groupCodeFor(chatId) ?: run {
+            Log.w(TAG, "groupManage: mute failed (not a group / no groupCode) chat=$chatId")
+            return false
+        }
+        if (muted) {
+            val duration = seconds.takeIf { it > 0 } ?: 600
+            val serverEnd = groupManageServerTimeSeconds() + duration
+            Log.i(
+                TAG,
+                "groupManage: mute start chat=$chatId uid=$uid seconds=$duration serverEnd=$serverEnd",
+            )
+            fun kernelMute(label: String, timeStamp: Int): Boolean = groupManageOp(
+                op = label,
+                chatId = chatId,
+                methodName = "setMemberShutUp",
+                parameterCount = 3,
+                callbackInterface = "com.tencent.qqnt.kernel.nativeinterface.IOperateCallback",
+            ) { _, groupCodeArg, cl ->
+                val infoClass = runCatching {
+                    Class.forName(
+                        "com.tencent.qqnt.kernel.nativeinterface.GroupMemberShutUpInfo", true, cl,
+                    )
+                }.getOrNull() ?: return@groupManageOp null
+                val info = runCatching { infoClass.getConstructor().newInstance() }.getOrNull()
+                    ?: return@groupManageOp null
+                groupManageSetField(info, "uid", uid)
+                groupManageSetField(info, "timeStamp", timeStamp)
+                arrayOf(groupCodeArg, ArrayList<Any>().apply { add(info) })
+            }
+            if (kernelMute("mute(serverEnd)", serverEnd.toInt())) return true
+            if (kernelMute("mute(duration)", duration)) return true
+            Log.i(TAG, "groupManage: mute attempt=kernel failed -> fallback trpc/legacy-oidb")
+            if (groupManageMuteViaTrpc("mute", groupCode, uid, serverEnd)) return true
+            if (groupManageMuteViaTrpc("mute", groupCode, uid, duration.toLong())) return true
+            return groupManageMuteViaOidb("mute", chatId, groupCode, uid, serverEnd)
+        }
+        // 解除禁言：TIM 原生 TroopMemberOperationRepo.setMemberShutUp 用「单元素
+        // GroupMemberShutUpInfo(uid, gagTimeStamp=0)」；空列表不是 TIM 原生用法（可能回调成功但 no-op），
+        // 这里改为目标明确路径优先 + 调用后校验成员禁言状态，避免误报成功。
+        val started = android.os.SystemClock.uptimeMillis()
+        Log.i(
+            TAG,
+            "groupManage: unmute start chat=$chatId uid=$uid " +
+                "(kernel uid+timeStamp=0 first, empty-list last)",
+        )
+        var callbackCode = -1
+        var method = "none"
+        fun unmuteKernel(label: String, timeStamp: Int): Boolean {
+            val (ok, code) = groupManageOpResult(
+                op = label,
+                chatId = chatId,
+                methodName = "setMemberShutUp",
+                parameterCount = 3,
+                callbackInterface = "com.tencent.qqnt.kernel.nativeinterface.IOperateCallback",
+            ) { _, groupCodeArg, cl ->
+                val infoClass = runCatching {
+                    Class.forName(
+                        "com.tencent.qqnt.kernel.nativeinterface.GroupMemberShutUpInfo",
+                        true,
+                        cl,
+                    )
+                }.getOrNull() ?: return@groupManageOpResult null
+                val info = runCatching { infoClass.getConstructor().newInstance() }.getOrNull()
+                    ?: return@groupManageOpResult null
+                groupManageSetField(info, "uid", uid)
+                groupManageSetField(info, "timeStamp", timeStamp)
+                arrayOf(groupCodeArg, ArrayList<Any>().apply { add(info) })
+            }
+            callbackCode = code
+            method = label
+            Log.i(TAG, "groupManage: unmute method=$label callbackCode=$code ok=$ok")
+            return ok
+        }
+        // 变体 1：timeStamp=0（TIM 原生解禁值）；变体 2：当前服务器秒（部分服务端把 0 当默认时长处理）。
+        var kernelOk = unmuteKernel("unmute(uid+0)", 0)
+        if (!kernelOk) {
+            kernelOk = unmuteKernel(
+                "unmute(uid+serverNow)",
+                (groupManageServerTimeSeconds() % Int.MAX_VALUE).toInt(),
+            )
+        }
+        var verified = kernelOk && awaitGroupMemberUnmuted(chatId, uid)
+        if (!verified) {
+            // TRPC / 旧版 OIDB 兜底（与禁言同一套通道）
+            val trpcOk = groupManageMuteViaTrpc("unmute", groupCode, uid, 0L)
+            if (trpcOk) {
+                method = "trpc"
+                callbackCode = -1
+                Log.i(TAG, "groupManage: unmute method=trpc ok=true")
+            } else {
+                val oidbOk = groupManageMuteViaOidb("unmute", chatId, groupCode, uid, 0L)
+                if (oidbOk) {
+                    method = "legacy-oidb"
+                    callbackCode = -1
+                    Log.i(TAG, "groupManage: unmute method=legacy-oidb ok=true")
+                }
+            }
+            verified = awaitGroupMemberUnmuted(chatId, uid)
+        }
+        if (!verified && method != "empty-list") {
+            // 最后兜底：空列表（历史实现；TIM 原生不使用，仅当明确目标路径/TRPC/OIDB 都未通过校验时尝试）
+            val (emptyOk, emptyCode) = groupManageOpResult(
+                op = "unmute(empty)",
+                chatId = chatId,
+                methodName = "setMemberShutUp",
+                parameterCount = 3,
+                callbackInterface = "com.tencent.qqnt.kernel.nativeinterface.IOperateCallback",
+            ) { _, groupCodeArg, _ -> arrayOf(groupCodeArg, ArrayList<Any>()) }
+            callbackCode = emptyCode
+            method = "empty-list"
+            Log.i(TAG, "groupManage: unmute method=empty-list callbackCode=$emptyCode ok=$emptyOk")
+            verified = emptyOk && awaitGroupMemberUnmuted(chatId, uid)
+        }
+        Log.i(
+            TAG,
+            "groupManage: unmute method=$method callbackCode=$callbackCode ok=$verified " +
+                "verified=$verified chat=$chatId uid=$uid " +
+                "elapsedMs=${android.os.SystemClock.uptimeMillis() - started}",
+        )
+        return verified
+    }
+
+    /**
+     * 查询单个群成员的禁言截止时间（秒级时间戳；null=查询失败）。
+     * 用内核 getAllMemberListV2(force=true) 的 MemberInfo.shutUpTime（与 TIM 成员列表同源）。
+     */
+    private fun queryGroupMemberShutUpTime(groupCode: Long, uid: String): Int? {
+        if (groupCode == 0L || uid.isBlank()) return null
+        val cl = hostClassLoader() ?: return null
+        val service = kernelService?.let { invokeGetter(it, "getGroupService") } ?: return null
+        val method = service.javaClass.methods.firstOrNull {
+            it.name == "getAllMemberListV2" && it.parameterCount == 3
+        } ?: return null
+        val args = runCatching {
+            awaitCallback(
+                cl,
+                "com.tencent.qqnt.kernel.nativeinterface.IGroupMemberListCallback",
+                6_000L,
+            ) { proxy -> method.invoke(service, groupCode, true, proxy) }
+        }.getOrNull() ?: return null
+        val listResult = args.getOrNull(2) ?: return null
+        @Suppress("UNCHECKED_CAST")
+        val infos = invokeGetter(listResult, "getInfos") as? Map<*, *> ?: return null
+        val info = infos[uid]
+            ?: infos.values.firstOrNull {
+                it != null && (invokeGetter(it, "getUid") as? String) == uid
+            }
+            ?: return null
+        return (invokeGetter(info, "getShutUpTime") as? Number)?.toInt()
+    }
+
+    /** 解禁后轮询校验成员确实不再禁言（shutUpTime <= 当前服务器时间），≤2.5s。 */
+    private fun awaitGroupMemberUnmuted(chatId: String, uid: String): Boolean {
+        val groupCode = groupCodeFor(chatId) ?: return false
+        val started = perfUptime()
+        val deadline = started + 2_500L
+        while (perfUptime() < deadline) {
+            val nowSec = groupManageServerTimeSeconds()
+            val shutUp = queryGroupMemberShutUpTime(groupCode, uid)
+            if (shutUp != null) {
+                val muted = shutUp.toLong() > nowSec
+                Log.i(
+                    TAG,
+                    "groupManage: unmute verify muted=$muted shutUpTime=$shutUp " +
+                        "now=$nowSec uid=$uid",
+                )
+                if (!muted) return true
+            }
+            Thread.sleep(150L)
+        }
+        Log.i(
+            TAG,
+            "groupManage: unmute verify muted=still-muted/timeout uid=$uid " +
+                "ms=${perfUptime() - started}",
+        )
+        return false
+    }
+
+    fun setGroupMemberAdmin(chatId: String, uid: String, admin: Boolean): Boolean {
+        if (uid.isBlank()) {
+            Log.w(TAG, "groupManage: admin failed (empty uid) chat=$chatId")
+            return false
+        }
+        val groupCode = groupCodeFor(chatId) ?: run {
+            Log.w(TAG, "groupManage: admin failed (not a group / no groupCode) chat=$chatId")
+            return false
+        }
+        val roleName = if (admin) "ADMIN" else "MEMBER"
+        val op = if (admin) "setAdmin" else "unsetAdmin"
+        Log.i(TAG, "groupManage: $op start chat=$chatId uid=$uid role=$roleName")
+        val kernelOk = groupManageOp(
+            op = op,
+            chatId = chatId,
+            methodName = "modifyMemberRole",
+            parameterCount = 4,
+            callbackInterface = "com.tencent.qqnt.kernel.nativeinterface.IOperateCallback",
+        ) { _, groupCodeArg, cl ->
+            val role = groupManageStaticField(
+                cl,
+                "com.tencent.qqnt.kernelpublic.nativeinterface.MemberRole",
+                roleName,
+            ) ?: return@groupManageOp null
+            arrayOf(groupCodeArg, uid, role)
+        }
+        if (kernelOk) return true
+        Log.i(TAG, "groupManage: $op attempt=kernel failed -> fallback legacy-oidb 0x55c_1")
+        return groupManageAdminViaOidb(op, chatId, groupCode, uid, admin)
+    }
+
+    fun setGroupMemberCard(chatId: String, uid: String, card: String): Boolean {
+        if (uid.isBlank()) {
+            Log.w(TAG, "groupManage: card failed (empty uid) chat=$chatId")
+            return false
+        }
+        Log.i(TAG, "groupManage: card start chat=$chatId uid=$uid card=${card.take(40)}")
+        return groupManageOp(
+            op = "card",
+            chatId = chatId,
+            methodName = "modifyMemberCardName",
+            parameterCount = 4,
+            callbackInterface = "com.tencent.qqnt.kernel.nativeinterface.IOperateCallback",
+        ) { _, groupCode, _ -> arrayOf(groupCode, uid, card) }
+    }
+
+    fun setGroupName(chatId: String, name: String): Boolean {
+        if (name.isBlank()) {
+            Log.w(TAG, "groupManage: groupName failed (empty name) chat=$chatId")
+            return false
+        }
+        Log.i(TAG, "groupManage: groupName start chat=$chatId name=${name.take(40)}")
+        return groupManageOp(
+            op = "groupName",
+            chatId = chatId,
+            methodName = "modifyGroupName",
+            parameterCount = 4,
+            callbackInterface = "com.tencent.qqnt.kernel.nativeinterface.IOperateCallback",
+        ) { _, groupCode, _ -> arrayOf(groupCode, name, false) }
+    }
+
+    fun setGroupAllMuted(chatId: String, muted: Boolean): Boolean {
+        Log.i(TAG, "groupManage: allMuted start chat=$chatId muted=$muted")
+        return groupManageOp(
+            op = "allMuted",
+            chatId = chatId,
+            methodName = "setGroupShutUp",
+            parameterCount = 3,
+            callbackInterface = "com.tencent.qqnt.kernel.nativeinterface.IOperateCallback",
+        ) { _, groupCode, _ -> arrayOf(groupCode, muted) }
+    }
+
+    /**
+     * 发布公告 Web 通道（TIM 4.1 的 mannounce 编辑页真实发布 cgi）：
+     * - 新建：POST https://web.qun.qq.com/cgi-bin/announce/add_qun_notice
+     *   参数 qid/bkn/text/pinned=0/type=1/settings={"is_show_edit_card":0,"tip_window_type":1,"confirm_required":1}
+     * - 编辑：POST https://web.qun.qq.com/cgi-bin/announce/announce_set
+     *   参数 qid/bkn/fid/settings={"set_top":0,...}
+     * 响应 JSON ec==0 表示成功（4=BK 错误/1=未登录时换下一组 cookie/bkn 重试）。
+     * 逆向依据：web.qun.qq.com_mannounce/edit/index.bundle.js 的 checkFeed/publishReq/addQunNotice。
+     */
+    private fun groupManagePublishNoticeViaWeb(
+        chatId: String,
+        groupCode: Long,
+        content: String,
+        feedsId: String,
+    ): Boolean {
+        val authCandidates = runCatching { resolveMannounceAuth() }.getOrNull().orEmpty()
+        if (authCandidates.isEmpty()) {
+            Log.w(TAG, "groupManage: notice attempt=web failed (no mannounce auth/cookie)")
+            return false
+        }
+        val create = feedsId.isBlank()
+        // mannounce 编辑页：内容变化走 add_qun_notice（编辑时带 fid）；仅设置变化走 announce_set。
+        val endpoints = if (create) {
+            listOf("https://web.qun.qq.com/cgi-bin/announce/add_qun_notice")
+        } else {
+            listOf(
+                "https://web.qun.qq.com/cgi-bin/announce/add_qun_notice",
+                "https://web.qun.qq.com/cgi-bin/announce/announce_set",
+            )
+        }
+        val addSettings = "{\"is_show_edit_card\":0,\"tip_window_type\":1,\"confirm_required\":1}"
+        val setSettings = "{\"set_top\":0,\"is_show_edit_card\":0,\"tip_window_type\":1,\"confirm_required\":1}"
+        val uin = myUin ?: ""
+        val triedKeys = LinkedHashSet<String>()
+        var attempt = 0
+        for ((baseCookie, key) in authCandidates) {
+            val plain = key.removePrefix("@")
+            val combos = buildList {
+                add("uin=o$uin; p_uin=o$uin; skey=$plain" to plain)
+                add("uin=o$uin; p_uin=o$uin; skey=@$plain" to "@$plain")
+                add("uin=o$uin; p_uin=o$uin; p_skey=$plain" to plain)
+                add(baseCookie to key)
+            }.distinct()
+            for ((cookie, bknKey) in combos) {
+                if (!triedKeys.add(cookie)) continue
+                attempt++
+                val bkn = bknFromSkey(bknKey)
+                for (endpoint in endpoints) {
+                    attempt++
+                    val isSet = endpoint.endsWith("announce_set")
+                    val fields = linkedMapOf(
+                        "qid" to groupCode.toString(),
+                        "bkn" to bkn,
+                    )
+                    if (feedsId.isNotBlank()) fields["fid"] = feedsId
+                    if (isSet) {
+                        fields["settings"] = setSettings
+                    } else {
+                        fields["text"] = content
+                        fields["pinned"] = "0"
+                        fields["type"] = "1"
+                        fields["settings"] = addSettings
+                    }
+                    val form = fields.entries.joinToString("&") { (name, value) ->
+                        "${java.net.URLEncoder.encode(name, "UTF-8")}=" +
+                            java.net.URLEncoder.encode(value, "UTF-8")
+                    }
+                    val body = runCatching { postForm(endpoint, form, cookie) }.getOrNull() ?: run {
+                        Log.w(
+                            TAG,
+                            "groupManage: notice attempt=web#$attempt failed (http) endpoint=" +
+                                endpoint.substringAfterLast('/'),
+                        )
+                        continue
+                    }
+                    val root = runCatching { org.json.JSONObject(body) }.getOrNull()
+                    val ec = root?.optInt("ec", -999) ?: -999
+                    val newFid = root?.optString("new_fid").orEmpty()
+                    Log.i(
+                        TAG,
+                        "groupManage: notice attempt=web#$attempt " +
+                            "endpoint=${endpoint.substringAfterLast('/')} " +
+                            "qid=$groupCode fid=${feedsId.take(24)} bkn=$bkn ec=$ec " +
+                            "newFid=${newFid.take(32)} body=${body.take(200)}",
+                    )
+                    if (ec == 0) {
+                        Log.i(
+                            TAG,
+                            "groupManage: notice web publish ok chat=$chatId " +
+                                "endpoint=${endpoint.substringAfterLast('/')} " +
+                                "newFid=${newFid.take(32)}",
+                        )
+                        return true
+                    }
+                    // 4=BK错误 / 1=未登录：换下一组 cookie/bkn；其它错误尝试下一个 endpoint。
+                }
+            }
+        }
+        Log.w(TAG, "groupManage: notice attempt=web failed chat=$chatId attempts=$attempt")
+        return false
+    }
+
+    fun publishGroupNotice(chatId: String, content: String, feedsId: String = ""): Boolean {
+        if (content.isBlank()) {
+            Log.w(TAG, "groupManage: notice failed (empty content) chat=$chatId")
+            return false
+        }
+        val groupCode = groupCodeFor(chatId) ?: run {
+            Log.w(TAG, "groupManage: notice failed (not a group / no groupCode) chat=$chatId")
+            return false
+        }
+        Log.i(
+            TAG,
+            "groupManage: notice start chat=$chatId feedsId=${feedsId.take(40)} len=${content.length}",
+        )
+        fun kernelPublish(label: String, withOldFeedsId: String?, withPic: Boolean): Boolean =
+            groupManageOp(
+                op = label,
+                chatId = chatId,
+                methodName = "publishGroupBulletin",
+                parameterCount = 4,
+                callbackInterface = "com.tencent.qqnt.kernel.nativeinterface.IOperateCallback",
+            ) { _, groupCodeArg, cl ->
+                val reqClass = runCatching {
+                    Class.forName(
+                        "com.tencent.qqnt.kernel.nativeinterface.GroupBulletinPublishReq", true, cl,
+                    )
+                }.getOrNull() ?: return@groupManageOp null
+                val req = runCatching { reqClass.getConstructor().newInstance() }.getOrNull()
+                    ?: return@groupManageOp null
+                groupManageSetField(req, "text", content)
+                groupManageSetField(req, "pinned", 0)
+                if (withOldFeedsId != null) groupManageSetField(req, "oldFeedsId", withOldFeedsId)
+                if (withPic) {
+                    runCatching {
+                        val picClass = Class.forName(
+                            "com.tencent.qqnt.kernel.nativeinterface.GroupBulletinPicInfo", true, cl,
+                        )
+                        val pic = picClass.getConstructor().newInstance()
+                        groupManageSetField(pic, "id", "")
+                        groupManageSetField(pic, "width", 0)
+                        groupManageSetField(pic, "height", 0)
+                        groupManageSetField(req, "picInfo", pic)
+                    }.onFailure {
+                        Log.w(TAG, "groupManage: notice picInfo build failed: ${it.javaClass.simpleName}")
+                    }
+                }
+                arrayOf(groupCodeArg, feedsId, req)
+            }
+        // 内核参数变体：picInfo=null（TIM 纯文字公告更可能这样传）→ 再试空 picInfo。
+        if (kernelPublish("notice(kernel,nullPic)", null, withPic = false)) return true
+        if (kernelPublish("notice(kernel,emptyPic)", if (feedsId.isBlank()) "" else feedsId, withPic = true)) {
+            return true
+        }
+        Log.i(TAG, "groupManage: notice attempt=kernel failed -> fallback web cgi")
+        val webOk = groupManagePublishNoticeViaWeb(chatId, groupCode, content, feedsId)
+        if (webOk) {
+            // 发布成功：让 UI 下次拉取拿到新公告。
+            runCatching { groupNoticeCache.remove(chatId) }
+            capturedNoticeList = null
+            captured48 = null
+            runCatching { invalidateChatInfoCache(chatId) }
+            Log.i(TAG, "groupManage: notice publish ok (web) chat=$chatId caches invalidated")
+        }
+        return webOk
+    }
+
+    fun quitGroup(chatId: String): Boolean {
+        val groupCode = groupCodeFor(chatId) ?: run {
+            Log.w(TAG, "groupManage: quit failed (not a group / no groupCode) chat=$chatId")
+            return false
+        }
+        Log.i(TAG, "groupManage: quit start chat=$chatId")
+        val kernelOk = groupManageOp(
+            op = "quit",
+            chatId = chatId,
+            methodName = "quitGroup",
+            parameterCount = 2,
+            callbackInterface = "com.tencent.qqnt.kernel.nativeinterface.IOperateCallback",
+        ) { _, groupCodeArg, _ -> arrayOf(groupCodeArg) }
+        if (kernelOk) return true
+        Log.i(TAG, "groupManage: quit attempt=kernel failed -> fallback trpc")
+        return groupManageQuitDestroyViaTrpc("quit", groupCode, destroy = false)
+    }
+
+    fun destroyGroup(chatId: String): Boolean {
+        val groupCode = groupCodeFor(chatId) ?: run {
+            Log.w(TAG, "groupManage: destroy failed (not a group / no groupCode) chat=$chatId")
+            return false
+        }
+        Log.i(TAG, "groupManage: destroy start chat=$chatId")
+        val kernelOk = groupManageOp(
+            op = "destroy",
+            chatId = chatId,
+            methodName = "destroyGroup",
+            parameterCount = 2,
+            callbackInterface = "com.tencent.qqnt.kernel.nativeinterface.IOperateCallback",
+        ) { _, groupCodeArg, _ -> arrayOf(groupCodeArg) }
+        if (kernelOk) return true
+        Log.i(TAG, "groupManage: destroy attempt=kernel failed -> fallback trpc")
+        return groupManageQuitDestroyViaTrpc("destroy", groupCode, destroy = true)
+    }
+
+}
+
+/** 宿主里的群文件数据源（TIM NT IKernelRichMediaService）。 */
+internal class TimGroupFileSource : GroupFileSource {
+    override fun canManageGroupFiles(chatId: String): Boolean =
+        TimBridge.canManageGroupFiles(chatId)
+
+    override fun listGroupFiles(
+        chatId: String,
+        parentFolderId: String,
+        startIndex: Int,
+        count: Int,
+    ): GroupFilePage? = TimBridge.listGroupFiles(chatId, parentFolderId, startIndex, count)
+
+    override fun downloadGroupFile(
+        chatId: String,
+        entry: GroupFileEntry,
+        onProgress: (GroupFileDownload) -> Unit,
+    ): GroupFileDownload? = TimBridge.downloadGroupFile(chatId, entry, onProgress)
+
+    override fun uploadGroupFile(
+        chatId: String,
+        parentFolderId: String,
+        localPath: String,
+        fileName: String,
+    ): Boolean = TimBridge.uploadGroupFile(chatId, parentFolderId, localPath, fileName)
+
+    override fun createGroupFolder(chatId: String, folderName: String): Boolean =
+        TimBridge.createGroupFolder(chatId, folderName)
+
+    override fun renameGroupFile(
+        chatId: String,
+        entry: GroupFileEntry,
+        newName: String,
+    ): Boolean = TimBridge.renameGroupFile(chatId, entry, newName)
+
+    override fun moveGroupFiles(
+        chatId: String,
+        entries: List<GroupFileEntry>,
+        destFolderId: String,
+    ): Boolean = TimBridge.moveGroupFiles(chatId, entries, destFolderId)
+
+    override fun deleteGroupFiles(chatId: String, entries: List<GroupFileEntry>): Boolean =
+        TimBridge.deleteGroupFiles(chatId, entries)
+
+    override fun openGroupFile(path: String): Boolean = TimBridge.openGroupFile(path)
+}
+
+/** 宿主里的群管理数据源（TIM NT IKernelGroupService）。 */
+internal class TimGroupManageSource : GroupManageSource {
+    override fun kickGroupMembers(chatId: String, uids: List<String>): Boolean =
+        TimBridge.kickGroupMembers(chatId, uids)
+
+    override fun setGroupMemberMuted(
+        chatId: String,
+        uid: String,
+        muted: Boolean,
+        seconds: Int,
+    ): Boolean = TimBridge.setGroupMemberMuted(chatId, uid, muted, seconds)
+
+    override fun setGroupMemberAdmin(chatId: String, uid: String, admin: Boolean): Boolean =
+        TimBridge.setGroupMemberAdmin(chatId, uid, admin)
+
+    override fun setGroupMemberCard(chatId: String, uid: String, card: String): Boolean =
+        TimBridge.setGroupMemberCard(chatId, uid, card)
+
+    override fun setGroupName(chatId: String, name: String): Boolean =
+        TimBridge.setGroupName(chatId, name)
+
+    override fun setGroupAllMuted(chatId: String, muted: Boolean): Boolean =
+        TimBridge.setGroupAllMuted(chatId, muted)
+
+    override fun publishGroupNotice(chatId: String, content: String, feedsId: String): Boolean =
+        TimBridge.publishGroupNotice(chatId, content, feedsId)
+
+    override fun quitGroup(chatId: String): Boolean = TimBridge.quitGroup(chatId)
+
+    override fun destroyGroup(chatId: String): Boolean = TimBridge.destroyGroup(chatId)
+}
+
+/** 宿主里的真实会话数据源。 */
+internal class TimChatSource : ChatSource {
+    override fun loadChats(): List<ChatItem>? = TimBridge.loadRecentChats()
+
+    override fun loadChatInfo(chatId: String): ChatInfoData? = TimBridge.loadChatInfo(chatId)
+
+    override fun loadChatInfoFast(chatId: String): ChatInfoData? = TimBridge.loadChatInfoFast(chatId)
+
+    override fun invalidateChatInfoCache(chatId: String) = TimBridge.invalidateChatInfoCache(chatId)
+
+    override fun loadGroupNotices(chatId: String): List<GroupNotice>? =
+        TimBridge.loadGroupNotices(chatId)
+
+    override fun loadGroupAssistant(): GroupAssistantData? = TimBridge.loadGroupAssistant()
+
+    override fun loadGroupMembers(chatId: String): List<ChatMember>? =
+        TimBridge.loadGroupMembers(chatId)
+}
+
+/** 宿主里的真实好友/联系人数据源。 */
+internal class TimContactSource : ContactSource {
+    override fun loadContacts(): List<ContactItem>? = TimBridge.loadContacts()
+
+    override fun loadContactDetail(contactId: String): ContactDetail? =
+        TimBridge.loadContactDetail(contactId)
+
+    override fun loadUserProfile(chatId: String, uid: String, uin: String): UserProfile? =
+        TimBridge.loadUserProfile(chatId, uid, uin)
+}
+
+/** 宿主里的真实收藏表情数据源。 */
+internal class TimEmojiSource : EmojiSource {
+    override fun loadFavoriteEmojis(): List<CustomEmoji>? = TimBridge.loadFavoriteEmojis()
+
+    override fun refreshFavoriteEmojis(): List<CustomEmoji>? = TimBridge.refreshFavoriteEmojis()
+
+    override fun addMessageToFavorites(chatId: String, msgId: Long, elementId: Long): Boolean =
+        TimBridge.addMessageToFavorites(chatId, msgId, elementId)
+
+    override fun loadStickerPacks(): List<StickerPack>? = TimBridge.loadStickerPacks()
+
+    override fun loadStickerPackEmojis(packId: String): List<CustomEmoji>? =
+        TimBridge.loadStickerPackEmojis(packId)
+
+    override fun sendStickerPackEmoji(chatId: String, epId: String, eId: String): Boolean =
+        TimBridge.sendStickerPackEmoji(chatId, epId, eId)
+
+    override fun moveFavoriteEmojiToTop(emojiId: String): Boolean =
+        TimBridge.moveFavoriteEmojiToTop(emojiId)
+
+    override fun deleteFavoriteEmoji(emojiId: String): Boolean =
+        TimBridge.deleteFavoriteEmoji(emojiId)
+}
+
+/** 宿主里的会话设置 / 聊天记录搜索数据源（置顶、消息免打扰、查找聊天记录）。 */
+internal class TimChatSettingSource : ChatSettingSource {
+    override fun setChatPinned(chatId: String, pinned: Boolean): Boolean =
+        TimBridge.setChatPinned(chatId, pinned)
+
+    override fun setChatMuted(chatId: String, muted: Boolean): Boolean =
+        TimBridge.setChatMuted(chatId, muted)
+
+    override fun setChatUnread(chatId: String, unread: Boolean): Boolean =
+        TimBridge.setChatUnread(chatId, unread)
+
+    override fun deleteChat(chatId: String): Boolean = TimBridge.deleteChat(chatId)
+
+    override fun searchChatMessages(chatId: String, keyword: String, limit: Int): List<ChatMessage>? =
+        TimBridge.searchChatMessages(chatId, keyword, limit)
+}
+
+/** 宿主里的加好友/群搜索 + 扫一扫数据源。 */
+internal class TimSearchSource : SearchSource {
+    override fun searchAll(keyword: String, messageLimit: Int): GlobalSearchResult? =
+        TimBridge.searchAll(keyword, messageLimit)
+}
+
+internal class TimFriendManageSource : FriendManageSource {
+    override fun clearChatHistory(chatId: String): Boolean = TimBridge.clearChatHistory(chatId)
+
+    override fun deleteFriend(chatId: String, uid: String): Boolean =
+        TimBridge.deleteFriend(chatId, uid)
+
+    override fun loadFriendRequests(): List<FriendRequest>? = TimBridge.loadFriendRequests()
+
+    override fun approveFriendRequest(uid: String, uin: String, accept: Boolean): Boolean =
+        TimBridge.approveFriendRequest(uid, uin, accept)
+
+    override fun setFriendRemark(uid: String, remark: String): Boolean =
+        TimBridge.setFriendRemark(uid, remark)
+
+    override fun setGroupDescription(chatId: String, description: String): Boolean =
+        TimBridge.setGroupDescription(chatId, description)
+
+    override fun openGroupAvatarEditor(chatId: String): Boolean =
+        TimBridge.openGroupAvatarEditor(chatId)
+}
+
+internal class TimCallSource : CallSource {
+    override fun startVoiceCall(chatId: String): Boolean = TimBridge.startVoiceCall(chatId)
+
+    override fun startVideoCall(chatId: String): Boolean = TimBridge.startVideoCall(chatId)
+}
+
+internal class TimAddFriendSource : AddFriendSource {
+    override fun search(keyword: String): AddFriendSearchResult? = TimBridge.searchAddFriend(keyword)
+
+    override fun queryFriendSetting(user: AddFriendUser): AddFriendSettingInfo? =
+        TimBridge.queryFriendSettingInfo(user)
+
+    override fun requestAddFriend(user: AddFriendUser, message: String): Boolean =
+        TimBridge.requestAddFriend(user, message)
+
+    override fun lastAddFriendError(): String? = TimBridge.lastAddFriendError()
+
+    override fun joinGroup(group: AddFriendGroup): Boolean = TimBridge.joinGroup(group)
+}
+
+/** 宿主里的扫一扫结果处理：交给 TIM 原生 DispatchScanResultActivity/QRJumpActivity。 */
+internal class TimQrActionSource : QrActionSource {
+    override fun openQrContent(text: String): Boolean = TimBridge.openQrContent(text)
+}
+
+/** 宿主里的语音播放源：交给 TIM CommonAudioPlayer（silk/amr 自动识别）。 */
+internal class TimVoicePlaybackSource : VoicePlaybackSource {
+    override fun playVoice(path: String, offsetMs: Int): Boolean =
+        TimBridge.playVoice(path, offsetMs)
+
+    override fun stopVoice() = TimBridge.stopVoice()
+
+    override fun isVoicePlaying(): Boolean = TimBridge.isVoicePlaying()
+
+    override fun isSpeakerEnabled(): Boolean = TimBridge.isSpeakerEnabled()
+
+    override fun setSpeakerEnabled(enabled: Boolean): Boolean =
+        TimBridge.setSpeakerEnabled(enabled)
+
+    override fun playbackPositionMs(): Int = TimBridge.voicePlaybackPositionMs()
+
+    override fun playbackDurationMs(): Int = TimBridge.voicePlaybackDurationMs()
+
+    override fun seekVoice(positionMs: Int): Boolean = TimBridge.seekVoice(positionMs)
+
+    override fun pauseVoice(): Boolean = TimBridge.pauseVoice()
+
+    override fun resumeVoice(): Boolean = TimBridge.resumeVoice()
+}
+
+/** 宿主里的创建群聊数据源。 */
+internal class TimGroupCreateSource : GroupCreateSource {
+    override fun createGroup(members: List<ContactItem>): String? = TimBridge.createGroup(members)
+}
+
+/** 宿主里的真实消息数据源。 */
+internal class TimMessageSource : MessageSource {
+    override fun loadMessages(chatId: String): List<ChatMessage>? = TimBridge.loadMessages(chatId)
+
+    override fun loadOlderMessages(chatId: String, count: Int): List<ChatMessage>? =
+        TimBridge.loadOlderMessages(chatId, count)
+
+    override fun loadChatImageOriginal(chatId: String, msgId: Long, elementId: Long): String? =
+        TimBridge.loadChatImageOriginal(chatId, msgId, elementId)
+
+    override fun startSystemVoiceRecord(chatId: String): Boolean =
+        TimBridge.startSystemVoiceRecord(chatId)
+
+    override fun loadHistoryAround(chatId: String, seq: Long, count: Int): List<ChatMessage>? =
+        TimBridge.loadHistoryAround(chatId, seq, count)
+
+    override fun sendText(chatId: String, text: String): Boolean = TimBridge.sendTextMessage(chatId, text)
+
+    override fun sendImage(chatId: String, filePath: String, width: Int, height: Int): Boolean =
+        TimBridge.sendImageMessage(chatId, filePath, width, height)
+
+    override fun sendFile(
+        chatId: String,
+        filePath: String,
+        fileName: String,
+        fileSize: Long,
+    ): Boolean = TimBridge.sendFileMessage(chatId, filePath, fileName, fileSize)
+
+    override fun sendVideo(
+        chatId: String,
+        filePath: String,
+        thumbPath: String?,
+        durationMs: Long,
+        width: Int,
+        height: Int,
+    ): Boolean = TimBridge.sendVideoMessage(chatId, filePath, thumbPath, durationMs, width, height)
+
+    override fun sendCustomEmoji(chatId: String, filePath: String): Boolean =
+        TimBridge.sendCustomEmojiMessage(chatId, filePath)
+
+    /** +1（复读消息）：桥层用「重发/转发自身」实现，详细日志见 TimBridge.sendPlusOne。 */
+    override fun sendPlusOne(chatId: String, msgId: Long): Boolean =
+        TimBridge.sendPlusOne(chatId, msgId)
+
+    override fun loadChatRecord(
+        chatId: String,
+        msgId: Long,
+        elementId: Long,
+    ): List<ChatMessage>? = TimBridge.loadChatRecord(chatId, msgId, elementId)
+
+    override fun loadChatRecord(
+        chatId: String,
+        msgId: Long,
+        elementId: Long,
+        parentMsgId: Long,
+    ): List<ChatMessage>? = TimBridge.loadChatRecord(chatId, msgId, elementId, parentMsgId)
+
+    override fun loadChatRecord(
+        chatId: String,
+        msgId: Long,
+        elementId: Long,
+        parentMsgId: Long,
+        rootMsgId: Long,
+    ): List<ChatMessage>? =
+        TimBridge.loadChatRecord(chatId, msgId, elementId, parentMsgId, rootMsgId)
+
+    override fun videoPlayUrl(chatId: String, msgId: Long, elementId: Long): String? =
+        TimBridge.videoPlayUrl(chatId, msgId, elementId)
+
+    override fun deleteMessage(chatId: String, msgId: Long): Boolean =
+        TimBridge.deleteMessage(chatId, msgId)
+
+    override fun recallMessage(chatId: String, msgId: Long): Boolean =
+        TimBridge.recallMessage(chatId, msgId)
+
+    override fun downloadAndOpenFile(
+        chatId: String,
+        msgId: Long,
+        elementId: Long,
+        knownPath: String?,
+    ): Boolean = TimBridge.downloadAndOpenFile(chatId, msgId, elementId, knownPath)
+
+    override fun openLocalFile(path: String): Boolean = TimBridge.openLocalFile(path)
+
+    override fun openArkUrl(url: String): Boolean = TimBridge.openArkUrl(url)
+
+    override fun openRedPacketMsg(chatId: String, msgId: Long): Boolean =
+        TimBridge.openRedPacketMsg(chatId, msgId)
+
+    override fun openRedPacket(
+        chatId: String,
+        billNo: String,
+        authkey: String,
+        channel: Int,
+        senderUin: Long,
+        grabState: Int,
+    ): Boolean = TimBridge.openRedPacket(chatId, billNo, authkey, channel, senderUin, grabState)
+
+    override fun startFileDownload(chatId: String, msgId: Long, elementId: Long): Boolean =
+        TimBridge.startFileDownload(chatId, msgId, elementId)
+
+    override fun fileDownloadProgress(chatId: String, msgId: Long, elementId: Long): Int =
+        TimBridge.fileDownloadProgress(chatId, msgId, elementId)
+
+    override fun downloadedFilePath(chatId: String, msgId: Long, elementId: Long): String? =
+        TimBridge.downloadedFilePath(chatId, msgId, elementId)
+
+    override fun forwardMessages(
+        srcChatId: String,
+        msgIds: List<Long>,
+        dstChatIds: List<String>,
+    ): Boolean = TimBridge.forwardMessages(srcChatId, msgIds, dstChatIds)
+
+    override fun sendTextWithReply(
+        chatId: String,
+        text: String,
+        replyToMsgId: Long,
+        replySenderUid: String,
+        replySourceText: String,
+    ): Boolean = TimBridge.sendTextMessageWithReply(
+        chatId = chatId,
+        text = text,
+        replyToMsgId = replyToMsgId,
+        replySenderUid = replySenderUid,
+        replySourceText = replySourceText,
+    )
+
+    override fun sendTextWithAt(
+        chatId: String,
+        text: String,
+        atTargets: List<AtTarget>,
+        replyToMsgId: Long,
+        replySenderUid: String,
+        replySourceText: String,
+    ): Boolean = TimBridge.sendTextWithAt(
+        chatId = chatId,
+        text = text,
+        atTargets = atTargets,
+        replyToMsgId = replyToMsgId,
+        replySenderUid = replySenderUid,
+        replySourceText = replySourceText,
+    )
+
+    override fun canRecallOthers(chatId: String): Boolean = TimBridge.canRecallOthers(chatId)
+}
+
+/**
+ * 接收 TIM「查询好友设置」回包的 ResultReceiver。
+ * TIM 的 addfriend/handler/receiver/g.java 命中捷径条件（Bundle isFromZPlan=true 且
+ * zplanResultReceiver 是 android.os.ResultReceiver）时，会 resultReceiver.send(result, bundle)，
+ * bundle 里带 friend_setting/user_question/contact_bothway/query_friend_uin。
+ */
+private class AddFriendSettingResultReceiver(
+    handler: android.os.Handler,
+    private val callback: (Int, android.os.Bundle?) -> Unit,
+) : android.os.ResultReceiver(handler) {
+    override fun onReceiveResult(resultCode: Int, resultData: android.os.Bundle?) {
+        callback(resultCode, resultData)
+    }
+}

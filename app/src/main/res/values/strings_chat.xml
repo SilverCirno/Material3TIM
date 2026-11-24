@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- ========== 消息页（本页专属文案，使用 chat_ 前缀避免与其他页面冲突） ========== -->
+    <string name="chat_new_chat">发起聊天</string>
+    <string name="home_plus_create_group">创建群聊</string>
+    <string name="home_plus_add_friend">加好友/群</string>
+    <string name="home_plus_scan">扫一扫</string>
+    <string name="chat_search_empty">没有找到相关聊天</string>
+    <string name="chat_search_pinned">置顶会话</string>
+    <string name="chat_member_count">%d 位成员</string>
+    <string name="chat_online">在线</string>
+
+    <!-- 下拉刷新文案（Miuix PullToRefresh 需要四条） -->
+    <string name="chat_refresh_pulling">下拉刷新</string>
+    <string name="chat_refresh_release">释放刷新</string>
+    <string name="chat_refresh_refreshing">正在刷新…</string>
+    <string name="chat_refresh_complete">刷新完成</string>
+    <string name="chat_load_older_pulling">下拉加载更早消息</string>
+    <string name="chat_load_older_release">松开加载更早消息</string>
+    <string name="chat_load_older_loading">正在加载更早消息…</string>
+    <string name="chat_load_older_complete">已加载更早消息</string>
+    <string name="chat_load_older_empty">没有更早的消息了</string>
+    <string name="chat_attach_send_failed">发送失败，请重试</string>
+
+    <!-- 聊天详情占位页 -->
+    <string name="chat_input_hint">输入消息…</string>
+    <string name="chat_detail_back">返回</string>
+
+    <!-- ========== 联系人页 ========== -->
+    <string name="contacts_search_empty">没有找到相关联系人</string>
+    <string name="contacts_vip">VIP</string>
+    <string name="contacts_add_friend">添加朋友</string>
+
+    <!-- ========== 加好友/群搜索页 ========== -->
+    <string name="add_friend_search_hint">QQ号 / 手机号 / 群号</string>
+    <string name="add_friend_idle">输入 QQ号 / 手机号 / 群号查找</string>
+    <string name="add_friend_empty">没有找到相关结果</string>
+    <string name="add_friend_failed">搜索失败，请重试</string>
+    <string name="add_friend_host_only">当前为独立 App 预览，加好友/群需在 TIM 宿主内使用</string>
+    <string name="add_friend_section_users">个人</string>
+    <string name="add_friend_section_groups">群聊</string>
+    <string name="add_friend_join_sent">已提交加群申请</string>
+    <string name="add_friend_join_failed">提交加群申请失败，请重试</string>
+
+    <!-- ========== 加好友验证页 ========== -->
+    <string name="add_friend_verify_title">加好友</string>
+    <string name="add_friend_verify_message_label">验证消息</string>
+    <string name="add_friend_verify_message_hint">请输入验证消息</string>
+    <string name="add_friend_verify_default_message">我是 Material3 TIM 用户</string>
+    <string name="add_friend_verify_send">发送</string>
+    <string name="add_friend_verify_sending">发送中…</string>
+    <string name="add_friend_verify_qq">QQ号：%1$s</string>
+    <string name="add_friend_verify_phone">手机号：%1$s</string>
+    <string name="add_friend_request_sent">好友请求已发送</string>
+    <string name="add_friend_request_failed">发送失败，请稍后再试</string>
+
+    <!-- 验证页按目标 friend_setting 渲染（查询中 / 允许任何人 / 验证问题） -->
+    <string name="add_friend_setting_loading">正在获取对方加好友设置…</string>
+    <string name="add_friend_setting_allow_anyone_hint">对方允许任何人添加，无需验证信息</string>
+    <string name="add_friend_setting_question">问题：%1$s</string>
+    <string name="add_friend_setting_question_indexed">问题%1$d：%2$s</string>
+    <string name="add_friend_setting_answer_label">回答</string>
+    <string name="add_friend_setting_answer_hint">请输入答案</string>
+
+    <!-- ========== 创建群聊选人页 ========== -->
+    <string name="create_group_confirm_count">确认(%1$d)</string>
+    <string name="create_group_empty">没有可选择的联系人</string>
+    <string name="create_group_success">群聊创建成功</string>
+    <string name="create_group_failed">创建群聊失败，请重试</string>
+    <string name="create_group_host_only">当前为独立 App 预览，创建群聊需在 TIM 宿主内使用</string>
+
+    <!-- ========== 会话卡片长按菜单 ========== -->
+    <string name="chat_card_pin">置顶</string>
+    <string name="chat_card_unpin">取消置顶</string>
+    <string name="chat_card_mark_unread">标为未读</string>
+    <string name="chat_card_mark_read">标为已读</string>
+    <string name="chat_card_delete">删除</string>
+    <string name="chat_card_delete_title">删除聊天</string>
+    <string name="chat_card_delete_message">仅从消息列表移除，不删除聊天记录</string>
+    <string name="chat_card_action_failed">操作失败，请重试</string>
+
+    <!-- ========== 会话卡片摘要前的提醒标签（TIM 风格 [有人@我] 等） ========== -->
+    <string name="chat_tag_at_me">[有人@我]</string>
+    <string name="chat_tag_at_all">[@全体成员]</string>
+    <string name="chat_tag_new_file">[有新文件]</string>
+    <string name="chat_tag_new_homework">[新的作业]</string>
+    <string name="chat_tag_group_notice">[群公告]</string>
+    <string name="chat_tag_my_red_packet">[@我的红包]</string>
+    <string name="chat_tag_my_gift">[@我的礼物]</string>
+    <string name="chat_tag_qq_red_packet">[QQ红包]</string>
+    <string name="chat_tag_reply_me">[有人回复我]</string>
+    <string name="chat_tag_special_care">[特别关心]</string>
+
+    <!-- ========== 语音消息播放 / 消息撤回 ========== -->
+    <string name="chat_voice_unavailable">语音文件未就绪</string>
+    <string name="chat_voice_play_failed">语音播放失败</string>
+    <string name="chat_recall_success">已撤回</string>
+    <string name="chat_recall_failed">撤回失败（超过时限或没有权限）</string>
+    <string name="chat_recall_unsupported">无法撤回</string>
+    <!-- ========== 群聊 @ 成员 ========== -->
+    <string name="chat_at_pick_title">选择提醒的人</string>
+    <string name="chat_at_all">全体成员</string>
+    <string name="chat_at_empty">暂无成员</string>
+    <string name="chat_at_owner">群主</string>
+    <string name="chat_at_admin">管理员</string>
+    <string name="chat_at_me">我</string>
+    <string name="chat_at_search_hint">搜索成员</string>
+    <string name="chat_at_confirm_count">确定(%1$d)</string>
+    <string name="chat_file_downloading">正在下载文件…</string>
+    <string name="chat_file_download_failed">文件下载失败</string>
+    <string name="chat_file_open_failed">无法打开文件</string>
+</resources>

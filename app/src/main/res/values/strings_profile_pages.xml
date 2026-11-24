@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 「我的」页子页面（编辑资料 / 我的收藏 / 我的文件）补充文案。公共文案见 values/strings.xml。 -->
+<resources>
+    <!-- ========== 编辑资料页 ========== -->
+    <string name="edit_profile_avatar_hint">点击更换头像</string>
+    <string name="edit_profile_birthday_value">2000年1月1日</string>
+    <string name="edit_profile_region_value">中国 · 北京</string>
+</resources>

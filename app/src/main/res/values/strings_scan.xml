@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- ========== 扫一扫（打开相机拍照 / 相册单选图片 + ZXing 识别二维码） ========== -->
+    <string name="scan_title">扫一扫</string>
+    <string name="scan_open_camera">打开相机</string>
+    <string name="scan_pick_image">选择图片</string>
+    <string name="scan_cancel">取消</string>
+    <string name="scan_decoding">正在识别二维码…</string>
+    <string name="scan_error_camera">无法打开系统相机</string>
+    <string name="scan_error_no_qr">未识别到二维码</string>
+    <string name="scan_error_open_failed">无法打开二维码内容</string>
+    <string name="scan_result_label">识别结果</string>
+    <string name="scan_copy">复制内容</string>
+    <string name="scan_copied">已复制</string>
+    <string name="scan_opened">已打开</string>
+</resources>

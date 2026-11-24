@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- ========== 联系人详情 / 新的朋友 / 群聊（本页专属文案，避免与其他页面重名） ========== -->
+    <string name="contact_online">在线</string>
+    <string name="contact_not_set">未设置</string>
+    <string name="contact_group_default">我的好友</string>
+</resources>
