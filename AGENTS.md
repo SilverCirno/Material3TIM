@@ -15,7 +15,7 @@
   - 两者共享 Screen/ViewModel/数据层，只在视觉与弹层组件上分开。
 - **技术栈**：Kotlin 2.4.21 / AGP 9.4.x / Gradle 9.7.x（JDK 21）、Compose BOM 2026.11.01、Miuix 0.9.5-beta03、minSdk 26。
 - **功能范围（已完成）**：消息列表/聊天详情、群文件、群管理（踢人/管理员/禁言/退群/解散/群名/群昵称/群简介/发布公告）、系统通知（免打扰过滤/点击跳转）、全局搜索、用户资料页、群成员、群公告、语音（播放/系统录音机录制发送/听筒扬声器切换）、图片（原图/长图/动图）、贴纸与收藏表情、群助手、新的朋友（含过滤通知）、好友管理（删好友/备注）、ARK 卡片（聊天记录/群公告点击）、M3E 弹窗（Expressive + 预测性返回）、首页会话分组、通知角标/未读跳转、下拉刷新、滑动引用等。
-- **已知限制/待办**：真 MarketFace 贴纸发送部分场景、APNG/魔法表情发送、TIM 原生输入法状态下的一些宿主兼容问题、部分二级页仍示例数据（我的收藏/我的文件/钱包等）、附件面板剩余项、通话页暂用 TIM 原生 UI、已读回执不做。Miuix 已升级 0.9.5-beta03，Glass 组件（GlassTopAppBar 等）尚未全量 adoption（Phase 2 待做）。详细变更记录见 README 与 git tag。
+- **已知限制/待办**：真 MarketFace 贴纸发送部分场景、APNG/魔法表情发送、TIM 原生输入法状态下的一些宿主兼容问题、部分二级页仍示例数据（我的收藏/我的文件/钱包/服务/新的朋友/标签/公众号/表情包）、附件面板剩余项、编辑资料写回、长按菜单「截图」、宽屏 Sidebar Style、通话页暂用 TIM 原生 UI、通知栏消息与已读回执未接（已读回执不做）。Miuix Glass/Voice/File/红包等已完成。详细变更记录见 README 与 git tag。
 
 ## 2. 架构分层
 
@@ -63,7 +63,7 @@ adb -s <DEVICE_SERIAL> shell am force-stop com.tencent.tim
 adb -s <DEVICE_SERIAL> shell am start -n com.tencent.tim/com.tencent.mobileqq.activity.SplashActivity
 ```
 
-- **版本号**：`app/build.gradle.kts` 中 `versionName` + `versionCode` 每次修复/功能递增（当前约 **0.5.294 / 317**，以 `app/build.gradle.kts` 为准）。
+- **版本号**：`app/build.gradle.kts` 中 `versionName` + `versionCode` 每次修复/功能递增（当前约 **0.5.295 / 318**，以 `app/build.gradle.kts` 为准）。
 - **Git**：按你的本地 Git 配置提交（如需签名可用 `git commit -S`）；
   发布时 `git tag -a vX.Y.Z -m "..."`。
 - **安装策略（用户已授权）**：构建成功后默认 **安装 + 强制停止 TIM + 重新打开**，不必每次询问；
@@ -208,8 +208,9 @@ adb -s <DEVICE_SERIAL> shell am start -n com.tencent.tim/com.tencent.mobileqq.ac
 - **验证方法**：分 UI 模式单独测——先切到目标模式、等 3~5s 预热、`adb shell dumpsys gfxinfo com.tencent.tim reset`、
   让用户连续滑动 6s、再 `dumpsys gfxinfo` 读 janky/p90/p95/p99/Slow UI；不要混入切换 UI/页面转场的帧。
 
-### Phase 2（待做）
-按 Mishka `miuix-glass-migration.md` 逐步把顶栏/底栏/弹窗/Sheet 换成 `miuix-glass` 组件（`GlassTopAppBar`、`GlassNavigationBar`、`GlassDialog`、`GlassBottomSheet`、`GlassIconDropdownMenu` 等），并接入 backdrop 采样（`rememberLayerBackdrop`/`PageBackdropBox`/`LocalPageBackdrop`）与无模糊降级（`isRuntimeShaderSupported()` 为 false 时 backdrop=null）。Phase 1 保持现有视觉不变，未做 Glass adoption。
+### Phase 2（已基本完成）
+已把 Miuix 顶栏/底栏/弹窗/Sheet 迁移到 `miuix-glass`：`GlassTopAppBar`（`HyperTopAppBar`）、`GlassNavigationBar`、`GlassPopup`/`GlassTransformPopup`（长按菜单/顶栏菜单，支持预测性返回）、`GlassDialog`/`GlassBottomSheet`、`GlassDropdownPreference`、`GlassSegmentedTabRow`；页面通过 `rememberPageBackdrop`/`LocalPageBackdrop` 采样，`isRuntimeShaderSupported()` 为 false 时自动回退纯色。主题外观页提供 example Layout 的同款设置（显示顶栏/顶栏风格/显示底栏/导航栏模式/悬浮底栏等）。
+**未做**：宽屏 `Sidebar Style`（example 的平板 rail 风格）、Miuix 固定头页面（搜索/群文件面包屑等）的玻璃顶栏穿内容效果。
 
 ### 应用图标（v0.5.293 起）
 - 图标为 **M3 / TIM 两行居中文字**（白色文字 + `#1C1B1F` 深色背景），不是图片：`res/drawable/ic_launcher_foreground.xml`
@@ -219,6 +220,15 @@ adb -s <DEVICE_SERIAL> shell am start -n com.tencent.tim/com.tencent.mobileqq.ac
   改字号/行距/换字后重跑脚本即可，不要手改 XML 路径；关于页「开源许可」已列出该字体（OFL 1.1）。
 - 颜色：`values/colors.xml` 的 `ic_launcher_background` / `ic_splash_background` 为深色；改背景色时同步保证白色文字对比度，
   关于页 icon 预览底也使用同色（`Color(0xFF1C1B1F)`）。
+
+### 宿主 Context 主题与平台组件（v0.5.295 起，重要）
+- 宿主 ComposeView 使用 `ModuleContext`（Resources 指向模块 APK）；**`getTheme()` 不能返回 `moduleResources.newTheme()` 空主题**：
+  平台组件会从 `view.context.theme` 读取属性，空主题里 `magnifierWidth/Height/Zoom` 全为 0，
+  长按文本输入框时 `android.widget.Magnifier.performPixelCopy` 会 `Bitmap.createBitmap(0,0)` 崩溃
+  （`IllegalArgumentException: width and height must be > 0`）。
+- 当前实现：`ModuleContext.getTheme()` 在模块主题上 `applyStyle(android.R.style.Theme_DeviceDefault, true)`，
+  保证系统文本选区放大镜、文本选择工具栏等平台组件有正常默认值；Compose 的 Material/Miuix 主题仍在 Compose 层单独提供。
+- 以后若新增宿主侧平台组件（PopupWindow/Dialog/TextToolbar 等），同样用这个主题，不要另建空主题。
 
 ## 6. 桥接开发要点
 
@@ -239,6 +249,7 @@ adb -s <DEVICE_SERIAL> shell am start -n com.tencent.tim/com.tencent.mobileqq.ac
 
 ## 8. 提交纪律
 
+- 许可证：项目整体 **GPL-3.0**（`LICENSE`）；主题设置页移植自 KernelSU ColorPalette（GPL-3.0），新增代码需与该许可证兼容。
 - 一个功能/修复一个 commit，message 用中文概述 + 关键点，带版本号。
 - 提交前：`./gradlew :app:assembleRelease` 通过、`git diff --check` 干净、无新增 warning 更好。
 - 同步打 annotated tag、拷贝根目录 APK，并向用户汇报：版本、提交/tag/APK、验证点。
