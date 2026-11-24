@@ -63,7 +63,7 @@ adb -s <DEVICE_SERIAL> shell am force-stop com.tencent.tim
 adb -s <DEVICE_SERIAL> shell am start -n com.tencent.tim/com.tencent.mobileqq.activity.SplashActivity
 ```
 
-- **版本号**：`app/build.gradle.kts` 中 `versionName` + `versionCode` 每次修复/功能递增（当前约 **0.5.295 / 318**，以 `app/build.gradle.kts` 为准）。
+- **版本号**：`app/build.gradle.kts` 中 `versionName` + `versionCode`（当前 **0.1.0 / 1**，首个公开版本）；**只有用户明确要求发版时才递增，日常修复不要 bump 版本号**。
 - **Git**：按你的本地 Git 配置提交（如需签名可用 `git commit -S`）；
   发布时 `git tag -a vX.Y.Z -m "..."`。
 - **安装策略（用户已授权）**：构建成功后默认 **安装 + 强制停止 TIM + 重新打开**，不必每次询问；
@@ -78,7 +78,7 @@ adb -s <DEVICE_SERIAL> shell am start -n com.tencent.tim/com.tencent.mobileqq.ac
 3. **本地编译**：`./gradlew :app:compileReleaseKotlin` 通过后再出包。
 4. **构建安装**：`./gradlew :app:assembleRelease` → `adb install -r` → force-stop TIM → 重新启动，真机回归。
 5. **真机验证**：功能由人工点击验证（不要用 adb 模拟点击/输入）；问题用 logcat（TAG `Material3Tim`）定位。
-6. **提交发布**：一个功能/修复一个 commit，递增 `versionName`/`versionCode`，打 annotated tag，并在根目录拷一份 `Material3Tim-vX.Y.Z.apk`（不入库）。
+6. **提交发布**：一个功能/修复一个 commit；只有用户明确要求发版时才递增 `versionName`/`versionCode` 并打 annotated tag，根目录 APK 不入库。
 
 ## 5. UI 规范
 
@@ -250,7 +250,7 @@ adb -s <DEVICE_SERIAL> shell am start -n com.tencent.tim/com.tencent.mobileqq.ac
 ## 8. 提交纪律
 
 - 许可证：项目整体 **GPL-3.0**（`LICENSE`）；主题设置页移植自 KernelSU ColorPalette（GPL-3.0），新增代码需与该许可证兼容。
-- 一个功能/修复一个 commit，message 用中文概述 + 关键点，带版本号。
+- 一个功能/修复一个 commit，message 用中文概述 + 关键点（默认不 bump 版本）。
 - 提交前：`./gradlew :app:assembleRelease` 通过、`git diff --check` 干净、无新增 warning 更好。
 - 同步打 annotated tag、拷贝根目录 APK，并向用户汇报：版本、提交/tag/APK、验证点。
 - 不要提交临时日志/调试文件；调试日志改为正式诊断日志时保留必要的前缀。

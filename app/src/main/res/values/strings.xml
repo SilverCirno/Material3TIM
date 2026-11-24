@@ -133,7 +133,9 @@
     <string name="about_license">开源许可</string>
     <string name="about_credits">界面设计参考 KernelSU Manager（GPL-3.0）与 Miuix（Apache-2.0），遵循各自开源许可。</string>
     <string name="about_github">GitHub</string>
-    <string name="about_github_url">https://github.com/linx3141</string>
+    <string name="about_github_url">https://github.com/linx3141/Material3Tim</string>
+    <string name="about_telegram">Telegram</string>
+    <string name="about_telegram_url">https://t.me/Linx3141Channel</string>
     <string name="about_third_party">使用的开源项目</string>
 
     <!-- ========== 其他 ========== -->

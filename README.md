@@ -2,7 +2,7 @@
 
 用自写的 Jetpack Compose 界面完整替换 **TIM（QQ NT 架构）** 官方 UI 的 Xposed 模块。同一个 APK 同时是**独立 App**（可直接安装预览 UI）和 **LSPosed 模块**（在 TIM 进程内接管界面），分阶段开发中。
 
-> **当前状态（v0.5.295 / versionCode 318）**
+> **当前状态（v0.1.0 / versionCode 1，首个公开版本）**
 >
 > - **第 1 步 ✅**：独立 Compose UI APK —— 全部页面 UI 已完成（示例数据）。
 > - **第 2 步 ✅**：同一个 APK 作为 LSPosed 模块在 TIM 进程内接管界面（测试机 + TIM 4.1.0.4050 真机验证通过）。
@@ -18,6 +18,11 @@
 
 ---
 
+## 链接
+
+- GitHub 仓库：<https://github.com/linx3141/Material3Tim>
+- Telegram 频道：<https://t.me/Linx3141Channel>
+
 ## 分步计划
 
 | 步骤 | 内容 | 状态 |
@@ -26,7 +31,14 @@
 | 2 | 制作成 Xposed 模块，替换 TIM 的 UI | ✅ 已完成（真机验证通过） |
 | 3 | 保证自写 UI 能正常调用 TIM 的功能 | 🔄 进行中（真实数据大部分打通，v0.5.77 实时推送、v0.5.78 转发与 +1、v0.5.79 打开聊天闪帧修复、v0.5.80 多选点击修复、v0.5.81 系统栏沉浸修复、v0.5.82 收藏表情页、v0.5.83 收藏表情倒序、v0.5.84 收藏表情发送、v0.5.85 会话置顶/免打扰/查找聊天记录、v0.5.86 消息页加号菜单、v0.5.87 创建群聊/加好友群/扫一扫、v0.5.88 建群成员与陌生人搜索修复、v0.5.89 昵称搜群/手机号搜索已接入；语音/文件/红包已接入，通知栏消息/已读回执等未完成） |
 
-## v0.5.295 更新（当前开发版）
+## v0.1.0 — 首个公开版本
+
+- **版本号重置**：公开前内部开发版本号是 0.5.295 / versionCode 318；对外首个版本改为 **0.1.0 / versionCode 1**（后续非用户要求不再自动 bump）。
+- 关于页新增 **Telegram 频道**入口（GitHub 下方）；README 增加 GitHub / Telegram 链接。
+- 包含内部开发期间的全部功能：双 UI（Material 3 Expressive / Miuix）、LSPosed 宿主接管、真实 TIM 数据、HyperOS4 玻璃组件、MaterialKolor 6.0 主题引擎（SPEC 2021/2025/2026 + CMF）、新文字图标等。
+- 修复宿主长按输入框文字选择崩溃（系统 Magnifier），README/AGENTS 脱敏并移除所有真实聊天截图，许可证为 GPL-3.0。
+
+## v0.5.295 更新（内部开发版，历史）
 
 1. **修复长按输入框文字崩溃**：宿主 `ModuleContext` 之前给 ComposeView 返回的是模块 APK 的空主题，系统文本选择放大镜（`android.widget.Magnifier`）读到的 `magnifierWidth/Height/Zoom` 全为 0，`performPixelCopy` 里 `Bitmap.createBitmap(0,0)` 抛 `width and height must be > 0` 直接崩溃（日志确认）。现已给宿主 Context 主题叠加系统 `Theme.DeviceDefault` 默认属性，长按输入框恢复正常系统文字选择/放大镜。
 2. **仓库文档整理**：README 更新技术栈/版本/当前未完成事项；新增 GPL-3.0 `LICENSE`（主题设置页移植自 KernelSU ColorPalette，KernelSU Manager 为 GPL-3.0，项目整体采用 GPL-3.0）。
@@ -882,14 +894,14 @@ mqq.app.MobileQQ.sMobileQQ.peekAppRuntime()
 ## 安装
 
 ```bash
-# 构建产物（当前 versionName 0.5.295 / versionCode 318）
+# 构建产物（当前 versionName 0.1.0 / versionCode 1）
 adb install -r app/build/outputs/apk/release/app-release.apk
 adb -s <DEVICE_SERIAL> install -r app/build/outputs/apk/release/app-release.apk   # 指定设备时
 ```
 
 - 包名 `io.github.linx3141.material3tim`；Debug 包带 `.debug` 后缀（applicationId 与 versionName 均带 debug 后缀），可与 Release 共存。
 - minSdk 26 / targetSdk 37；需要 Android 14+ 设备做宿主测试（LSPosed 环境）。
-- 分发给他人时建议把产物重命名为 `Material3Tim-v0.5.295.apk`；根目录 APK 与构建产物不入库（`.gitignore` 已忽略 `*.apk` / `*.aab`），Release 通过 GitHub Releases 分发。
+- 分发给他人时建议把产物重命名为 `Material3Tim-v0.1.0.apk`；根目录 APK 与构建产物不入库（`.gitignore` 已忽略 `*.apk` / `*.aab`），Release 通过 GitHub Releases 分发。
 - 历史版本与提交记录见 git tag（`v0.5.76` 起）；不在仓库内保存截图/聊天数据。
 
 **启用方法（LSPosed）**：安装 APK → LSPosed 管理器里启用「Material3 TIM」模块（作用域 `com.tencent.tim`）→ 强制停止 TIM 再打开。停用模块即可恢复 TIM 原界面。
@@ -902,7 +914,7 @@ adb -s <DEVICE_SERIAL> install -r app/build/outputs/apk/release/app-release.apk 
 - [material-kolor](https://github.com/jordond/materialkolor) **6.0.0**（`material-kolor-core` + `material-kolor-material3`；已适配 material-color-utilities 6.0.0）
 - miuix-nav（类型安全导航 + 转场）、libxposed API 102（`compileOnly`，运行时由 LSPosed 注入）
 - minSdk 26 / targetSdk 37 / compileSdk 37.2（build-tools 37.0.0）
-- 当前版本 **v0.5.295 / versionCode 318**（以 `app/build.gradle.kts` 为准）
+- 当前版本 **v0.1.0 / versionCode 1**（首个公开版本；后续非用户要求不自动 bump）
 
 ## 目录结构（主要部分）
 

@@ -30,7 +30,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.nestedscroll.nestedScroll
-import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -40,6 +40,7 @@ import androidx.compose.ui.unit.sp
 import com.material3tim.BuildConfig
 import com.material3tim.R
 import com.material3tim.ui.LocalUiMode
+import com.material3tim.ui.util.ExternalLink
 import com.material3tim.ui.component.miuix.glass.LocalPageBackdrop
 import com.material3tim.ui.component.miuix.glass.rememberPageBackdrop
 import com.material3tim.ui.component.miuix.hyper.CardItem
@@ -61,8 +62,11 @@ import top.yukonga.miuix.kmp.utils.scrollEndHaptic
 
 @Composable
 fun AboutMiuix(onBack: () -> Unit) {
-    val uriHandler = LocalUriHandler.current
+    // 与消息气泡链接一致：走 ExternalLink（Custom Tabs/默认浏览器），并标记外跳预期，
+    // 避免 TIM 的「即将离开 TIM 打开其他应用」确认框。
+    val context = LocalContext.current
     val githubUrl = stringResource(R.string.about_github_url)
+    val telegramUrl = stringResource(R.string.about_telegram_url)
     val scrollBehavior = MiuixScrollBehavior()
     val listState = rememberLazyListState()
     val enableBlur = LocalEnableBlur.current
@@ -132,7 +136,14 @@ fun AboutMiuix(onBack: () -> Unit) {
                             ArrowPreference(
                                 title = stringResource(R.string.about_github),
                                 summary = githubUrl,
-                                onClick = { uriHandler.openUri(githubUrl) },
+                                onClick = { ExternalLink.open(context, githubUrl) },
+                            )
+                        },
+                        CardItem("telegram") {
+                            ArrowPreference(
+                                title = stringResource(R.string.about_telegram),
+                                summary = telegramUrl,
+                                onClick = { ExternalLink.open(context, telegramUrl) },
                             )
                         },
                     ),
