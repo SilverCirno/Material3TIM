@@ -2,14 +2,19 @@ package com.material3tim.xposed
 
 import android.app.Activity
 import android.content.Context
+import android.content.res.Configuration
 import android.graphics.Color
 import android.os.Build
 import android.util.Log
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.widget.FrameLayout
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.unit.IntSize
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.activity.setViewTreeOnBackPressedDispatcherOwner
@@ -20,6 +25,7 @@ import androidx.lifecycle.setViewTreeViewModelStoreOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import com.material3tim.AppEnvironment
 import com.material3tim.ui.M3TimRoot
+import com.material3tim.ui.util.LocalHostWindowSize
 import com.material3tim.ui.viewmodel.MainActivityViewModel
 import java.util.Collections
 import java.util.WeakHashMap
@@ -27,7 +33,7 @@ import java.util.WeakHashMap
 /**
  * 把自写的 Compose UI 挂到 TIM 的 Activity 上（第二步：接管整个界面）。
  *
- * 实现方式：在 `decorView` 最上层放一个全屏 [ComposeView]（compose 接管视觉与交互），
+ * 实现方式：在 `decorView` 最上层放一个全屏 Compose 覆盖层（compose 接管视觉与交互），
  * 而不是把 TIM 的 content 清空 —— TIM 的主框架里大量 `findViewById(...).addView(...)`
  * 之类的强假设，清空 content 很容易让宿主 NPE 崩溃；覆盖层方案对宿主零侵入。
  * TIM 自己的 view 树留在下面继续运转（登录态、消息服务都正常）。
@@ -40,8 +46,37 @@ internal object UiHost {
     private const val HOST_PREFS = "material3tim_host"
     private const val KEY_MATERIAL_UI_ENABLED = "material3tim_enabled"
 
-    private val hosted: MutableMap<Activity, ComposeView> =
-        Collections.synchronizedMap(WeakHashMap<Activity, ComposeView>())
+    private val hosted: MutableMap<Activity, HostComposeOverlay> =
+        Collections.synchronizedMap(WeakHashMap<Activity, HostComposeOverlay>())
+
+    private class HostComposeOverlay(
+        private val activity: Activity,
+        moduleContext: Context,
+    ) : FrameLayout(moduleContext) {
+        val windowSize = mutableStateOf(IntSize.Zero)
+
+        fun refreshConfiguration() {
+            val host = activity.resources
+            if (resources.configuration != host.configuration ||
+                resources.displayMetrics.densityDpi != host.displayMetrics.densityDpi
+            ) {
+                dispatchConfigurationChanged(host.configuration)
+            }
+        }
+
+        override fun dispatchConfigurationChanged(newConfig: Configuration) {
+            // 独立 AssetManager 的 Resources 不随 Activity 更新。先同步，再让 Compose 子 View
+            // 读取新配置；保留模块资源隔离，不重建 Composition / 返回栈。
+            @Suppress("DEPRECATION")
+            resources.updateConfiguration(newConfig, activity.resources.displayMetrics)
+            super.dispatchConfigurationChanged(newConfig)
+        }
+
+        override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+            super.onSizeChanged(w, h, oldw, oldh)
+            windowSize.value = IntSize(w, h)
+        }
+    }
 
     /** 已注册的预测性返回回调（每 Activity 一个）。 */
     private val backCallbacks: MutableMap<Activity, Any> =
@@ -103,6 +138,7 @@ internal object UiHost {
                 // 关键：从后台回到前台时把 Compose 的 lifecycle 恢复成 RESUMED。
                 // 否则 Compose 的 WindowRecomposer 帧时钟一直暂停：点击能被收到但界面
                 // 不重组、列表 fling 没有惯性、预测性返回动画卡在半路。
+                existing.refreshConfiguration()
                 HostOwners.get(activity)?.onResume()
                 if (existing.parent == null) attachToDecor(activity, existing)
                 return
@@ -172,14 +208,19 @@ internal object UiHost {
         ensureViewTreeOwners(activity, owners)
         registerPredictiveBack(activity, owners)
 
+        val overlay = HostComposeOverlay(activity, moduleContext)
         val composeView = ComposeView(moduleContext).apply {
             setContent {
-                HostRoot(activity)
+                CompositionLocalProvider(LocalHostWindowSize provides overlay.windowSize.value) {
+                    HostRoot(activity)
+                }
             }
         }
-        attachToDecor(activity, composeView)
-        hosted[activity] = composeView
-        Log.i(TAG, "hosted compose ui on ${activity.javaClass.name}, moduleRes=${moduleResources != null}")
+        val matchParent = ViewGroup.LayoutParams.MATCH_PARENT
+        overlay.addView(composeView, FrameLayout.LayoutParams(matchParent, matchParent))
+        attachToDecor(activity, overlay)
+        hosted[activity] = overlay
+        Log.i(TAG, "hosted compose ui on ${activity.javaClass.name}")
     }
 
     @Composable
@@ -302,6 +343,7 @@ internal object UiHost {
     fun onActivityResumed(activity: Activity) {
         val view = hosted[activity] ?: return
         configureWindow(activity)
+        view.refreshConfiguration()
         HostOwners.get(activity)?.onResume()
         if (view.parent == null) attachToDecor(activity, view)
     }
@@ -317,7 +359,7 @@ internal object UiHost {
         HostOwners.remove(activity)
     }
 
-    private fun attachToDecor(activity: Activity, view: ComposeView) {
+    private fun attachToDecor(activity: Activity, view: HostComposeOverlay) {
         val decor = activity.window?.decorView as? ViewGroup ?: return
         if (view.parent === decor) return
         if (view.parent is ViewGroup) (view.parent as ViewGroup).removeView(view)
