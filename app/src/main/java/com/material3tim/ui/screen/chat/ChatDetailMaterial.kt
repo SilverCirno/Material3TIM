@@ -747,8 +747,7 @@ internal fun ChatDetailMaterial(
                 enter = expandVertically(expandFrom = Alignment.Bottom) + fadeIn(),
                 exit = shrinkVertically(shrinkTowards = Alignment.Bottom) + fadeOut(),
             ) {
-                ChatEmojiPanelMaterial(
-                    composer = composer,
+                ChatStickerPanel(
                     onSendCustomEmoji = onSendCustomEmoji,
                     onSendStickerPackEmoji = onSendStickerPackEmoji,
                 )

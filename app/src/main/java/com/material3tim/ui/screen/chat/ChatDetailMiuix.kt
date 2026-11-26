@@ -802,8 +802,7 @@ internal fun ChatDetailMiuix(
                     enter = expandVertically(expandFrom = Alignment.Bottom) + fadeIn(),
                     exit = shrinkVertically(shrinkTowards = Alignment.Bottom) + fadeOut(),
                 ) {
-                    ChatEmojiPanelMiuix(
-                        composer = composer,
+                    ChatStickerPanel(
                         onSendCustomEmoji = onSendCustomEmoji,
                         onSendStickerPackEmoji = onSendStickerPackEmoji,
                     )
