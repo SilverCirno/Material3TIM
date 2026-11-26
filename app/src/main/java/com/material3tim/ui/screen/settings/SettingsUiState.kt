@@ -38,6 +38,7 @@ data class SettingsUiState(
 
 @Immutable
 data class SettingsScreenActions(
+    val onSyncTelegram: () -> Unit,
     val onOpenTheme: () -> Unit,
     val onSetUiModeIndex: (Int) -> Unit,
     val onOpenAbout: () -> Unit,

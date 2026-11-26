@@ -114,6 +114,14 @@ fun SettingPagerMaterial(
                     },
                     {
                         SegmentedListItem(
+                            onClick = actions.onSyncTelegram,
+                            headlineContent = { Text(stringResource(R.string.tg_settings)) },
+                            supportingContent = { Text(stringResource(R.string.tg_settings_summary)) },
+                            trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null) },
+                        )
+                    },
+                    {
+                        SegmentedListItem(
                             onClick = actions.onOpenTimSettings,
                             headlineContent = {
                                 Text(stringResource(id = R.string.settings_open_tim_settings))

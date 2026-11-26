@@ -488,8 +488,18 @@ interface VoicePlaybackSource {
     fun resumeVoice(): Boolean = false
 }
 
+/** 宿主原生收藏和文件助手入口。 */
+interface PersonalLibrarySource {
+    fun openFavorites(): Boolean
+    fun openFiles(): Boolean
+    fun collect(message: ChatMessage): Boolean
+}
+
 /** 可插拔的数据源注册表（第 3 步：真实 TIM 数据接入）。 */
 object AppDataSources {
+
+    @Volatile
+    var personalLibrary: PersonalLibrarySource? = null
 
     @Volatile
     var chatSource: ChatSource? = null

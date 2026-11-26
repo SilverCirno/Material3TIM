@@ -1,5 +1,7 @@
 # Material3 TIM
 
+聊天表情面板底部可直接切换 TIM 和 Telegram 表情包。首次登录与构建配置见 [Telegram 表情包同步](docs/telegram-stickers.md)。
+
 用自写的 Jetpack Compose 界面完整替换 **TIM（QQ NT 架构）** 官方 UI 的 Xposed 模块。同一个 APK 同时是**独立 App**（可直接安装预览 UI）和 **LSPosed 模块**（在 TIM 进程内接管界面），分阶段开发中。
 
 > **当前状态（v0.1.0 / versionCode 1，首个公开版本）**

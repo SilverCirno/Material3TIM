@@ -34,6 +34,19 @@
             android:value="@string/xposed_module_description" />
 
         <activity
+            android:name=".telegram.TelegramSyncActivity"
+            android:exported="true"
+            android:label="@string/tg_title" />
+        <provider
+            android:name=".telegram.StickerExportProvider"
+            android:authorities="${applicationId}.stickers"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/sticker_export_paths" />
+        </provider>
+
+        <activity
             android:name=".ui.MainActivity"
             android:exported="true"
             android:theme="@style/Theme.M3Tim.Starting"

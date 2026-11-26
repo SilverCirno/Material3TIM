@@ -140,6 +140,7 @@ internal object UiHost {
         AppEnvironment.init(moduleContext)
         // 第 3 步：把真实 TIM 数据接入 UI（会话列表 → 之后的消息/联系人/发送）。
         TimBridge.install()
+        com.material3tim.data.source.AppDataSources.personalLibrary = TimPersonalLibrary(activity)
         com.material3tim.data.source.AppDataSources.chatSource = TimChatSource()
         com.material3tim.data.source.AppDataSources.messageSource = TimMessageSource()
         com.material3tim.data.source.AppDataSources.contactSource = TimContactSource()

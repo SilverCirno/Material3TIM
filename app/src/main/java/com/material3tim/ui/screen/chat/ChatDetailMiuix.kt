@@ -802,8 +802,7 @@ internal fun ChatDetailMiuix(
                     enter = expandVertically(expandFrom = Alignment.Bottom) + fadeIn(),
                     exit = shrinkVertically(shrinkTowards = Alignment.Bottom) + fadeOut(),
                 ) {
-                    ChatEmojiPanelMiuix(
-                        composer = composer,
+                    ChatStickerPanel(
                         onSendCustomEmoji = onSendCustomEmoji,
                         onSendStickerPackEmoji = onSendStickerPackEmoji,
                     )
@@ -2402,6 +2401,7 @@ private fun handleMessageMenuAction(
         // at对方在 LocalMessageMenuAction provider 中单独处理（需聚焦输入框 + 弹键盘）。
         MessageMenuAction.AT_SENDER -> Unit
         MessageMenuAction.ADD_TO_FAVORITE -> Unit
+        MessageMenuAction.SAVE_TO_COLLECTION -> openMessageCollection(context, message)
     }
 }
 
