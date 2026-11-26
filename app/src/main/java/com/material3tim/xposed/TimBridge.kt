@@ -19636,6 +19636,9 @@ internal object TimBridge {
     // ---------------------------------------------------------------------
 
     private const val NOTIFY_CHANNEL_ID = "m3tim_messages"
+    private const val NOTIFY_REPLY_REVISION = "com.material3tim.notification.REPLY_REVISION"
+    private val notificationUpdateLock = Any()
+    private val notificationReply = TimNotificationReply(::sendNotificationReply)
 
     private data class NotifyChatInfo(val name: String, val at: Long)
 
@@ -19922,6 +19925,102 @@ internal object TimBridge {
         }.onFailure { Log.w(TAG, "notify: enqueue failed: ${it.javaClass.simpleName} ${it.message}") }
     }
 
+    private fun chatNotificationTag(chatId: String): String = "m3tim_$chatId"
+
+    // 不读 myUin 缓存：旧通知在切换 TIM 账号后不能替新账号发送。
+    private fun notificationReplyAccount(): String? {
+        val runtime = appRuntime() ?: return null
+        return sequenceOf("getCurrentAccountUin", "getCurrentUin")
+            .mapNotNull { invokeGetter(runtime, it) as? String }
+            .firstOrNull { (it.toLongOrNull() ?: 0L) > 0L }
+    }
+
+    private fun notificationReplyLabel(resId: Int): String? =
+        runCatching { AppEnvironment.context.getString(resId) }.getOrNull()
+
+    /** 新会话可能早于最近列表刷新，直接用通知来源记录里的联系人。 */
+    private fun prepareNotificationReplyContact(chatId: String, record: Any?): Boolean {
+        record ?: return false
+        val chatType = (invokeGetter(record, "getChatType") as? Number)?.toInt() ?: return false
+        if (chatType != 1 && chatType != 2) return false
+        if (contacts.containsKey(chatId)) return true
+        val peerUid = (invokeGetter(record, "getPeerUid") as? String).orEmpty().ifBlank {
+            if (chatType != 2) return false
+            val groupUin = (invokeGetter(record, "getPeerUin") as? Number)?.toLong() ?: return false
+            if (groupUin <= 0L) return false
+            groupUin.toString()
+        }
+        val cl = hostClassLoader() ?: return false
+        val contact = buildKernelContact(cl, chatType, peerUid) ?: return false
+        contacts.putIfAbsent(chatId, contact)
+        return true
+    }
+
+    /** 接收器在后台工作线程调用。成功后仅撤下提交回复时看到的那条通知。 */
+    private fun sendNotificationReply(
+        context: Context,
+        chatId: String,
+        account: String,
+        token: android.app.PendingIntent,
+        text: String?,
+    ) {
+        if (notificationReplyAccount() != account) return
+        val manager = context.getSystemService(android.app.NotificationManager::class.java) ?: return
+        val tag = chatNotificationTag(chatId)
+        val id = chatId.hashCode()
+        fun activeNotice(): android.app.Notification? = manager.activeNotifications.firstOrNull {
+            it.tag == tag && it.id == id && it.notification.channelId == NOTIFY_CHANNEL_ID &&
+                it.notification.actions?.any { action -> action.actionIntent == token } == true
+        }?.notification
+
+        val revision = activeNotice()?.extras?.getString(NOTIFY_REPLY_REVISION) ?: return
+        val sent = text != null && sendTextMessage(chatId, text)
+        synchronized(notificationUpdateLock) {
+            val active = activeNotice() ?: return@synchronized
+            // 回复期间如果收到了新消息或已经进入会话，不覆盖/复活原通知。
+            if (active.extras.getString(NOTIFY_REPLY_REVISION) != revision) return@synchronized
+            if (sent) {
+                notifyAggByChat.remove(chatId)
+                manager.cancel(tag, id)
+            } else {
+                val error = notificationReplyLabel(
+                    if (text == null) com.material3tim.R.string.chat_notification_reply_invalid
+                    else com.material3tim.R.string.chat_notification_reply_unconfirmed,
+                ) ?: return@synchronized
+                val updated = android.app.Notification.Builder.recoverBuilder(context, active)
+                    .setSubText(error)
+                    .setOnlyAlertOnce(true)
+                    .build()
+                manager.notify(tag, id, updated)
+            }
+        }
+    }
+
+    fun dismissChatNotification(chatId: String) {
+        if (chatId.isBlank()) return
+        runCatching {
+            // 清理与发送走同一队列，避免清理之后又发出进入聊天之前排队的通知。
+            notifyExecutor.execute {
+                runCatching dismiss@{
+                    val manager = notifyContext()?.getSystemService(android.app.NotificationManager::class.java)
+                        ?: return@dismiss
+                    synchronized(notificationUpdateLock) {
+                        notifyAggByChat.remove(chatId)
+                        val tag = chatNotificationTag(chatId)
+                        val id = chatId.hashCode()
+                        manager.cancel(tag, id)
+                        // 兼容旧版本未设 tag 的通知；核对频道和组，不碰 TIM 原生或别的会话。
+                        val hasLegacyNotification = manager.activeNotifications.any {
+                            it.tag == null && it.id == id &&
+                                it.notification.channelId == NOTIFY_CHANNEL_ID && it.notification.group == tag
+                        }
+                        if (hasLegacyNotification) manager.cancel(id)
+                    }
+                }.onFailure { Log.w(TAG, "notify: dismiss failed chat=$chatId", it) }
+            }
+        }.onFailure { Log.w(TAG, "notify: dismiss enqueue failed chat=$chatId", it) }
+    }
+
     private fun maybePostMessageNotification(chatId: String, record: Any?) {
         // 前台且正在看该会话：不提醒。
         if (AppUiState.isForeground && AppUiState.currentChatId == chatId) {
@@ -19964,7 +20063,6 @@ internal object TimBridge {
         } else {
             1
         }
-        notifyAggByChat[chatId] = NotifyAgg(count, nowMs)
         val summaryText = if (count > 1) {
             "$count 条新消息（最近：${preview.sender}: ${preview.summary}）"
         } else {
@@ -19976,21 +20074,43 @@ internal object TimBridge {
             @Suppress("DEPRECATION")
             android.app.Notification.Builder(context)
         }
-        builder.setSmallIcon(android.R.drawable.stat_notify_chat)
-            .setContentTitle(info.name.take(40))
+        // 取 TIM 自己的应用图标，使用宿主包名解析，不能从模块隔离的资源表里取同号资源。
+        val host = context.applicationContext ?: context
+        val timIcon = host.applicationInfo.icon.takeIf { host.packageName == MainModule.TARGET_PACKAGE && it != 0 }
+            ?.let { android.graphics.drawable.Icon.createWithResource(host.packageName, it) }
+        if (timIcon != null) {
+            // 状态栏由系统单色渲染；通知中心也显示彩色 TIM 图标，便于辨认。
+            builder.setSmallIcon(timIcon).setLargeIcon(timIcon)
+        } else {
+            builder.setSmallIcon(android.R.drawable.stat_notify_chat)
+        }
+        builder.setContentTitle(info.name.take(40))
             .setContentText(summaryText)
             .setNumber(count)
             .setWhen(nowMs)
             .setShowWhen(true)
             .setAutoCancel(true)
             .setOnlyAlertOnce(false)
-            .setGroup("m3tim_$chatId")
+            .setGroup(chatNotificationTag(chatId))
         // 每个会话一条独立通知，不用 group summary 标记（否则系统会当成摘要吞掉）。
         .setGroupSummary(false)
         notificationPendingIntent(context, chatId)?.let { builder.setContentIntent(it) }
+        val account = notificationReplyAccount()
+        val replyLabel = notificationReplyLabel(com.material3tim.R.string.chat_notification_reply)
+        if (account != null && replyLabel != null && prepareNotificationReplyContact(chatId, record)) {
+            notificationReply.createAction(context, chatId, account, replyLabel)?.let { action ->
+                builder.addAction(action)
+                builder.addExtras(android.os.Bundle().apply {
+                    putString(NOTIFY_REPLY_REVISION, java.util.UUID.randomUUID().toString())
+                })
+            }
+        }
         val notification = builder.build()
         runCatching {
-            manager.notify(chatId.hashCode(), notification)
+            synchronized(notificationUpdateLock) {
+                manager.notify(chatNotificationTag(chatId), chatId.hashCode(), notification)
+                notifyAggByChat[chatId] = NotifyAgg(count, nowMs)
+            }
             Log.i(
                 TAG,
                 "notify: post chat=$chatId title=${info.name.take(30)} body=$summaryText " +
@@ -21128,6 +21248,8 @@ internal class TimChatSettingSource : ChatSettingSource {
 
     override fun setChatUnread(chatId: String, unread: Boolean): Boolean =
         TimBridge.setChatUnread(chatId, unread)
+
+    override fun dismissChatNotification(chatId: String) = TimBridge.dismissChatNotification(chatId)
 
     override fun deleteChat(chatId: String): Boolean = TimBridge.deleteChat(chatId)
 

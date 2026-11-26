@@ -9,6 +9,9 @@
     <string name="chat_search_pinned">置顶会话</string>
     <string name="chat_member_count">%d 位成员</string>
     <string name="chat_online">在线</string>
+    <string name="chat_notification_reply">回复</string>
+    <string name="chat_notification_reply_invalid">请输入 1–4000 个字符</string>
+    <string name="chat_notification_reply_unconfirmed">未确认发送，请进入聊天查看</string>
 
     <!-- 下拉刷新文案（Miuix PullToRefresh 需要四条） -->
     <string name="chat_refresh_pulling">下拉刷新</string>
