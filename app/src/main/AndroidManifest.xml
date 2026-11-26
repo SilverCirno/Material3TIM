@@ -4,6 +4,12 @@
 
     <!-- 后续步骤（Xposed 宿主注入 / 模块管理页面）可能用到；当前 UI 原型不需要联网 -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 扫一扫：应用内 CameraX 预览（扫码框），不再拉起系统相机 -->
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <uses-feature
+        android:name="android.hardware.camera.any"
+        android:required="false" />
 
     <uses-sdk tools:overrideLibrary="top.yukonga.miuix.kmp.blur" />
 

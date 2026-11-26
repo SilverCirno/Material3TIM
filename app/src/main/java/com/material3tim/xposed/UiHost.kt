@@ -38,6 +38,7 @@ internal object UiHost {
 
     private const val TAG = "Material3Tim"
     private const val HOST_PREFS = "material3tim_host"
+    private const val KEY_MATERIAL_UI_ENABLED = "material3tim_enabled"
 
     private val hosted: MutableMap<Activity, ComposeView> =
         Collections.synchronizedMap(WeakHashMap<Activity, ComposeView>())
@@ -54,9 +55,47 @@ internal object UiHost {
     private val immersiveReapplyAt: MutableMap<Activity, Long> =
         Collections.synchronizedMap(WeakHashMap<Activity, Long>())
 
+    /** 是否启用 Material3TIM 界面（关闭后显示 TIM 原生界面）。 */
+    fun isMaterialUiEnabled(context: Context): Boolean =
+        context.getSharedPreferences(HOST_PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_MATERIAL_UI_ENABLED, true)
+
+    /** 设置是否启用 Material3TIM 界面；新值在 TIM 进程重启后生效。 */
+    fun setMaterialUiEnabled(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(HOST_PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_MATERIAL_UI_ENABLED, enabled)
+            .apply()
+        Log.i(TAG, "material3tim_enabled=$enabled")
+    }
+
+    /**
+     * 重启 TIM 进程，让“启用/停用 Material3TIM 界面”生效。
+     * 仅在宿主 TIM 进程里执行；独立 App 只提示，不自杀。
+     */
+    fun restartTim(context: Context) {
+        if (context.packageName != "com.tencent.tim") return
+        val activity = findActivity(context)
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            runCatching { activity?.finishAffinity() }
+            android.os.Process.killProcess(android.os.Process.myPid())
+        }, 350L)
+    }
+
+    private fun findActivity(context: Context?): Activity? {
+        var current = context
+        var guard = 0
+        while (current != null && guard++ < 8) {
+            if (current is Activity) return current
+            current = (current as? android.content.ContextWrapper)?.baseContext
+        }
+        return null
+    }
+
     /** 供 hook 调用：保证目标 Activity 上已经挂上我们的 UI。 */
     fun ensureHosted(module: MainModule, activity: Activity) {
         if (activity.isFinishing) return
+        if (!isMaterialUiEnabled(activity)) return
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1 && activity.isDestroyed) return
         try {
             val existing = hosted[activity]
@@ -77,18 +116,19 @@ internal object UiHost {
     private fun install(module: MainModule, activity: Activity) {
         val moduleResources = ModuleResources.createModuleResources(module, activity)
         if (moduleResources == null) {
-            // 兜底：把模块资源注入宿主 Activity 的 Resources。
-            val injected = ModuleResources.injectIntoHostResources(module, activity, activity.resources)
-            if (!injected) {
-                // 覆盖安装后当前进程注入的是已删除的旧 APK：自动重启 TIM 一次；
-                // 若短时间内已重启过（避免循环），就不要用宿主资源表挂载 UI（否则文案全变 false），
-                // 保留 TIM 原生界面，等用户下次冷启动即可恢复。
-                if (ModuleResources.tryRecoverByRestart(activity)) return
-                Log.e(TAG, "module resources unavailable, skip hosting ui to avoid wrong strings")
-                return
-            }
+            // 注意：**不要**退化成把模块 APK 注入宿主 Activity 的 Resources。
+            // QAuxiliary 也用 `Resources.addLoaders` 注入自己的 APK，两个 0x7f
+            // 资源表挂在同一个 Resources 上会互相遮蔽（QAuxv 文案串号/自检失败）。
+            // 覆盖安装后当前进程注入的是已删除的旧 APK 时，重启 TIM 一次即可
+            // 拿到新路径；仍然失败就保留 TIM 原生界面，等下次冷启动恢复。
+            if (ModuleResources.tryRecoverByRestart(activity)) return
+            Log.e(
+                TAG,
+                "module resources unavailable, skip hosting ui (no host resource injection)",
+            )
+            return
         }
-        val resources = moduleResources ?: activity.resources
+        val resources = moduleResources
         val remotePrefs = runCatching { module.getRemotePreferences("settings") }.getOrNull()
         val settingsPrefs = HostSettingsPrefs(
             remote = remotePrefs,
