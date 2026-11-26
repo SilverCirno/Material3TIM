@@ -24,19 +24,14 @@ import java.io.File
 
 import com.material3tim.ui.component.AnimatedOrStaticImage
 import com.material3tim.ui.component.rememberLocalImage
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.foundation.Image
 import android.view.inputmethod.InputMethodManager
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
@@ -458,8 +453,6 @@ internal fun ChatDetailMaterial(
     // 结构性优化：内容保持完整高度测量，键盘弹出时不再逐帧缩减测量高度，也不再逐帧 scrollBy/scrollToItem。
     // 键盘高度只在下方 Modifier.offset{}（placement 阶段）读取，整块内容（消息列表/输入栏/面板）随之上移，
     // 底部由平移跟随键盘；低端机键盘动画不再触发 LazyColumn 每帧重排。
-    val focusManager = LocalFocusManager.current
-    val keyboardController = LocalSoftwareKeyboardController.current
     val comingSoon = remember(context) {
         {
             Toast.makeText(context, R.string.feature_coming_soon, Toast.LENGTH_SHORT).show()
@@ -483,36 +476,10 @@ internal fun ChatDetailMaterial(
 
 
     val chatInputFocusRequester = remember { FocusRequester() }
-    // 打开面板前记录键盘是否展开：关闭面板时若之前是展开状态则恢复键盘，否则保持收起不动 IME。
-    var imeWasVisibleBeforePanel by remember { mutableStateOf(false) }
-    // 展开任一面板时收起键盘，保证面板是“键盘位”的替代品。
-    val onTogglePanel: (ChatPanel) -> Unit = { target ->
-        val imeWasVisible = imeController.isImeVisibleNow()
-        composer.dismissAtPicker()
-        composer.togglePanel(target)
-        if (composer.isPanelOpen) {
-            imeWasVisibleBeforePanel = imeWasVisible
-            focusManager.clearFocus()
-            keyboardController?.hide()
-            // keyboardController.hide() 在宿主窗口里可能不生效，显式走 IMM 收起键盘。
-            imeController.hideIme("panel")
-        } else if (imeWasVisibleBeforePanel) {
-            // 关闭面板且打开前键盘是展开的：重新聚焦输入框并弹回键盘。
-            imeWasVisibleBeforePanel = false
-            runCatching { chatInputFocusRequester.requestFocus() }
-            imeController.requestShow("panel-closed")
-        }
-    }
-    val onPanelAction: (ChatPanel) -> Unit = { target ->
-        imeWasVisibleBeforePanel = imeController.isImeVisibleNow()
-        composer.dismissAtPicker()
-        composer.showPanel(target)
-        focusManager.clearFocus()
-        keyboardController?.hide()
-        imeController.hideIme("panel")
-    }
+    val handoff = rememberChatPanelHandoff(composer, keyboardHeightState, navigationBarBottom)
+    val onTogglePanel = rememberChatPanelToggle(composer, imeController, keyboardHeightState, chatInputFocusRequester, handoff)
     val onInputFocused: () -> Unit = {
-        imeWasVisibleBeforePanel = false
+        if (composer.isPanelOpen) handoff.returnToKeyboard()
         composer.closePanels()
         composer.dismissAtPicker()
     }
@@ -656,7 +623,7 @@ internal fun ChatDetailMaterial(
                 // 键盘收起时保留导航栏 padding；键盘弹出由 offset 整体上移（placement 阶段读取，不重组/不重测）。
                 .padding(bottom = navigationBarBottom)
                 .offset {
-                    val shift = keyboardHeightState.value - navigationBarBottom
+                    val shift = handoff.remainingImeInset.value - navigationBarBottom
                     if (shift > 0.dp) IntOffset(0, -shift.roundToPx()) else IntOffset.Zero
                 },
         ) {
@@ -741,36 +708,32 @@ internal fun ChatDetailMaterial(
                 inputFocusRequester = chatInputFocusRequester,
                 onStartVoiceRecord = onStartVoiceRecord,
             )
-            // 表情面板：与参考图一致，位于输入栏下方（占据键盘位）。
-            AnimatedVisibility(
-                visible = composer.panel == ChatPanel.Emoji,
-                enter = expandVertically(expandFrom = Alignment.Bottom) + fadeIn(),
-                exit = shrinkVertically(shrinkTowards = Alignment.Bottom) + fadeOut(),
-            ) {
-                ChatStickerPanel(
-                    onSendCustomEmoji = onSendCustomEmoji,
-                    onSendStickerPackEmoji = onSendStickerPackEmoji,
-                )
-            }
-            // 附件面板：输入栏下方的就地展开面板，把消息列表向上顶。
-            AnimatedVisibility(
-                visible = composer.panel == ChatPanel.Attach,
-                enter = expandVertically(expandFrom = Alignment.Bottom) + fadeIn(),
-                exit = shrinkVertically(shrinkTowards = Alignment.Bottom) + fadeOut(),
-            ) {
-                ChatAttachPanelMaterial(
-                    hintVisible = composer.attachHintVisible,
-                    onDismissHint = composer::dismissAttachHint,
-                    onAction = { action ->
-                        composer.closePanels()
-                        onAttachAction(action)
-                    },
-                    onCameraAction = { isVideo ->
-                        composer.closePanels()
-                        onCameraAction(isVideo)
-                    },
-                )
-            }
+            ChatInlinePanelHost(
+                listState = listState,
+                panel = composer.panel,
+                handoff = handoff,
+                keyboardHeight = keyboardHeightState,
+                emoji = {
+                    ChatStickerPanel(
+                        onSendCustomEmoji = onSendCustomEmoji,
+                        onSendStickerPackEmoji = onSendStickerPackEmoji,
+                    )
+                },
+                attach = {
+                    ChatAttachPanelMaterial(
+                        hintVisible = composer.attachHintVisible,
+                        onDismissHint = composer::dismissAttachHint,
+                        onAction = { action ->
+                            composer.closePanels()
+                            onAttachAction(action)
+                        },
+                        onCameraAction = { isVideo ->
+                            composer.closePanels()
+                            onCameraAction(isVideo)
+                        },
+                    )
+                },
+            )
             }
         }
         // 右下角浮动按钮层：底部距离 = 输入栏高度 + margin（与右侧 margin 相同）。
@@ -778,7 +741,7 @@ internal fun ChatDetailMaterial(
             bottomButtonVisible = canScrollForward && backToBottomGestureVisible,
             atMeVisible = hasUnreadAtMe,
             bottomOffsetPx = composerBarHeightPx,
-            keyboardBottomInset = keyboardHeightState,
+            keyboardBottomInset = handoff.remainingImeInset,
             onAtMe = {
                 // 从最新一条未读 @我 开始，逐条向更早遍历。
                 val target = unreadAtMeIndices.getOrNull(
@@ -1814,7 +1777,7 @@ private fun SystemMessageMaterial(text: String) {
     }
 }
 
-/** 输入栏：+ / 关闭附件面板、圆角输入框、表情、空态麦克风 / 非空发送按钮。 */
+/** 输入栏：圆角输入框（左表情、右语音 / 发送）+ 最右侧附件加号。 */
 @Composable
 private fun ChatInputBarMaterial(
     composer: ChatComposerState,
@@ -1825,7 +1788,7 @@ private fun ChatInputBarMaterial(
     isGroup: Boolean = false,
     imeController: ChatImeController,
     inputFocusRequester: FocusRequester? = null,
-    onStartVoiceRecord: () -> Unit = {},
+    @Suppress("UNUSED_PARAMETER") onStartVoiceRecord: () -> Unit = {},
 ) {
     val colorScheme = MaterialTheme.colorScheme
     val context = LocalContext.current
@@ -1834,6 +1797,11 @@ private fun ChatInputBarMaterial(
     // @/面板打开时收键盘 + 清焦点（标准做法），其余 IME 逻辑交给 ChatImeController。
     val attachOpen = composer.panel == ChatPanel.Attach
     val emojiOpen = composer.panel == ChatPanel.Emoji
+    // 按住麦克风：系统语音识别实时写入输入框；松开后取最终结果。
+    val voiceInput = rememberChatVoiceInput(
+        onText = { newText -> composer.onAtTextChanged(composer.text, newText, isGroup) },
+        onMessage = { res -> Toast.makeText(context, res, Toast.LENGTH_SHORT).show() },
+    )
     // 固定行高：按布局行数决定输入框高度（1/2/3/4 行各自固定），不随中英文字形高度变化。
     var lineCount by remember { mutableStateOf(1) }
     val submit: () -> Unit = {
@@ -1850,43 +1818,34 @@ private fun ChatInputBarMaterial(
             .fillMaxWidth()
             .padding(horizontal = 12.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        IconButton(
-            onClick = onAttachClick,
-            modifier = Modifier.size(40.dp),
-        ) {
-            Icon(
-                imageVector = if (attachOpen) Icons.Filled.Close else Icons.Filled.Add,
-                contentDescription = stringResource(
-                    if (attachOpen) R.string.chat_input_close else R.string.chat_more_actions,
-                ),
-                tint = colorScheme.onSurfaceVariant,
-                modifier = Modifier.size(26.dp),
-            )
-        }
         Surface(
             // 固定最小高度：空态占位符与有文本时输入框高度一致（多行时正常增高）。
             modifier = Modifier
                 .weight(1f)
-                .height(44.dp + ((lineCount.coerceIn(1, 4) - 1) * 24).dp)
-                // 点击输入框区域（即使已聚焦但键盘被系统收起）重新请求键盘：不消费事件，不影响光标/长按。
-                .pointerInput(Unit) {
-                    awaitEachGesture {
-                        awaitFirstDown(requireUnconsumed = false)
-                        if (!imeController.isImeVisibleNow()) {
-                            imeController.requestShow("click")
-                        }
-                    }
-                },
-            shape = RoundedCornerShape(22.dp),
-            color = colorScheme.surfaceContainerHighest,
+                .height(48.dp + ((lineCount.coerceIn(1, 4) - 1) * 24).dp),
+            shape = RoundedCornerShape(24.dp),
+            color = colorScheme.surfaceContainerHigh,
             contentColor = colorScheme.onSurface,
         ) {
             Row(
-                modifier = Modifier.padding(start = 14.dp, end = 2.dp),
+                modifier = Modifier.padding(horizontal = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
+                IconButton(
+                    onClick = onEmojiClick,
+                    modifier = Modifier.size(40.dp),
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.EmojiEmotions,
+                        contentDescription = stringResource(
+                            if (emojiOpen) R.string.chat_input_close else R.string.chat_emoji,
+                        ),
+                        tint = if (emojiOpen) colorScheme.primary else colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(24.dp),
+                    )
+                }
                 BasicTextField(
                     value = composer.text,
                     onValueChange = { newValue ->
@@ -1907,7 +1866,8 @@ private fun ChatInputBarMaterial(
                     },
                     modifier = Modifier
                         .weight(1f)
-                        .padding(vertical = 10.dp)
+                        .chatTextFieldIme(composer, imeController)
+                        .padding(vertical = 12.dp)
                         .then(
                             if (inputFocusRequester != null) {
                                 Modifier.focusRequester(inputFocusRequester)
@@ -1932,54 +1892,61 @@ private fun ChatInputBarMaterial(
                     decorationBox = { innerTextField ->
                         if (composer.text.isEmpty()) {
                             Text(
-                                text = stringResource(R.string.chat_input_hint),
+                                text = stringResource(
+                                    if (voiceInput.isListening) {
+                                        R.string.chat_voice_listening
+                                    } else {
+                                        R.string.chat_input_hint
+                                    },
+                                ),
                                 style = MaterialTheme.typography.bodyLarge,
-                                color = colorScheme.onSurfaceVariant,
+                                color = if (voiceInput.isListening) {
+                                    colorScheme.primary
+                                } else {
+                                    colorScheme.onSurfaceVariant
+                                },
                                 maxLines = 1,
                             )
                         }
                         innerTextField()
                     },
                 )
-                IconButton(
-                    onClick = onEmojiClick,
-                    modifier = Modifier.size(36.dp),
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.EmojiEmotions,
-                        contentDescription = stringResource(
-                            if (emojiOpen) R.string.chat_input_close else R.string.chat_emoji,
-                        ),
-                        tint = if (emojiOpen) colorScheme.primary else colorScheme.onSurfaceVariant,
-                        modifier = Modifier.size(22.dp),
+                // 听写中保留麦克风，避免部分识别结果触发发送按钮替换并中断按住手势。
+                if (composer.text.isEmpty() || voiceInput.isListening) {
+                    VoiceInputButton(
+                        controller = voiceInput,
+                        currentText = { composer.text },
+                        icon = Icons.Filled.Mic,
+                        tint = colorScheme.onSurfaceVariant,
+                        activeTint = colorScheme.primary,
+                        modifier = Modifier.size(40.dp),
                     )
+                } else {
+                    FilledIconButton(
+                        onClick = submit,
+                        modifier = Modifier.size(40.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.Send,
+                            contentDescription = stringResource(R.string.chat_send),
+                            modifier = Modifier.size(20.dp),
+                        )
+                    }
                 }
             }
         }
-        // 右侧操作位固定占位（空态麦克风 / 有文本发送），保证输入框宽度和输入栏高度不随文本变化。
-        if (composer.text.isEmpty()) {
-            IconButton(
-                onClick = onStartVoiceRecord,
-                modifier = Modifier.size(44.dp),
-            ) {
-                Icon(
-                    imageVector = Icons.Filled.Mic,
-                    contentDescription = stringResource(R.string.chat_voice),
-                    tint = colorScheme.onSurfaceVariant,
-                    modifier = Modifier.size(22.dp),
-                )
-            }
-        } else {
-            FilledIconButton(
-                onClick = submit,
-                modifier = Modifier.size(44.dp),
-            ) {
-                Icon(
-                    imageVector = Icons.AutoMirrored.Filled.Send,
-                    contentDescription = stringResource(R.string.chat_send),
-                    modifier = Modifier.size(20.dp),
-                )
-            }
+        IconButton(
+            onClick = onAttachClick,
+            modifier = Modifier.size(44.dp),
+        ) {
+            Icon(
+                imageVector = if (attachOpen) Icons.Filled.Close else Icons.Filled.Add,
+                contentDescription = stringResource(
+                    if (attachOpen) R.string.chat_input_close else R.string.chat_attach,
+                ),
+                tint = if (attachOpen) colorScheme.primary else colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(24.dp),
+            )
         }
     }
 }

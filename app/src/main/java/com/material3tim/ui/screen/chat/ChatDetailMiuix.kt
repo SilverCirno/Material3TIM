@@ -25,14 +25,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.foundation.Image
 import android.view.inputmethod.InputMethodManager
 import android.widget.Toast
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.expandVertically
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
@@ -80,6 +73,7 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
@@ -113,7 +107,6 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.nestedscroll.nestedScroll
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
@@ -477,8 +470,6 @@ internal fun ChatDetailMiuix(
     // 结构性优化：内容保持完整高度测量，键盘弹出时不再逐帧缩减测量高度，也不再逐帧 scrollBy/scrollToItem。
     // 键盘高度只在下方 Modifier.offset{}（placement 阶段）读取，整块内容（消息列表/输入栏/面板）随之上移，
     // 底部由平移跟随键盘；低端机键盘动画不再触发 LazyColumn 每帧重排。
-    val focusManager = LocalFocusManager.current
-    val keyboardController = LocalSoftwareKeyboardController.current
     val comingSoon = remember(context) {
         {
             Toast.makeText(context, R.string.feature_coming_soon, Toast.LENGTH_SHORT).show()
@@ -501,35 +492,10 @@ internal fun ChatDetailMiuix(
     }
 
     val chatInputFocusRequester = remember { FocusRequester() }
-    // 打开面板前记录键盘是否展开：关闭面板时若之前是展开状态则恢复键盘，否则保持收起不动 IME。
-    var imeWasVisibleBeforePanel by remember { mutableStateOf(false) }
-    val onTogglePanel: (ChatPanel) -> Unit = { target ->
-        val imeWasVisible = imeController.isImeVisibleNow()
-        composer.dismissAtPicker()
-        composer.togglePanel(target)
-        if (composer.isPanelOpen) {
-            imeWasVisibleBeforePanel = imeWasVisible
-            focusManager.clearFocus()
-            keyboardController?.hide()
-            // keyboardController.hide() 在宿主窗口里可能不生效，显式走 IMM 收起键盘。
-            imeController.hideIme("panel")
-        } else if (imeWasVisibleBeforePanel) {
-            // 关闭面板且打开前键盘是展开的：重新聚焦输入框并弹回键盘。
-            imeWasVisibleBeforePanel = false
-            runCatching { chatInputFocusRequester.requestFocus() }
-            imeController.requestShow("panel-closed")
-        }
-    }
-    val onPanelAction: (ChatPanel) -> Unit = { target ->
-        imeWasVisibleBeforePanel = imeController.isImeVisibleNow()
-        composer.dismissAtPicker()
-        composer.showPanel(target)
-        focusManager.clearFocus()
-        keyboardController?.hide()
-        imeController.hideIme("panel")
-    }
+    val handoff = rememberChatPanelHandoff(composer, keyboardHeightState, navigationBarBottom)
+    val onTogglePanel = rememberChatPanelToggle(composer, imeController, keyboardHeightState, chatInputFocusRequester, handoff)
     val onInputFocused: () -> Unit = {
-        imeWasVisibleBeforePanel = false
+        if (composer.isPanelOpen) handoff.returnToKeyboard()
         composer.closePanels()
         composer.dismissAtPicker()
     }
@@ -696,7 +662,7 @@ internal fun ChatDetailMiuix(
                     // 键盘收起时保留导航栏 padding；键盘弹出由 offset 整体上移（placement 阶段读取，不重组/不重测）。
                     .padding(bottom = navigationBarBottom)
                     .offset {
-                        val shift = keyboardHeightState.value - navigationBarBottom
+                        val shift = handoff.remainingImeInset.value - navigationBarBottom
                         if (shift > 0.dp) IntOffset(0, -shift.roundToPx()) else IntOffset.Zero
                     },
             ) {
@@ -796,43 +762,39 @@ internal fun ChatDetailMiuix(
                     inputFocusRequester = chatInputFocusRequester,
                     onStartVoiceRecord = onStartVoiceRecord,
                 )
-                // 表情面板：输入栏下方的“键盘位”面板。
-                AnimatedVisibility(
-                    visible = composer.panel == ChatPanel.Emoji,
-                    enter = expandVertically(expandFrom = Alignment.Bottom) + fadeIn(),
-                    exit = shrinkVertically(shrinkTowards = Alignment.Bottom) + fadeOut(),
-                ) {
-                    ChatStickerPanel(
-                        onSendCustomEmoji = onSendCustomEmoji,
-                        onSendStickerPackEmoji = onSendStickerPackEmoji,
-                    )
-                }
-                // 附件面板：输入栏下方就地展开（不加额外背景容器，直接铺在页面背景上）。
-                AnimatedVisibility(
-                    visible = composer.panel == ChatPanel.Attach,
-                    enter = expandVertically(expandFrom = Alignment.Bottom) + fadeIn(),
-                    exit = shrinkVertically(shrinkTowards = Alignment.Bottom) + fadeOut(),
-                ) {
-                    ChatAttachPanelMiuix(
-                        hintVisible = composer.attachHintVisible,
-                        onDismissHint = composer::dismissAttachHint,
-                        onAction = { action ->
-                            composer.closePanels()
-                            onAttachAction(action)
-                        },
-                        onCameraAction = { isVideo ->
-                            composer.closePanels()
-                            onCameraAction(isVideo)
-                        },
-                    )
-                }
+                ChatInlinePanelHost(
+                    listState = listState,
+                    panel = composer.panel,
+                    handoff = handoff,
+                    keyboardHeight = keyboardHeightState,
+                    emoji = {
+                        ChatStickerPanel(
+                            onSendCustomEmoji = onSendCustomEmoji,
+                            onSendStickerPackEmoji = onSendStickerPackEmoji,
+                        )
+                    },
+                    attach = {
+                        ChatAttachPanelMiuix(
+                            hintVisible = composer.attachHintVisible,
+                            onDismissHint = composer::dismissAttachHint,
+                            onAction = { action ->
+                                composer.closePanels()
+                                onAttachAction(action)
+                            },
+                            onCameraAction = { isVideo ->
+                                composer.closePanels()
+                                onCameraAction(isVideo)
+                            },
+                        )
+                    },
+                )
                 }
             }
         ChatFloatingActionsMiuix(
             bottomButtonVisible = canScrollForward && backToBottomGestureVisible,
             atMeVisible = hasUnreadAtMe,
             bottomOffsetPx = composerBarHeightPx,
-            keyboardBottomInset = keyboardHeightState,
+            keyboardBottomInset = handoff.remainingImeInset,
             onAtMe = {
                 // 从最新一条未读 @我 开始，逐条向更早遍历。
                 val target = unreadAtMeIndices.getOrNull(
@@ -1834,7 +1796,7 @@ private fun SystemMessageMiuix(text: String) {
     }
 }
 
-/** 输入栏：+ / 关闭附件面板、圆角输入框、表情、空态麦克风 / 非空发送按钮。 */
+/** 输入栏：圆角输入框（左表情、右语音 / 发送）+ 最右侧附件加号。 */
 @Composable
 private fun ChatInputBarMiuix(
     composer: ChatComposerState,
@@ -1845,13 +1807,18 @@ private fun ChatInputBarMiuix(
     isGroup: Boolean = false,
     imeController: ChatImeController,
     inputFocusRequester: FocusRequester? = null,
-    onStartVoiceRecord: () -> Unit = {},
+    @Suppress("UNUSED_PARAMETER") onStartVoiceRecord: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val focusManager = LocalFocusManager.current
     val keyboardController = LocalSoftwareKeyboardController.current
     val attachOpen = composer.panel == ChatPanel.Attach
     val emojiOpen = composer.panel == ChatPanel.Emoji
+    // 按住麦克风：系统语音识别实时写入输入框；松开后取最终结果。
+    val voiceInput = rememberChatVoiceInput(
+        onText = { newText -> composer.onAtTextChanged(composer.text, newText, isGroup) },
+        onMessage = { res -> Toast.makeText(context, res, Toast.LENGTH_SHORT).show() },
+    )
     // 固定行高：按布局行数决定输入框高度（1/2/3/4 行各自固定），不随中英文字形高度变化。
     var lineCount by remember { mutableStateOf(1) }
     val submit: () -> Unit = {
@@ -1868,39 +1835,30 @@ private fun ChatInputBarMiuix(
             .fillMaxWidth()
             .padding(horizontal = 10.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        IconButton(
-            onClick = onAttachClick,
-            modifier = Modifier.size(40.dp),
-        ) {
-            Icon(
-                imageVector = if (attachOpen) MiuixIcons.Close else MiuixIcons.AddCircle,
-                contentDescription = stringResource(
-                    if (attachOpen) R.string.chat_input_close else R.string.chat_more_actions,
-                ),
-                tint = colorScheme.onSurfaceVariantSummary,
-                modifier = Modifier.size(26.dp),
-            )
-        }
         Row(
             modifier = Modifier
                 .weight(1f)
-                .height(42.dp + ((lineCount.coerceIn(1, 4) - 1) * 20).dp)
-                // 点击输入框区域（即使已聚焦但键盘被系统收起）重新请求键盘：不消费事件。
-                .pointerInput(Unit) {
-                    awaitEachGesture {
-                        awaitFirstDown(requireUnconsumed = false)
-                        if (!imeController.isImeVisibleNow()) {
-                            imeController.requestShow("click")
-                        }
-                    }
-                }
-                .clip(RoundedCornerShape(22.dp))
+                .height(46.dp + ((lineCount.coerceIn(1, 4) - 1) * 20).dp)
+                .clip(RoundedCornerShape(24.dp))
                 .background(colorScheme.surfaceContainerHigh)
-                .padding(start = 14.dp, end = 2.dp),
+                .padding(horizontal = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            IconButton(
+                onClick = onEmojiClick,
+                modifier = Modifier.size(40.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.EmojiEmotions,
+                    contentDescription = stringResource(
+                        if (emojiOpen) R.string.chat_input_close else R.string.chat_emoji,
+                    ),
+                    tint = if (emojiOpen) colorScheme.primary else colorScheme.onSurfaceVariantSummary,
+                    modifier = Modifier.size(24.dp),
+                )
+            }
             BasicTextField(
                 value = composer.text,
                 onValueChange = { newValue ->
@@ -1918,7 +1876,8 @@ private fun ChatInputBarMiuix(
                 },
                 modifier = Modifier
                     .weight(1f)
-                    .padding(vertical = 10.dp)
+                    .chatTextFieldIme(composer, imeController)
+                    .padding(vertical = 12.dp)
                     .then(
                         if (inputFocusRequester != null) {
                             Modifier.focusRequester(inputFocusRequester)
@@ -1944,62 +1903,66 @@ private fun ChatInputBarMiuix(
                 decorationBox = { innerTextField ->
                     if (composer.text.isEmpty()) {
                         Text(
-                            text = stringResource(R.string.chat_input_hint),
+                            text = stringResource(
+                                if (voiceInput.isListening) {
+                                    R.string.chat_voice_listening
+                                } else {
+                                    R.string.chat_input_hint
+                                },
+                            ),
                             fontSize = 15.sp,
                             lineHeight = 20.sp,
-                            color = colorScheme.onSurfaceVariantSummary,
+                            color = if (voiceInput.isListening) {
+                                colorScheme.primary
+                            } else {
+                                colorScheme.onSurfaceVariantSummary
+                            },
                             maxLines = 1,
                         )
                     }
                     innerTextField()
                 },
             )
-            IconButton(
-                onClick = onEmojiClick,
-                modifier = Modifier.size(36.dp),
-            ) {
-                Icon(
-                    imageVector = Icons.Filled.EmojiEmotions,
-                    contentDescription = stringResource(
-                        if (emojiOpen) R.string.chat_input_close else R.string.chat_emoji,
-                    ),
-                    tint = if (emojiOpen) colorScheme.primary else colorScheme.onSurfaceVariantSummary,
-                    modifier = Modifier.size(22.dp),
+            // 听写中保留麦克风，避免部分识别结果触发发送按钮替换并中断按住手势。
+            if (composer.text.isEmpty() || voiceInput.isListening) {
+                VoiceInputButton(
+                    controller = voiceInput,
+                    currentText = { composer.text },
+                    icon = MiuixIcons.Mic,
+                    tint = colorScheme.onSurfaceVariantSummary,
+                    activeTint = colorScheme.primary,
+                    modifier = Modifier.size(40.dp),
                 )
+            } else {
+                Box(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clip(CircleShape)
+                        .background(colorScheme.primary)
+                        .clickable(onClick = submit),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        imageVector = MiuixIcons.Send,
+                        contentDescription = stringResource(R.string.chat_send),
+                        tint = colorScheme.onPrimary,
+                        modifier = Modifier.size(20.dp),
+                    )
+                }
             }
         }
-        // 右侧操作位固定占位（空态麦克风 / 有文本发送），保证输入框宽度和输入栏高度不随文本变化。
-        if (composer.text.isEmpty()) {
-            Box(
-                modifier = Modifier
-                    .size(40.dp)
-                    .clip(CircleShape)
-                    .clickable(onClick = onStartVoiceRecord),
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(
-                    imageVector = MiuixIcons.Mic,
-                    contentDescription = stringResource(R.string.chat_voice),
-                    tint = colorScheme.onSurfaceVariantSummary,
-                    modifier = Modifier.size(22.dp),
-                )
-            }
-        } else {
-            Box(
-                modifier = Modifier
-                    .size(40.dp)
-                    .clip(CircleShape)
-                    .background(colorScheme.primary)
-                    .clickable(onClick = submit),
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(
-                    imageVector = MiuixIcons.Send,
-                    contentDescription = stringResource(R.string.chat_send),
-                    tint = colorScheme.onPrimary,
-                    modifier = Modifier.size(20.dp),
-                )
-            }
+        IconButton(
+            onClick = onAttachClick,
+            modifier = Modifier.size(40.dp),
+        ) {
+            Icon(
+                imageVector = if (attachOpen) Icons.Filled.Close else Icons.Filled.Add,
+                contentDescription = stringResource(
+                    if (attachOpen) R.string.chat_input_close else R.string.chat_attach,
+                ),
+                tint = if (attachOpen) colorScheme.primary else colorScheme.onSurfaceVariantSummary,
+                modifier = Modifier.size(24.dp),
+            )
         }
     }
 }
