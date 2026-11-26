@@ -298,13 +298,9 @@ fun M3TimRoot(
                         entry<Route.Forward>(swipeDismiss = swipeDismiss) { key ->
                             ForwardScreen(key.srcChatId, key.msgIds, key.preview)
                         }
-                        entry<Route.ChatImage>(swipeDismiss = swipeDismiss) { key ->
-                            ChatImageScreen(
-                                imagePath = key.imagePath,
-                                chatId = key.chatId,
-                                msgId = key.msgId,
-                                elementId = key.elementId,
-                            )
+                        // 图片查看器的横划留给翻页；系统返回、顶部返回按钮仍可退出。
+                        entry<Route.ChatImage>(swipeDismiss = NavSwipeDirection.None) { key ->
+                            ChatImageScreen(key)
                         }
                         entry<Route.ChatVideo>(swipeDismiss = swipeDismiss) { key ->
                             ChatVideoScreen(

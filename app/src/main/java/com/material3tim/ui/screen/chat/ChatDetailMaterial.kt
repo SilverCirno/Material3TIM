@@ -1166,7 +1166,7 @@ private fun MultiPartBubbleMaterial(
     content: Color,
     position: ChatBubblePosition,
 ) {
-    val navigator = LocalNavigator.current
+    val openImage = openChatImage(message)
     val colorScheme = MaterialTheme.colorScheme
     val imageLabel = stringResource(R.string.chat_image_message)
     val gradient = remember(colorScheme.secondaryContainer, colorScheme.tertiaryContainer) {
@@ -1186,7 +1186,7 @@ private fun MultiPartBubbleMaterial(
                 modifier = Modifier.padding(8.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                message.parts.forEach { part ->
+                message.parts.forEachIndexed { partIndex, part ->
                     when (part.kind) {
                         ChatPartKind.TEXT -> Text(
                             text = linkifyContent(
@@ -1225,18 +1225,7 @@ private fun MultiPartBubbleMaterial(
                                             Modifier.background(gradient)
                                         },
                                     )
-                                    .clickable {
-                                        part.imagePath?.let {
-                                        navigator.push(
-                                            Route.ChatImage(
-                                                imagePath = it,
-                                                chatId = message.chatId,
-                                                msgId = message.msgId,
-                                                elementId = part.elementId,
-                                            ),
-                                        )
-                                    }
-                                    },
+                                    .clickable { openImage(partIndex) },
                                 contentAlignment = Alignment.Center,
                             ) {
                                 if (part.imagePath != null) {
@@ -1293,7 +1282,7 @@ private fun ImageBubbleMaterial(message: ChatMessage, position: ChatBubblePositi
         EmojiImageBubbleMaterial(message)
         return
     }
-    val navigator = LocalNavigator.current
+    val openImage = openChatImage(message)
     val colorScheme = MaterialTheme.colorScheme
     val gradient = remember(colorScheme.secondaryContainer, colorScheme.tertiaryContainer) {
         Brush.linearGradient(listOf(colorScheme.secondaryContainer, colorScheme.tertiaryContainer))
@@ -1311,18 +1300,7 @@ private fun ImageBubbleMaterial(message: ChatMessage, position: ChatBubblePositi
             .height((220f / ratio).dp)
             .clip(chatBubbleShape(position, message.isMe))
             .background(gradient)
-            .clickable {
-                message.imagePath?.let {
-                navigator.push(
-                    Route.ChatImage(
-                        imagePath = it,
-                        chatId = message.chatId,
-                        msgId = message.msgId,
-                        elementId = message.elementId,
-                    ),
-                )
-            }
-            },
+            .clickable { openImage(null) },
         contentAlignment = Alignment.Center,
     ) {
         if (message.imagePath != null) {
@@ -1359,7 +1337,7 @@ private fun ImageBubbleMaterial(message: ChatMessage, position: ChatBubblePositi
 /** 表情图片：无气泡框、无背景，限制最大尺寸类似 TIM 的表情展示。 */
 @Composable
 private fun EmojiImageBubbleMaterial(message: ChatMessage) {
-    val navigator = LocalNavigator.current
+    val openImage = openChatImage(message)
     val ratio = remember(message.imagePath, message.imageWidth, message.imageHeight) {
         when {
             message.imageWidth > 0 && message.imageHeight > 0 ->
@@ -1373,18 +1351,7 @@ private fun EmojiImageBubbleMaterial(message: ChatMessage) {
         modifier = Modifier
             .width(widthDp.dp)
             .height(heightDp.dp)
-            .clickable {
-                message.imagePath?.let {
-                navigator.push(
-                    Route.ChatImage(
-                        imagePath = it,
-                        chatId = message.chatId,
-                        msgId = message.msgId,
-                        elementId = message.elementId,
-                    ),
-                )
-            }
-            },
+            .clickable { openImage(null) },
         contentAlignment = Alignment.Center,
     ) {
         if (message.imagePath != null) {

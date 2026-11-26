@@ -215,6 +215,7 @@ fun ChatRecordScreen(
     CompositionLocalProvider(
         LocalChatRecordParentMsgId provides msgId,
         LocalChatRecordRootMsgId provides providedRootMsgId,
+        LocalChatImageMessages provides messages,
     ) {
         when (LocalUiMode.current) {
             UiMode.Miuix -> ChatRecordMiuix(
