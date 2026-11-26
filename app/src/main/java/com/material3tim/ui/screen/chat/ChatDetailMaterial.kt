@@ -2439,6 +2439,7 @@ private fun handleMessageMenuActionMaterial(
         // at对方在 LocalMessageMenuAction provider 中单独处理（需聚焦输入框 + 弹键盘）。
         MessageMenuAction.AT_SENDER -> Unit
         MessageMenuAction.ADD_TO_FAVORITE -> Unit
+        MessageMenuAction.SAVE_TO_COLLECTION -> openMessageCollection(context, message)
     }
 }
 

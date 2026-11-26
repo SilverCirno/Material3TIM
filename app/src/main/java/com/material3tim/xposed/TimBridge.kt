@@ -4915,68 +4915,55 @@ internal object TimBridge {
         val mime = android.webkit.MimeTypeMap.getSingleton()
             .getMimeTypeFromExtension(extension) ?: "*/*"
         return runCatching {
-            var uri: android.net.Uri? = null
-            var usedAuthority = ""
-            // 优先用 TIM 自己的 FileProvider7Helper（内部用 TIM 的 FileProvider 类与
-            // authority = packageName + ".fileprovider"，避免直接反射 androidx 类时
-            // 命中模块自带/被 R8 重命名的类导致 ClassNotFoundException）。
-            runCatching {
-                val helperClass = Class.forName(
-                    "com.tencent.mobileqq.utils.kapalaiadapter.FileProvider7Helper",
-                    false, cl,
-                )
-                val method = helperClass.methods.firstOrNull {
-                    it.name == "getUriForFile" && it.parameterCount == 2 &&
-                        it.parameterTypes[0] == Context::class.java &&
-                        it.parameterTypes[1] == java.io.File::class.java
-                } ?: return@runCatching
-                val candidate = method.invoke(null, context, file) as? android.net.Uri
-                if (candidate != null) {
-                    uri = candidate
-                    usedAuthority = "FileProvider7Helper"
-                }
-            }
-            if (uri == null) {
-                val fileProviderClass = Class.forName("androidx.core.content.FileProvider", false, cl)
-                val getUriForFile = fileProviderClass.getMethod(
-                    "getUriForFile",
-                    Context::class.java,
-                    String::class.java,
-                    java.io.File::class.java,
-                )
-                for (authority in listOf(
-                    "com.tencent.tim.fileprovider",
-                    "com.tencent.tim.external.fileprovider",
-                )) {
-                    val candidate = runCatching {
-                        getUriForFile.invoke(null, context, authority, file) as? android.net.Uri
-                    }.getOrNull()
-                    if (candidate != null) {
-                        uri = candidate
-                        usedAuthority = authority
-                        break
-                    }
-                }
-            }
-            if (uri == null) {
-                Log.w(TAG, "fileOpen: FileProvider.getUriForFile failed name=${file.name}")
-                return false
-            }
+            val uri = hostFileUri(context, cl, file) ?: return false
             val intent = Intent(Intent.ACTION_VIEW).apply {
                 setDataAndType(uri, mime)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
             context.startActivity(intent)
-            Log.i(
-                TAG,
-                "fileOpen: ok name=${file.name} mime=$mime authority=$usedAuthority",
-            )
+            Log.i(TAG, "fileOpen: ok name=${file.name} mime=$mime authority=${uri.authority}")
             true
         }.getOrElse { t ->
             Log.w(TAG, "fileOpen: open failed name=${file.name}: ${t.javaClass.simpleName} ${t.message}")
             false
         }
+    }
+
+    internal fun hostFileUri(context: Context, cl: ClassLoader, file: java.io.File): android.net.Uri? {
+        // 优先用 TIM 自己的 FileProvider7Helper（内部用 TIM 的 FileProvider 类与
+        // authority = packageName + ".fileprovider"，避免直接反射 androidx 类时
+        // 命中模块自带/被 R8 重命名的类导致 ClassNotFoundException）。
+        val primary = runCatching {
+            val helperClass = Class.forName(
+                "com.tencent.mobileqq.utils.kapalaiadapter.FileProvider7Helper",
+                false, cl,
+            )
+            val method = helperClass.methods.firstOrNull {
+                it.name == "getUriForFile" && it.parameterCount == 2 &&
+                    it.parameterTypes[0] == Context::class.java &&
+                    it.parameterTypes[1] == java.io.File::class.java
+            } ?: return@runCatching null
+            method.invoke(null, context, file) as? android.net.Uri
+        }.getOrNull()
+        if (primary != null) return primary
+        return runCatching {
+            val fileProviderClass = Class.forName("androidx.core.content.FileProvider", false, cl)
+            val getUriForFile = fileProviderClass.getMethod(
+                "getUriForFile",
+                Context::class.java,
+                String::class.java,
+                java.io.File::class.java,
+            )
+            listOf(
+                "com.tencent.tim.fileprovider",
+                "com.tencent.tim.external.fileprovider",
+            ).firstNotNullOfOrNull { authority ->
+                runCatching {
+                    getUriForFile.invoke(null, context, authority, file) as? android.net.Uri
+                }.getOrNull()
+            }
+        }.getOrNull()
     }
 
     /**
@@ -5193,7 +5180,7 @@ internal object TimBridge {
             Log.w(TAG, "openRedPacket: no context")
             return false
         }
-        val currentUin = currentWalletUin()
+        val currentUin = currentAccountUin()
         val currentNick = currentWalletNickName().ifBlank { currentUin }
         val peerUinStr = when {
             meta.peerUin != 0L -> meta.peerUin.toString()
@@ -8302,7 +8289,7 @@ internal object TimBridge {
     }
 
     /** 当前账号 uin（红包 PayBridge json 的 userId/groupId 用）。优先内核初始化时缓存的 myUin。 */
-    private fun currentWalletUin(): String {
+    internal fun currentAccountUin(): String {
         myUin?.takeIf { it.isNotBlank() }?.let { return it }
         return runCatching {
             val cl = hostClassLoader() ?: return@runCatching ""
