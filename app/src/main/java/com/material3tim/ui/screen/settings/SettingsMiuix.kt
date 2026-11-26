@@ -163,6 +163,13 @@ fun SettingPagerMiuix(
                                 onClick = actions.onOpenTheme,
                             )
                         },
+                        CardItem("telegramStickers") {
+                            ArrowPreference(
+                                title = stringResource(R.string.tg_settings),
+                                summary = stringResource(R.string.tg_settings_summary),
+                                onClick = actions.onSyncTelegram,
+                            )
+                        },
                         CardItem("timSettings") {
                             ArrowPreference(
                                 title = stringResource(id = R.string.settings_open_tim_settings),

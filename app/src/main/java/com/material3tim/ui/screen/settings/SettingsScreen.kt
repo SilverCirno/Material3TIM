@@ -26,6 +26,7 @@ fun SettingPager(navigator: Navigator) {
     val context = LocalContext.current
 
     val actions = SettingsScreenActions(
+        onSyncTelegram = rememberTelegramSyncAction(),
         onOpenTheme = { navigator.push(Route.ColorPalette) },
         onSetUiModeIndex = { index -> viewModel.setUiMode(uiModeFromIndex(index)) },
         onOpenAbout = { navigator.push(Route.About) },
