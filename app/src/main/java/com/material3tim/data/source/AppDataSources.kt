@@ -290,6 +290,9 @@ interface ContactSource {
 
     fun loadContactDetail(contactId: String): ContactDetail?
 
+    /** 将当前联系人 NT UID 解析为 QQ 号。失败返回 null；需在 IO 线程调用。 */
+    fun resolveContactUin(uid: String): String? = null
+
     /**
      * 按聊天上下文加载任意用户资料（群聊成员/私聊对方，含非好友）；[uid]/[uin] 二选一可用。
      * 返回 [UserProfile]（好友关系、群角色、群成员信息）；失败返回 null。阻塞，需在 IO 线程调用。

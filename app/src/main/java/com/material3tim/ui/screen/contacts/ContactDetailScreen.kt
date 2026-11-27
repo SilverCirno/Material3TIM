@@ -15,6 +15,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -38,7 +39,9 @@ import com.material3tim.ui.navigation3.LocalNavigator
 import com.material3tim.ui.navigation3.Route
 import com.material3tim.ui.screen.chat.GroupMemberRole
 import com.material3tim.ui.screen.chat.canOperateMember
+import com.material3tim.ui.screen.profile.qZoneUin
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
@@ -60,6 +63,8 @@ fun ContactDetailScreen(
 ) {
     val navigator = LocalNavigator.current
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var resolvingQZone by remember(contactId, chatId, uid, uin) { mutableStateOf(false) }
     val liveSource = AppDataSources.contactSource
     val isChatProfile = chatId.isNotBlank() && (uid.isNotBlank() || uin.isNotBlank())
     var profile by remember(contactId, chatId, uid, uin) { mutableStateOf<UserProfile?>(null) }
@@ -241,19 +246,29 @@ fun ContactDetailScreen(
         )
     }
     val onProfileRefresh: () -> Unit = { refreshTick += 1 }
-    val onOpenQZone: () -> Unit = {
-        // 优先用群成员/入口传入的 QQ 号；timId 在拿不到 uin 时会退化成 uid，
-        // 拿它去开空间会变成错误的人（甚至空号）。只接受纯数字 QQ 号。
-        val qzoneQq = sequenceOf(
-            targetMember?.uin,
-            uin,
-            profile?.timId,
-            pageDetail.timId,
-        ).filterNotNull().firstOrNull { candidate ->
-            // QQ 号必须为正整数；"0" / uid 字符串都不能拿去开空间。
-            (candidate.toLongOrNull() ?: 0L) > 0L
-        }.orEmpty()
-        com.material3tim.ui.util.openQZone(context, qzoneQq)
+    val onOpenQZone: () -> Unit = openSpace@{
+        if (resolvingQZone) return@openSpace
+        // 联系人页可能只有 NT UID；优先已有 QQ 号，否则让宿主解析当前联系人的真实号码。
+        val number = sequenceOf(targetMember?.uin, uin, profile?.timId, pageDetail.timId)
+            .firstNotNullOfOrNull(::qZoneUin)
+        if (number != null) {
+            navigator.push(Route.QZone(number, ownProfile = isSelf))
+            return@openSpace
+        }
+        val contactUid = sequenceOf(targetMember?.uid, uid, remarkUid, profile?.timId, pageDetail.timId)
+            .filterNotNull().firstOrNull { it.startsWith("u_") }
+        val currentRoute = navigator.current()
+        resolvingQZone = true
+        scope.launch {
+            try {
+                val resolved = withContext(Dispatchers.IO) {
+                    contactUid?.let { liveSource?.resolveContactUin(it) }?.let(::qZoneUin)
+                }
+                if (navigator.current() != currentRoute) return@launch
+                if (resolved != null) navigator.push(Route.QZone(resolved, ownProfile = isSelf))
+                else android.widget.Toast.makeText(context, R.string.qzone_contact_number_unavailable, android.widget.Toast.LENGTH_SHORT).show()
+            } finally { resolvingQZone = false }
+        }
     }
     // 仅「聊天头像入口且资料还没拿到」时显示局部 loading/失败态；拿到后（甚至刷新中）继续显示旧数据。
     val showProfilePlaceholders = isChatProfile && profile == null

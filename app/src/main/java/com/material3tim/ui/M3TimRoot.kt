@@ -98,6 +98,7 @@ import com.material3tim.ui.screen.profile.EditProfileScreen
 import com.material3tim.ui.screen.profile.FavoritesScreen
 import com.material3tim.ui.screen.profile.FilesScreen
 import com.material3tim.ui.screen.profile.ProfilePager
+import com.material3tim.ui.screen.profile.QZoneScreen
 import com.material3tim.ui.screen.profile.ServicesScreen
 import com.material3tim.ui.screen.profile.WalletScreen
 import com.material3tim.ui.screen.settings.SettingPager
@@ -336,6 +337,7 @@ fun M3TimRoot(
                         entry<Route.Tags>(swipeDismiss = swipeDismiss) { TagsScreen() }
                         entry<Route.OfficialAccounts>(swipeDismiss = swipeDismiss) { OfficialAccountsScreen() }
                         entry<Route.EditProfile>(swipeDismiss = swipeDismiss) { EditProfileScreen() }
+                        entry<Route.QZone>(swipeDismiss = NavSwipeDirection.None) { key -> QZoneScreen(key) }
                         entry<Route.Favorites>(swipeDismiss = swipeDismiss) { FavoritesScreen() }
                         entry<Route.Files>(swipeDismiss = swipeDismiss) { FilesScreen() }
                         entry<Route.Wallet>(swipeDismiss = swipeDismiss) { WalletScreen() }

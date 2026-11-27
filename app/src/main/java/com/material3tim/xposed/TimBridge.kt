@@ -2367,8 +2367,13 @@ internal object TimBridge {
             val map = service.javaClass
                 .getMethod("getUinByUid", String::class.java, ArrayList::class.java)
                 .invoke(service, "", list) as? Map<*, *>
-            val uin = (map?.get(uid) as? Number)?.toLong() ?: 0L
-            if (uin != 0L) uidToUin[uid] = uin
+            val value = map?.get(uid)
+            val uin = when (value) {
+                is Number -> value.toLong()
+                is String -> value.toLongOrNull() ?: 0L
+                else -> 0L
+            }
+            if (uin > 0L) uidToUin[uid] = uin
             uin
         }.getOrDefault(0L)
     }
@@ -7287,6 +7292,27 @@ internal object TimBridge {
             Log.e(TAG, "loadContacts failed: ${t.javaClass.simpleName} ${t.message}", t)
             null
         }
+    }
+
+    fun resolveContactUin(uid: String): String? {
+        if (!isHost || !uid.startsWith("u_") || !ensureServices()) return null
+        // 只接受完全一致的 UID，不使用群号或将 UID 里的数字拼成 QQ 号。
+        chatMeta.values.firstOrNull { it.chatType == 1 && it.peerUid == uid && it.peerUin > 0L }
+            ?.let { return it.peerUin.toString() }
+        val mapped = uinForUid(uid)
+        if (mapped > 0L) return mapped.toString()
+        return runCatching {
+            val service = profileService ?: return null
+            val infos = service.javaClass.getMethod("getCoreAndBaseInfo", String::class.java, ArrayList::class.java)
+                .invoke(service, "", arrayListOf(uid)) as? Map<*, *>
+            val info = infos?.get(uid) ?: return null
+            val core = invokeGetter(info, "getCoreInfo")
+            val result = sequenceOf(core?.let { invokeGetter(it, "getUin") }, invokeGetter(info, "getUin"))
+                .mapNotNull { it?.toString()?.toLongOrNull()?.takeIf { number -> number > 0L } }
+                .firstOrNull() ?: return null
+            uidToUin[uid] = result
+            result.toString()
+        }.getOrNull()
     }
 
     /** 读取某个好友的详情（阻塞，IO 线程调用）。 */
@@ -21438,6 +21464,8 @@ internal class TimContactSource : ContactSource {
 
     override fun loadContactDetail(contactId: String): ContactDetail? =
         TimBridge.loadContactDetail(contactId)
+
+    override fun resolveContactUin(uid: String): String? = TimBridge.resolveContactUin(uid)
 
     override fun loadUserProfile(chatId: String, uid: String, uin: String): UserProfile? =
         TimBridge.loadUserProfile(chatId, uid, uin)

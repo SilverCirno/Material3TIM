@@ -163,6 +163,10 @@ sealed interface Route : NavKey, Parcelable {
 
     @Parcelize
     @Serializable
+    data class QZone(val uin: String, val ownProfile: Boolean = false, val visitors: Boolean = false) : Route
+
+    @Parcelize
+    @Serializable
     data object Favorites : Route
 
     @Parcelize

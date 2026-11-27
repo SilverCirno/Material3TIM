@@ -128,7 +128,7 @@ fun ProfileMaterial(
                             icon = Icons.Filled.Public,
                             title = stringResource(R.string.profile_qzone),
                             onClick = {
-                                com.material3tim.ui.util.openQZone(context, profile.timId)
+                                navigator.push(Route.QZone(profile.timId, ownProfile = true))
                             },
                         )
                     },
