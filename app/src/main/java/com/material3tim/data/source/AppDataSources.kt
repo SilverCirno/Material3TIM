@@ -251,6 +251,9 @@ interface MessageSource {
     /** 获取视频在线播放地址（未下载时使用）；失败返回 null。 */
     fun videoPlayUrl(chatId: String, msgId: Long, elementId: Long): String? = null
 
+    /** 在线地址不可用时，用 TIM 内核下载视频，返回已完成的本地文件。 */
+    suspend fun downloadChatVideo(chatId: String, msgId: Long, elementId: Long): String? = null
+
     /**
      * 下载并打开文件消息（未下载时先触发内核 richmedia 下载再交给系统应用打开）；阻塞，需在 IO 线程调用。
      * [knownPath] 为消息里已带出的本地路径（可空）。

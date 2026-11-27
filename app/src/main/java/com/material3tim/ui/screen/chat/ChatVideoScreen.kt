@@ -53,11 +53,14 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -106,21 +109,27 @@ fun ChatVideoScreen(
     val navigator = LocalNavigator.current
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var source by remember(videoPath) {
-        mutableStateOf(videoPath.takeIf { it.isNotBlank() && File(it).isFile }.orEmpty())
+    var source by remember(videoPath, chatId, msgId, elementId) {
+        mutableStateOf(videoPath.takeIf { it.isNotBlank() && File(it).let { f -> f.isFile && f.length() > 0L } }.orEmpty())
     }
-    var loading by remember(videoPath, chatId, msgId, elementId) { mutableStateOf(false) }
+    var loading by remember(videoPath, chatId, msgId, elementId) { mutableStateOf(source.isBlank()) }
+    var attempt by remember(videoPath, chatId, msgId, elementId) { mutableIntStateOf(0) }
+    var localOnly by remember(videoPath, chatId, msgId, elementId) { mutableStateOf(false) }
+    val canFetch = chatId.isNotBlank() && msgId != 0L && elementId != 0L
     var fullscreen by remember { mutableStateOf(false) }
     var controlsVisible by remember { mutableStateOf(true) }
 
-    LaunchedEffect(videoPath, chatId, msgId, elementId) {
-        if (source.isNotBlank()) return@LaunchedEffect
-        if (chatId.isBlank() || elementId == 0L) return@LaunchedEffect
-        loading = true
-        val url = withContext(Dispatchers.IO) {
-            AppDataSources.messageSource?.videoPlayUrl(chatId, msgId, elementId)
+    LaunchedEffect(videoPath, chatId, msgId, elementId, attempt) {
+        if (source.isNotBlank() || !canFetch) {
+            loading = false
+            return@LaunchedEffect
         }
-        if (!url.isNullOrBlank()) source = url
+        loading = true
+        source = withContext(Dispatchers.IO) {
+            val bridge = AppDataSources.messageSource ?: return@withContext null
+            val online = if (localOnly) null else bridge.videoPlayUrl(chatId, msgId, elementId)
+            online ?: bridge.downloadChatVideo(chatId, msgId, elementId)
+        }.orEmpty()
         loading = false
     }
     LaunchedEffect(controlsVisible) {
@@ -145,25 +154,41 @@ fun ChatVideoScreen(
             .fillMaxSize()
             .background(Color.Black),
     ) {
-        when {
-            source.isNotBlank() -> VideoStage(
-                source = source,
-                ratio = ratio,
-                accent = MaterialTheme.colorScheme.primary,
-                fullscreen = fullscreen,
-                controlsVisible = controlsVisible,
-                onToggleFullscreen = {
-                    fullscreen = !fullscreen
-                    controlsVisible = true
-                },
-                onToggleControls = { controlsVisible = !controlsVisible },
-            )
-            loading -> CircularProgressIndicator(
-                color = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.align(Alignment.Center),
-            )
-            else -> Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                VideoPlaceholder(thumbnailPath = thumbnailPath)
+        if (source.isNotBlank()) {
+            // 换成本地文件时销毁旧播放器，避免 AndroidView 继续用失效的网址。
+            key(source) {
+                val playingSource = source
+                VideoStage(
+                    source = playingSource,
+                    ratio = ratio,
+                    accent = MaterialTheme.colorScheme.primary,
+                    fullscreen = fullscreen,
+                    controlsVisible = controlsVisible,
+                    onToggleFullscreen = {
+                        fullscreen = !fullscreen
+                        controlsVisible = true
+                    },
+                    onToggleControls = { controlsVisible = !controlsVisible },
+                    onPlaybackError = {
+                        if (source == playingSource) {
+                            source = ""
+                            controlsVisible = true
+                            if (!localOnly && playingSource.startsWith("https://", ignoreCase = true) && canFetch) {
+                                localOnly = true
+                                loading = true
+                                attempt++
+                            }
+                        }
+                    },
+                )
+            }
+        } else {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                VideoPlaceholder(
+                    thumbnailPath = thumbnailPath,
+                    loading = loading,
+                    onRetry = if (canFetch && !loading) ({ localOnly = false; attempt++ }) else null,
+                )
             }
         }
 
@@ -202,6 +227,7 @@ fun ChatVideoScreen(
                     },
                     actions = {
                         IconButton(
+                            enabled = source.isNotBlank(),
                             onClick = {
                                 scope.launch {
                                     val message = withContext(Dispatchers.IO) {
@@ -238,6 +264,7 @@ private fun VideoStage(
     controlsVisible: Boolean,
     onToggleFullscreen: () -> Unit,
     onToggleControls: () -> Unit,
+    onPlaybackError: () -> Unit,
 ) {
     val context = LocalContext.current
     var videoView by remember { mutableStateOf<android.widget.VideoView?>(null) }
@@ -246,7 +273,14 @@ private fun VideoStage(
     var position by remember { mutableLongStateOf(0L) }
     var duration by remember { mutableLongStateOf(0L) }
     var dragging by remember { mutableStateOf(false) }
+    var prepared by remember { mutableStateOf(false) }
 
+    LaunchedEffect(prepared) {
+        if (!prepared) {
+            delay(15_000L)
+            if (!prepared) onPlaybackError()
+        }
+    }
     DisposableEffect(source) {
         onDispose { videoView?.stopPlayback() }
     }
@@ -294,17 +328,18 @@ private fun VideoStage(
                 modifier = Modifier.fillMaxSize(),
                 factory = { ctx ->
                     android.widget.VideoView(ctx).apply {
-                        setVideoPath(source)
                         setOnPreparedListener { mp ->
+                            prepared = true
                             duration = mp.duration.toLong()
                             buffering = false
                             start()
                         }
                         setOnCompletionListener { isPlaying = false }
                         setOnErrorListener { _, _, _ ->
-                            buffering = false
+                            onPlaybackError()
                             true
                         }
+                        setVideoPath(source)
                     }.also { videoView = it }
                 },
             )
@@ -421,7 +456,7 @@ private fun VideoStage(
 }
 
 @Composable
-private fun VideoPlaceholder(thumbnailPath: String) {
+private fun VideoPlaceholder(thumbnailPath: String, loading: Boolean, onRetry: (() -> Unit)?) {
     val bitmap = com.material3tim.ui.component.rememberLocalImage(thumbnailPath, maxDimension = 1024)
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
         if (bitmap != null) {
@@ -434,12 +469,14 @@ private fun VideoPlaceholder(thumbnailPath: String) {
                     .aspectRatio(16f / 9f),
             )
         }
+        if (loading) CircularProgressIndicator(Modifier.padding(top = 18.dp))
         Text(
-            text = stringResource(R.string.chat_video_missing),
+            text = stringResource(if (loading) R.string.chat_video_loading else R.string.chat_video_missing),
             style = MaterialTheme.typography.bodyMedium,
             color = Color.White,
-            modifier = Modifier.padding(24.dp),
+            modifier = Modifier.padding(16.dp),
         )
+        if (onRetry != null) TextButton(onClick = onRetry) { Text(stringResource(R.string.group_files_retry)) }
     }
 }
 

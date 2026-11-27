@@ -37,6 +37,7 @@ import com.material3tim.data.model.ForwardedFilePeer
 import com.material3tim.data.model.forwardedFileTargets
 import com.material3tim.data.model.forwardedMessageRowId
 import com.material3tim.data.model.forwardedSenderName
+import com.material3tim.data.model.chatVideoStreamUrl
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.withTimeoutOrNull
@@ -165,7 +166,12 @@ internal object TimBridge {
     /** 已经触发过下载的图片元素（msgId:elementId），避免反复请求。 */
     private val imageDownloadRequested = ConcurrentHashMap.newKeySet<String>()
 
-    private val videoThumbRequested = ConcurrentHashMap.newKeySet<String>()
+    private data class VideoThumbRequest(val chatId: String, val at: Long)
+    private val videoThumbRequests = ConcurrentHashMap<Pair<Long, Long>, VideoThumbRequest>()
+    private val videoThumbnailPaths = object : LinkedHashMap<Pair<Long, Long>, String>(32, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Pair<Long, Long>, String>?): Boolean = size > 256
+    }
+    private val videoDownloads = ConcurrentHashMap<Pair<Long, Long>, CompletableDeferred<String?>>()
 
     /** 聊天记录内视频文件下载+抽帧请求去重（key = "videoFile:msgId:elementId"）。 */
     private val videoFileDownloadStarted = ConcurrentHashMap.newKeySet<String>()
@@ -290,29 +296,25 @@ internal object TimBridge {
         val service = msgService ?: return
         val meta = chatMeta[chatId] ?: return
         val cl = hostClassLoader() ?: return
-        if (elementId == 0L) return
-        val key = "$msgId:$elementId"
-        if (!videoThumbRequested.add(key)) return
-        runCatching {
-            val method = service.javaClass.methods.firstOrNull {
-                it.name == "getRichMediaElement" && it.parameterCount == 1
-            } ?: return@runCatching
-            val request = buildRichMediaElementGetReq(
-                cl,
-                peerUid = meta.peerUid,
-                chatType = meta.chatType,
-                msgId = msgId,
-                elementId = elementId,
-                downloadType = 2,
-                thumbSize = 0,
-                downSourceType = 1,
-                triggerType = 1,
-            ) ?: return@runCatching
-            mainHandler.post {
-                runCatching { method.invoke(service, request) }
-                Log.i(TAG, "requested video thumb: msg=$msgId elem=$elementId (downloadType=2)")
-            }
-        }.onFailure { Log.w(TAG, "request video thumb failed: ${it.javaClass.simpleName} ${it.message}") }
+        if (msgId == 0L || elementId == 0L) return
+        val target = resolveKernelMethod(service, "getRichMediaElement", 1) ?: return
+        val ctx = videoPlayContextByMsg[msgId]
+        val request = buildRichMediaElementGetReq(
+            cl, ctx?.peerUid ?: meta.peerUid, ctx?.chatType ?: meta.chatType, msgId, elementId,
+            downloadType = 2, thumbSize = 0, downSourceType = 1, triggerType = 1,
+        ) ?: return
+        val now = perfUptime()
+        val key = msgId to elementId
+        val pending = VideoThumbRequest(chatId, now)
+        if (videoThumbRequests.size > 512) videoThumbRequests.entries.removeAll { now - it.value.at > 60_000L }
+        if (videoThumbRequests.compute(key) { _, previous ->
+                if (previous != null && now - previous.at < 15_000L) previous else pending
+            } !== pending
+        ) return
+        runCatching { target.second.invoke(target.first, request) }.onFailure {
+            videoThumbRequests.remove(key, pending)
+            Log.w(TAG, "request video thumb failed: ${it.javaClass.simpleName}")
+        }
     }
 
     /** 构造 RichMediaElementGetReq（字段赋值版，便于区分缩略图/视频本体请求）。 */
@@ -405,6 +407,28 @@ internal object TimBridge {
         }
     }
 
+    private fun isUsableVideoThumbnail(path: String?): Boolean {
+        if (path.isNullOrBlank() || !completeFilePath(path, 0L)) return false
+        if (isImageFilePath(path)) return true
+        // TIM 缓存有时无扩展名，用图片头判定而不是把它当作视频本体。
+        return runCatching {
+            val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            android.graphics.BitmapFactory.decodeFile(path, bounds)
+            bounds.outWidth > 0 && bounds.outHeight > 0
+        }.getOrDefault(false)
+    }
+
+    private fun isPlayableLocalVideo(path: String?): Boolean {
+        if (path.isNullOrBlank() || !completeFilePath(path, 0L)) return false
+        if (isVideoFilePath(path)) return true
+        return runCatching {
+            java.io.File(path).inputStream().use { input ->
+                val signature = ByteArray(8)
+                input.read(signature) == 8 && String(signature, 4, 4, Charsets.US_ASCII) == "ftyp"
+            }
+        }.getOrDefault(false)
+    }
+
     /** 是否是视频扩展名（视频本体路径）。 */
     private fun isVideoFilePath(path: String?): Boolean {
         val lower = path?.lowercase(Locale.ROOT) ?: return false
@@ -415,8 +439,8 @@ internal object TimBridge {
 
     /**
      * 扫 TIM 短视频缓存目录找视频本体：`<externalFilesDir.parent>/Tencent/Tim/shortvideo/<md5>/<md5>.mp4`。
-     * 接收消息的 VideoElement.filePath 常为空，但 TIM 可能已自动下载到该目录（真机已确认存在与
-     * fileSize 完全一致的 mp4）。优先文件名含 videoMd5/fileName，其次大小匹配。
+     * 接收消息的 VideoElement.filePath 常为空，但可能已自动下载到该目录。只使用哈希或文件名匹配，
+     * 不能单凭大小把另一个视频当成本消息。
      */
     private fun findTimShortVideoFile(
         videoMd5: String,
@@ -447,14 +471,10 @@ internal object TimBridge {
         val needles = listOf(videoMd5, fileName)
             .map { it.substringAfterLast('/') }
             .filter { it.isNotBlank() }
-        candidates.firstOrNull { file -> needles.any { file.name.contains(it, true) } }
-            ?.let { return it.absolutePath }
-        if (fileSize > 0L) {
-            candidates.firstOrNull { it.length() == fileSize }?.let { return it.absolutePath }
-            candidates.firstOrNull { kotlin.math.abs(it.length() - fileSize) <= 4096L }
-                ?.let { return it.absolutePath }
-        }
-        return null
+        return candidates.firstOrNull { file ->
+            file.length() > 0 && (fileSize <= 0L || file.length() == fileSize) &&
+                needles.any { needle -> file.name.equals(needle, true) || file.nameWithoutExtension.equals(needle, true) }
+        }?.absolutePath
     }
 
     /** 用 MediaMetadataRetriever 探测视频元数据（时长/宽高/旋转）。 */
@@ -2786,6 +2806,14 @@ internal object TimBridge {
                 }
             }
         }
+        val videoKey = msgId to elementId
+        if (downType in 0..1) {
+            videoDownloads[videoKey]?.let { pending ->
+                if (errCode != 0L || isPlayableLocalVideo(rawPath)) {
+                    pending.complete(rawPath.takeIf { errCode == 0L })
+                }
+            }
+        }
         if (errCode == 0L && !rawPath.isNullOrBlank() && pathUsable(rawPath) && elementId != 0L) {
             downloadedMediaByElement[elementId] = rawPath
         }
@@ -2801,6 +2829,13 @@ internal object TimBridge {
         if (errCode != 0L) return
         val path = rawPath ?: return
         if (!pathUsable(path)) return
+        if (downType in 0..2 && videoThumbRequests.containsKey(videoKey) && isUsableVideoThumbnail(path)) {
+            videoThumbRequests.remove(videoKey)?.let { request ->
+                synchronized(videoThumbnailPaths) { videoThumbnailPaths[videoKey] = path }
+                // 接收的新视频也会走这里，不依赖进入聊天时的短轮询。
+                LiveEvents.emitMessageEvent(MessageEvent(request.chatId, listOf(msgId), MessageEvent.Kind.UPDATE))
+            }
+        }
         when (downType) {
             2 -> downloadedImageThumbs[msgId] = path
             1 -> downloadedImageOrig[msgId] = path
@@ -7600,7 +7635,7 @@ internal object TimBridge {
                     "group=${meta?.isGroup == true}",
             )
         }
-        val (described, parts) = describeElementsWithParts(elements, msgId)
+        val (described, parts) = describeElementsWithParts(elements, msgId, allowSentVideoFallback = isMe)
         val replyInfo = extractReplyInfo(elements)
         val timeMillis = if (msgTime < 10_000_000_000L) msgTime * 1000L else msgTime
         val timeLabel = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(timeMillis))
@@ -7614,7 +7649,7 @@ internal object TimBridge {
         if (described.type == ChatMessageType.VIDEO) {
             // 记录该视频消息所属会话上下文（聊天记录内跨会话视频播放 URL 必须用内层 peer）。
             cacheVideoPlayContext(record, msgId)
-            if (described.imagePath == null) {
+            if (forwardedIndex == null && described.imagePath == null) {
                 requestVideoThumb(chatId, msgId, described.elementId)
             }
         }
@@ -8876,6 +8911,7 @@ internal object TimBridge {
     private fun describeElementsWithParts(
         elements: List<*>,
         msgId: Long,
+        allowSentVideoFallback: Boolean,
     ): Pair<ElementInfo, List<ChatPart>> {
         val parts = ArrayList<ChatPart>()
         val textBuffer = StringBuilder()
@@ -8889,7 +8925,7 @@ internal object TimBridge {
             if (element == null) continue
             // 聊天记录（合并转发）等特殊元素：保持原解析路径。
             if (invokeGetter(element, "getMultiForwardMsgElement") != null) {
-                return describeElements(elements, msgId) to emptyList()
+                return describeElements(elements, msgId, allowSentVideoFallback) to emptyList()
             }
             when ((invokeGetter(element, "getElementType") as? Number)?.toInt()) {
                 ELEMENT_TYPE_TEXT -> {
@@ -8923,11 +8959,11 @@ internal object TimBridge {
                         ?.let { parts.add(it) }
                 }
                 ELEMENT_TYPE_REPLY -> Unit // 引用元素不参与正文
-                else -> return describeElements(elements, msgId) to emptyList()
+                else -> return describeElements(elements, msgId, allowSentVideoFallback) to emptyList()
             }
         }
         flushText()
-        if (parts.isEmpty()) return describeElements(elements, msgId) to emptyList()
+        if (parts.isEmpty()) return describeElements(elements, msgId, allowSentVideoFallback) to emptyList()
         if (parts.size == 1) {
             // 单元素消息：与原 describeElements 输出保持一致（不引入 parts 渲染路径）。
             val part = parts[0]
@@ -8975,7 +9011,7 @@ internal object TimBridge {
         return primary to parts
     }
 
-    private fun describeElements(elements: List<*>, msgId: Long): ElementInfo {
+    private fun describeElements(elements: List<*>, msgId: Long, allowSentVideoFallback: Boolean): ElementInfo {
         for ((index, element) in elements.withIndex()) {
             if (element == null) continue
             // 聊天记录（合并转发）：elementType 不固定，直接用 multiForwardMsgElement 判断
@@ -9172,7 +9208,7 @@ internal object TimBridge {
                     val thumbs = video?.let { invokeGetter(it, "getThumbPath") } as? Map<*, *>
                     val mapThumb = thumbs.orEmpty().entries
                         .sortedByDescending { (it.key as? Number)?.toInt() ?: 0 }
-                        .mapNotNull { (it.value as? String)?.takeIf { path -> pathUsable(path) } }
+                        .mapNotNull { (it.value as? String)?.takeIf(::isUsableVideoThumbnail) }
                         .firstOrNull()
                     // 接收消息的 VideoElement.filePath/thumbPath 常为空：用内核
                     // assembleMobileQQRichMediaFilePath（TIM aio/utils/v.e/f 同款）拼真实缓存路径。
@@ -9186,11 +9222,12 @@ internal object TimBridge {
                         importRichMediaContext = importRichMediaContext,
                         fileUuid = fileUuid,
                         needCreate = false,
-                    )?.takeIf { isImageFilePath(it) && pathUsable(it) }
-                    val cachedThumb = downloadedMediaByElement[videoElementId]
-                        ?.takeIf { isImageFilePath(it) && pathUsable(it) }
+                    )?.takeIf(::isUsableVideoThumbnail)
+                    val cachedThumb = synchronized(videoThumbnailPaths) { videoThumbnailPaths[msgId to videoElementId] }
+                        ?.takeIf(::isUsableVideoThumbnail)
+                        ?: downloadedMediaByElement[videoElementId]?.takeIf(::isUsableVideoThumbnail)
                     val videoFilePath = (video?.let { invokeGetter(it, "getFilePath") } as? String)
-                        ?.takeIf { pathUsable(it) }
+                        ?.takeIf(::isPlayableLocalVideo)
                         ?: assembleRichMediaPath(
                             elementType = 5,
                             elementSubType = 0,
@@ -9201,14 +9238,13 @@ internal object TimBridge {
                             importRichMediaContext = importRichMediaContext,
                             fileUuid = fileUuid,
                             needCreate = false,
-                        )?.takeIf { pathUsable(it) }
-                        ?: downloadedMediaByElement[videoElementId]
-                            ?.takeIf { isVideoFilePath(it) && pathUsable(it) }
+                        )?.takeIf(::isPlayableLocalVideo)
+                        ?: downloadedMediaByElement[videoElementId]?.takeIf(::isPlayableLocalVideo)
                         ?: findTimShortVideoFile(videoMd5, videoFileName, fileSize)
                     // 自己刚发出的视频：服务端消息元素常无 filePath/thumb/duration，按 fileSize 回填
                     // 发送时记录的 sentVideoMeta（TTL 10 分钟）。
-                    val sentMeta = sentVideoMetaFor(fileSize)
-                    val sentVideoPath = sentMeta?.filePath?.takeIf { pathUsable(it) }
+                    val sentMeta = if (allowSentVideoFallback) sentVideoMetaFor(fileSize) else null
+                    val sentVideoPath = sentMeta?.filePath?.takeIf(::isPlayableLocalVideo)
                     val sentThumb = sentMeta?.thumbPath?.takeIf { isImageFilePath(it) && pathUsable(it) }
                     val finalVideoPath = videoFilePath ?: sentVideoPath
                     var thumbPath = mapThumb ?: assembledThumb ?: cachedThumb ?: sentThumb
@@ -9780,7 +9816,8 @@ internal object TimBridge {
                 val elementType = (invokeGetter(element, "getElementType") as? Number)?.toInt() ?: 0
                 when (elementType) {
                     ELEMENT_TYPE_VIDEO -> {
-                        if (invokeGetter(element, "getVideoElement") == null) return@forEach
+                        // 普通聊天在 mapMsgRecord 使用同一个限流的请求入口；这里仅处理转发。
+                        if (rootMsgIdOverride == null || invokeGetter(element, "getVideoElement") == null) return@forEach
                         requestRecordRichMedia(record, element, RecordRichMediaKind.VIDEO_THUMB)
                         requestRecordRichMedia(record, element, RecordRichMediaKind.VIDEO_FILE)
                     }
@@ -11885,9 +11922,10 @@ internal object TimBridge {
             val list = invokeGetter(result, key) as? List<*> ?: continue
             for (info in list) {
                 info ?: continue
-                val url = (invokeGetter(info, "getUrl") as? String)?.takeIf { it.isNotBlank() }
-                    ?: (invokeGetter(info, "getHttpsDomain") as? String)?.takeIf { it.isNotBlank() }
-                if (url != null) return url
+                chatVideoStreamUrl(
+                    invokeGetter(info, "getUrl") as? String,
+                    invokeGetter(info, "getHttpsDomain") as? String,
+                )?.let { return it }
             }
         }
         return null
@@ -11916,7 +11954,11 @@ internal object TimBridge {
             val codecClass = Class.forName(
                 "com.tencent.qqnt.kernel.nativeinterface.VideoCodecFormatType", false, cl,
             )
-            val codec = codecClass.enumConstants?.firstOrNull() ?: return@runCatching null
+            val codecs = codecClass.enumConstants.orEmpty()
+            val codec = codecs.firstOrNull { value ->
+                val name = (value as? Enum<*>)?.name.orEmpty().uppercase(Locale.ROOT)
+                "H264" in name || "AVC" in name
+            } ?: codecs.firstOrNull() ?: return@runCatching null
             val req = runCatching {
                 val reqClass = Class.forName(
                     "com.tencent.qqnt.kernel.nativeinterface.RMReqExParams", false, cl,
@@ -11939,18 +11981,16 @@ internal object TimBridge {
             val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, m, args ->
                 if (m.name == "onResult" && args != null) {
                     code = (args.getOrNull(0) as? Number)?.toInt() ?: -1
-                    url = parseVideoPlayResult(args.getOrNull(2))
+                    if (code == 0) url = parseVideoPlayResult(args.getOrNull(2))
                     latch.countDown()
                 }
                 defaultValueFor(m.returnType)
             }
             target.second.invoke(target.first, contact, msgId, elementId, codec, req, callback)
-            latch.await(8, TimeUnit.SECONDS)
+            latch.await(4, TimeUnit.SECONDS)
             Log.i(
                 TAG,
-                "videoPlayUrl ctx=$label contactPeer=${invokeGetter(contact, "getPeerUid")} " +
-                    "chatType=${invokeGetter(contact, "getChatType")} api=v2 " +
-                    "code=$code url=${url?.take(80)}",
+                "videoPlayUrl ctx=$label api=v2 code=$code playable=${url != null}",
             )
             VideoUrlAttempt(code, url, "v2")
         }.getOrElse { t ->
@@ -11982,7 +12022,11 @@ internal object TimBridge {
             val wayClass = Class.forName(
                 "com.tencent.qqnt.kernel.nativeinterface.VideoRequestWay", false, cl,
             )
-            val codec = codecClass.enumConstants?.firstOrNull() ?: return@runCatching null
+            val codecs = codecClass.enumConstants.orEmpty()
+            val codec = codecs.firstOrNull { value ->
+                val name = (value as? Enum<*>)?.name.orEmpty().uppercase(Locale.ROOT)
+                "H264" in name || "AVC" in name
+            } ?: codecs.firstOrNull() ?: return@runCatching null
             @Suppress("UNCHECKED_CAST")
             val ways = (wayClass.enumConstants.orEmpty().toList() as List<Any?>).sortedBy { enum ->
                 when ((enum as? Enum<*>)?.name) {
@@ -11991,32 +12035,22 @@ internal object TimBridge {
                     else -> 2
                 }
             }
-            var last = VideoUrlAttempt(-1, null, "old")
-            outer@ for (way in ways) {
-                for ((first, second) in listOf(msgId to elementId, elementId to msgId)) {
-                    val latch = CountDownLatch(1)
-                    var code = -1
-                    var url: String? = null
-                    val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, m, args ->
-                        if (m.name == "onResult" && args != null) {
-                            code = (args.getOrNull(0) as? Number)?.toInt() ?: -1
-                            url = parseVideoPlayResult(args.getOrNull(2))
-                            latch.countDown()
-                        }
-                        defaultValueFor(m.returnType)
-                    }
-                    target.second.invoke(target.first, contact, first, second, codec, way, callback)
-                    latch.await(6, TimeUnit.SECONDS)
-                    last = VideoUrlAttempt(code, url, "old")
-                    Log.i(
-                        TAG,
-                        "videoPlayUrl ctx=$label api=old way=${(way as? Enum<*>)?.name} " +
-                            "args=$first,$second code=$code url=${url?.take(80)}",
-                    )
-                    if (!url.isNullOrBlank()) break@outer
+            val way = ways.firstOrNull() ?: return@runCatching null
+            val latch = CountDownLatch(1)
+            var code = -1
+            var url: String? = null
+            val callback = Proxy.newProxyInstance(cl, arrayOf(callbackClass)) { _, m, args ->
+                if (m.name == "onResult" && args != null) {
+                    code = (args.getOrNull(0) as? Number)?.toInt() ?: -1
+                    if (code == 0) url = parseVideoPlayResult(args.getOrNull(2))
+                    latch.countDown()
                 }
+                defaultValueFor(m.returnType)
             }
-            last
+            target.second.invoke(target.first, contact, msgId, elementId, codec, way, callback)
+            latch.await(3, TimeUnit.SECONDS)
+            Log.i(TAG, "videoPlayUrl ctx=$label api=old code=$code playable=${url != null}")
+            VideoUrlAttempt(code, url, "old")
         }.getOrElse { t ->
             Log.w(
                 TAG,
@@ -12033,7 +12067,7 @@ internal object TimBridge {
     fun videoPlayUrl(chatId: String, msgId: Long, elementId: Long): String? {
         if (!isHost) return null
         if (!ensureServices()) return null
-        val rootContact = contacts[chatId] ?: return null
+        val rootContact = kernelContactFor(chatId) ?: return null
         val cl = hostClassLoader() ?: return null
         val service = kernelService?.let { invokeGetter(it, "getRichMediaService") } ?: run {
             Log.w(TAG, "videoPlayUrl: richMediaService null")
@@ -12055,7 +12089,7 @@ internal object TimBridge {
             if (attempt != null && !attempt.url.isNullOrBlank()) {
                 Log.i(
                     TAG,
-                    "videoPlayUrl ok ctx=$label api=v2 code=${attempt.code} url=${attempt.url.take(120)}",
+                    "videoPlayUrl ok ctx=$label api=v2 code=${attempt.code}",
                 )
                 return attempt.url
             }
@@ -12076,13 +12110,45 @@ internal object TimBridge {
             if (attempt != null && !attempt.url.isNullOrBlank()) {
                 Log.i(
                     TAG,
-                    "videoPlayUrl ok ctx=$label api=old code=${attempt.code} url=${attempt.url.take(120)}",
+                    "videoPlayUrl ok ctx=$label api=old code=${attempt.code}",
                 )
                 return attempt.url
             }
         }
         Log.w(TAG, "videoPlayUrl failed chat=$chatId msg=$msgId elem=$elementId ctx=${ctx != null}")
         return null
+    }
+
+    /** 同 TIM ShortVideoMsgItem 下载本体，等待同一消息、同一元素的内核完成回调。 */
+    suspend fun downloadChatVideo(chatId: String, msgId: Long, elementId: Long): String? {
+        if (!isHost || msgId == 0L || elementId == 0L || !ensureServices()) return null
+        val key = msgId to elementId
+        downloadedMediaByElement[elementId]?.takeIf(::isPlayableLocalVideo)?.let { return it }
+        val meta = chatMeta[chatId] ?: ensureChatContext(chatId) ?: return null
+        val ctx = videoPlayContextByMsg[msgId]
+        val service = msgService ?: return null
+        val method = resolveKernelMethod(service, "getRichMediaElement", 1) ?: return null
+        val cl = hostClassLoader() ?: return null
+        val request = buildRichMediaElementGetReq(
+            cl, ctx?.peerUid ?: meta.peerUid, ctx?.chatType ?: meta.chatType, msgId, elementId,
+            downloadType = 1, thumbSize = 0, downSourceType = 1, triggerType = 1,
+        ) ?: return null
+        val result = CompletableDeferred<String?>()
+        videoDownloads.putIfAbsent(key, result)?.let { active ->
+            return withTimeoutOrNull(60_000L) { active.await() }
+        }
+        try {
+            method.second.invoke(method.first, request)
+            Log.i(TAG, "videoOpen: kernel download requested msg=$msgId elem=$elementId")
+            return withTimeoutOrNull(60_000L) { result.await() }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (t: Throwable) {
+            Log.w(TAG, "videoOpen: kernel download failed: ${t.javaClass.simpleName}")
+            return null
+        } finally {
+            videoDownloads.remove(key, result)
+        }
     }
 
     /**
@@ -21571,6 +21637,9 @@ internal class TimMessageSource : MessageSource {
 
     override fun videoPlayUrl(chatId: String, msgId: Long, elementId: Long): String? =
         TimBridge.videoPlayUrl(chatId, msgId, elementId)
+
+    override suspend fun downloadChatVideo(chatId: String, msgId: Long, elementId: Long): String? =
+        TimBridge.downloadChatVideo(chatId, msgId, elementId)
 
     override fun deleteMessage(chatId: String, msgId: Long): Boolean =
         TimBridge.deleteMessage(chatId, msgId)

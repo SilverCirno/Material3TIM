@@ -2139,7 +2139,7 @@ internal fun openVideoMessage(
         queryMsgId != 0L && message.elementId != 0L -> onOpenPlayer(
             Route.ChatVideo(
                 videoPath = "",
-                thumbnailPath = message.videoThumbPath.orEmpty(),
+                thumbnailPath = thumbnailPath.ifBlank { message.videoThumbPath.orEmpty() },
                 chatId = message.chatId,
                 msgId = queryMsgId,
                 elementId = message.elementId,
