@@ -2670,7 +2670,7 @@ internal object TimBridge {
             if (msgId != 0L && !ids.contains(msgId)) ids.add(msgId)
         }
         // 新消息 → 系统通知（后台/其它会话才提醒；只入队，不阻塞内核回调线程）。
-        if (kind == MessageEvent.Kind.NEW) {
+        if (kind == MessageEvent.Kind.NEW && methodName != "onAddSendMsg") {
             records.forEach { record ->
                 val chatId = runCatching { chatIdForMsgRecord(record) }.getOrNull()
                 if (chatId != null) enqueueMessageNotification(chatId, record)
@@ -19798,8 +19798,8 @@ internal object TimBridge {
     /** 同一会话 1s 内多条新消息合并计数。 */
     private val notifyAggByChat = ConcurrentHashMap<String, NotifyAgg>()
 
-    /** 已发过通知的 msgId 去重（限长，避免内存增长）。 */
-    private val notifiedMsgIds = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
+    /** 按内核消息 ID 和会话序号去重；保留最近条目，不在达到上限时整表清空。 */
+    private val notificationDedupe = NotificationDeduplication()
 
     private val notifyExecutor =
         java.util.concurrent.Executors.newSingleThreadExecutor { r ->
@@ -20052,11 +20052,6 @@ internal object TimBridge {
     /** push 线程只做入队；真正判断/发通知在单线程 executor 里（可安全阻塞查会话缓存）。 */
     private fun enqueueMessageNotification(chatId: String, record: Any?) {
         if (chatId.isBlank() || record == null) return
-        val msgId = (invokeGetter(record, "getMsgId") as? Number)?.toLong() ?: 0L
-        if (msgId != 0L) {
-            if (!notifiedMsgIds.add(msgId)) return
-            if (notifiedMsgIds.size > 500) notifiedMsgIds.clear()
-        }
         runCatching {
             notifyExecutor.execute {
                 runCatching { maybePostMessageNotification(chatId, record) }
@@ -20163,7 +20158,16 @@ internal object TimBridge {
         }.onFailure { Log.w(TAG, "notify: dismiss enqueue failed chat=$chatId", it) }
     }
 
-    private fun maybePostMessageNotification(chatId: String, record: Any?) {
+    private fun maybePostMessageNotification(chatId: String, record: Any) {
+        val account = notificationReplyAccount()
+        val msgId = (invokeGetter(record, "getMsgId") as? Number)?.toLong() ?: 0L
+        val seq = (invokeGetter(record, "getMsgSeq") as? Number)?.toLong() ?: 0L
+        val type = (invokeGetter(record, "getChatType") as? Number)?.toInt() ?: 0
+        val peerUin = (invokeGetter(record, "getPeerUin") as? Number)?.toLong() ?: 0L
+        // 优先使用两种回调都可能带的 QQ 号/群号来比较序号，避免 peerUid 有无造成不同键。
+        val conversation = if (peerUin > 0L && type > 0) "$type:$peerUin" else chatId
+        val notifySeq = seq.takeIf { type == 1 || type == 2 } ?: 0L
+        if (!notificationDedupe.accept(account.orEmpty(), conversation, msgId, notifySeq)) return
         // 前台且正在看该会话：不提醒。
         if (AppUiState.isForeground && AppUiState.currentChatId == chatId) {
             Log.i(TAG, "notify: skip chat=$chatId (foreground in this chat)")
@@ -20232,12 +20236,12 @@ internal object TimBridge {
             .setWhen(nowMs)
             .setShowWhen(true)
             .setAutoCancel(true)
-            .setOnlyAlertOnce(false)
+            // 保留每会话一个通知：首次提醒，后续更新内容和快捷回复，不再响铃、震动。
+            .setOnlyAlertOnce(true)
             .setGroup(chatNotificationTag(chatId))
         // 每个会话一条独立通知，不用 group summary 标记（否则系统会当成摘要吞掉）。
         .setGroupSummary(false)
         notificationPendingIntent(context, chatId)?.let { builder.setContentIntent(it) }
-        val account = notificationReplyAccount()
         val replyLabel = notificationReplyLabel(com.material3tim.R.string.chat_notification_reply)
         if (account != null && replyLabel != null && prepareNotificationReplyContact(chatId, record)) {
             notificationReply.createAction(context, chatId, account, replyLabel)?.let { action ->
@@ -20255,8 +20259,8 @@ internal object TimBridge {
             }
             Log.i(
                 TAG,
-                "notify: post chat=$chatId title=${info.name.take(30)} body=$summaryText " +
-                    "count=$count id=${chatId.hashCode()} channel=$NOTIFY_CHANNEL_ID",
+                "notify: post chat=$chatId msg=$msgId count=$count " +
+                    "id=${chatId.hashCode()} channel=$NOTIFY_CHANNEL_ID",
             )
         }.onFailure { Log.w(TAG, "notify: notify() failed chat=$chatId: ${it.javaClass.simpleName} ${it.message}") }
     }
