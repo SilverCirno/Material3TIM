@@ -17194,6 +17194,23 @@ internal object TimBridge {
         }
     }
 
+    fun launchNativeScanner(): Boolean {
+        if (!isHost) return false
+        val activity = hostActivity()?.takeUnless { it.isFinishing || it.isDestroyed } ?: return false
+        val cl = hostClassLoader() ?: return false
+        return runCatching {
+            val scanner = Class.forName("com.tencent.mobileqq.qrscan.activity.ScannerActivity", false, cl)
+            // TIM 会话菜单的原生来源。scanForResult=false 让 ScannerActivity 自己完成识别和授权。
+            activity.startActivity(Intent(activity, scanner).apply {
+                putExtra("from", "Conversation")
+                putExtra("detectType", 3)
+                putExtra("scanForResult", false)
+            })
+            true
+        }.onFailure { Log.w(TAG, "qr: native scanner unavailable: ${it.javaClass.simpleName}") }
+            .getOrDefault(false)
+    }
+
     /**
      * 扫一扫结果处理（与 TIM 扫一扫结果一致），按内容 scheme 分发：
      * 1) mqqapi/mqq/qq scheme：TIM JumpAction 分发——QRoute `IJumpApi.doJumpAction`（内部即
@@ -17210,7 +17227,7 @@ internal object TimBridge {
             Log.w(TAG, "qr: openQrContent empty text")
             return false
         }
-        Log.i(TAG, "qr: openQrContent(text=${content.take(120)})")
+        // 登录二维码包含短期凭据，不写入日志。
         val cl = hostClassLoader() ?: run {
             Log.w(TAG, "qr: openQrContent unavailable (no host classloader)")
             return false
@@ -21452,6 +21469,7 @@ internal class TimAddFriendSource : AddFriendSource {
 
 /** 宿主里的扫一扫结果处理：交给 TIM 原生 DispatchScanResultActivity/QRJumpActivity。 */
 internal class TimQrActionSource : QrActionSource {
+    override fun launchNativeScanner(): Boolean = TimBridge.launchNativeScanner()
     override fun openQrContent(text: String): Boolean = TimBridge.openQrContent(text)
 }
 

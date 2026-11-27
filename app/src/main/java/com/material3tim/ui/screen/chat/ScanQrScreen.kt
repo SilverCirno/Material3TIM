@@ -79,15 +79,28 @@ internal enum class ScanQrError {
 /**
  * 扫一扫页面入口（消息页加号菜单「扫一扫」→ `Route.ScanQr`）。
  *
- * 页面内直接用 CameraX 预览 + 扫码框 + ZXing 实时解码，不再拉起系统相机：
+ * 宿主模式优先启动 TIM 原生扫一扫，让原应用完成登录授权等完整流程。
+ * 独立模式或宿主入口不可用时使用 CameraX + ZXing：
  * - 首次进入请求 CAMERA 权限；拒绝后显示权限说明，仍可「选择图片」；
  * - 预览下方有手电筒、相册、取消；
- * - 解出内容后按内容分发（http(s) → [ExternalLink]；其它优先
- *   [AppDataSources.qrActionSource]，再退化 ACTION_VIEW）；成功 Toast 并关闭，
+ * - 解出内容后优先交给 [AppDataSources.qrActionSource]；未分发时才按普通链接处理。
  *   失败在取景框下方显示原因（可复制内容、继续扫）。
  */
 @Composable
 fun ScanQrScreen(onClose: () -> Unit) {
+    val source = AppDataSources.qrActionSource
+    var showFallback by remember(source) { mutableStateOf(source == null) }
+    LaunchedEffect(source) {
+        if (source != null) {
+            if (runCatching { source.launchNativeScanner() }.getOrDefault(false)) onClose()
+            else showFallback = true
+        }
+    }
+    if (showFallback) CameraScanQrScreen(onClose)
+}
+
+@Composable
+private fun CameraScanQrScreen(onClose: () -> Unit) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
@@ -329,8 +342,8 @@ private fun toBinaryBitmap(bitmap: Bitmap): BinaryBitmap {
 
 /**
  * 二维码内容分发（按顺序）：
- * 1. http(s) 链接 → [ExternalLink.open]（与聊天气泡一致）；
- * 2. 其它内容 → [AppDataSources.qrActionSource] 交给 TIM 原生分发；
+ * 1. 所有码先交给 TIM 原生分发（登录码也可以是 HTTPS）；
+ * 2. 原生未处理的 http(s) 链接才交给 [ExternalLink.open]；
  * 3. 仍失败 → 内容带 scheme 时尝试系统 ACTION_VIEW。
  *
  * @return 是否已成功发起打开动作。
@@ -338,13 +351,13 @@ private fun toBinaryBitmap(bitmap: Bitmap): BinaryBitmap {
 private fun dispatchQrContent(context: Context, rawText: String): Boolean {
     val text = rawText.trim()
     if (text.isEmpty()) return false
+    val source = AppDataSources.qrActionSource
+    if (source != null && runCatching { source.openQrContent(text) }.getOrDefault(false)) {
+        return true
+    }
     val lower = text.lowercase()
     if (lower.startsWith("http://") || lower.startsWith("https://")) {
         ExternalLink.open(context, text)
-        return true
-    }
-    val source = AppDataSources.qrActionSource
-    if (source != null && runCatching { source.openQrContent(text) }.getOrDefault(false)) {
         return true
     }
     val uri = runCatching { Uri.parse(text) }.getOrNull() ?: return false

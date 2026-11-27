@@ -447,10 +447,10 @@ interface AddFriendSource {
 
 /** 扫一扫结果处理：QQ 功能性二维码（mqqapi://、加好友/加群卡片等）交给 TIM 原生跳转。 */
 interface QrActionSource {
-    /**
-     * 用 TIM 原生扫码结果分发（DispatchScanResultActivity）打开二维码内容；成功拉起返回 true。
-     * 普通 http(s) 链接由 UI 层用 ExternalLink 打开，不需要走这里。
-     */
+    /** 打开宿主原生扫码页；登录、授权、相册扫码由宿主处理。 */
+    fun launchNativeScanner(): Boolean = false
+
+    /** 用 TIM 原生扫码结果分发打开二维码内容；HTTPS 也可能是电脑端登录码。 */
     fun openQrContent(text: String): Boolean = false
 }
 
