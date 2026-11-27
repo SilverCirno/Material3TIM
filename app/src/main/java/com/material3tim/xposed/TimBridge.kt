@@ -32,6 +32,14 @@ import com.material3tim.data.model.GroupFilePage
 import com.material3tim.data.model.GroupMemberRole
 import com.material3tim.data.model.GroupNotice
 import com.material3tim.data.model.UserProfile
+import com.material3tim.data.model.ForwardedFile
+import com.material3tim.data.model.ForwardedFilePeer
+import com.material3tim.data.model.forwardedFileTargets
+import com.material3tim.data.model.forwardedMessageRowId
+import com.material3tim.data.model.forwardedSenderName
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.selects.select
+import kotlinx.coroutines.withTimeoutOrNull
 import com.material3tim.data.repository.LiveChats
 import com.material3tim.data.repository.formatChatTimeLabel
 import com.material3tim.data.source.AddFriendSource
@@ -2769,6 +2777,15 @@ internal object TimBridge {
             TAG,
             "richmedia complete: msg=$msgId elem=$elementId err=$errCode downType=$downType path=${rawPath?.take(80)}",
         )
+        if (downType in 0..1 && elementId != 0L) {
+            forwardedFileTransfers[msgId to elementId]?.let { transfer ->
+                if (errCode == 0L && completeFilePath(rawPath, transfer.size)) {
+                    transfer.path.complete(rawPath)
+                } else if (errCode != 0L) {
+                    transfer.path.complete(null)
+                }
+            }
+        }
         if (errCode == 0L && !rawPath.isNullOrBlank() && pathUsable(rawPath) && elementId != 0L) {
             downloadedMediaByElement[elementId] = rawPath
         }
@@ -2812,6 +2829,9 @@ internal object TimBridge {
             (progress * 100L / totalSize).toInt().coerceIn(0, 100)
         } else {
             progress.toInt().coerceIn(0, 100)
+        }
+        if (elementId != 0L && (progress > 0L || totalSize > 0L)) {
+            forwardedFileTransfers[msgId to elementId]?.started?.complete(Unit)
         }
         val old = if (elementId != 0L) {
             richMediaProgressByElement.put(elementId, pct)
@@ -5414,6 +5434,107 @@ internal object TimBridge {
         return ok
     }
 
+    private class ForwardedFileTransfer(val size: Long) {
+        val path = CompletableDeferred<String?>()
+        val started = CompletableDeferred<Unit>()
+    }
+
+    private val forwardedFileTransfers = ConcurrentHashMap<Pair<Long, Long>, ForwardedFileTransfer>()
+    private val forwardedFilePaths = object : LinkedHashMap<ForwardedFile, String>(32, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<ForwardedFile, String>?): Boolean = size > 64
+    }
+
+    private fun completeFilePath(path: String?, expectedSize: Long): Boolean =
+        !path.isNullOrBlank() && java.io.File(path).let {
+            it.isFile && it.length() > 0L && (expectedSize <= 0L || it.length() == expectedSize)
+        }
+
+    private fun forwardedFileElement(record: Any, elementId: Long): Any? {
+        val elements = invokeGetter(record, "getElements") as? List<*> ?: return null
+        return elements.mapNotNull { element ->
+            element ?: return@mapNotNull null
+            val id = (invokeGetter(element, "getElementId") as? Number)?.toLong() ?: 0L
+            if (id != elementId) return@mapNotNull null
+            invokeGetter(element, "getFileElement")
+        }.singleOrNull()
+    }
+
+    private fun completedForwardedElementPath(element: Any): String? {
+        val size = (invokeGetter(element, "getFileSize") as? Number)?.toLong() ?: 0L
+        return (invokeGetter(element, "getFilePath") as? String)?.takeIf { completeFilePath(it, size) }
+    }
+
+    /** 只处理用户点中的转发文件；原始消息从记录缓存取，不查询外层普通聊天。 */
+    suspend fun downloadForwardedFile(file: ForwardedFile): String? {
+        if (!isHost) return null
+        val index = file.rowIndex ?: return null
+        return try {
+            synchronized(forwardedFilePaths) { forwardedFilePaths[file] }
+                ?.takeIf { completeFilePath(it, 0L) }?.let { return it }
+            val key = chatRecordCacheKey(
+                file.chatId, file.recordMsgId, file.recordElementId, file.parentMsgId, file.rootMsgId,
+            )
+            if (chatRecordCacheGet(key) == null) {
+                loadChatRecord(file.chatId, file.recordMsgId, file.recordElementId, file.parentMsgId, file.rootMsgId)
+            }
+            val record = chatRecordCacheGet(key)?.first?.getOrNull(index) ?: return null
+            val innerId = (invokeGetter(record, "getMsgId") as? Number)?.toLong() ?: 0L
+            if (innerId != file.messageId) return null
+            val element = forwardedFileElement(record, file.elementId) ?: return null
+            completedForwardedElementPath(element)?.let { return it }
+            if (file.elementId == 0L || !ensureServices()) return null
+            val service = msgService ?: return null
+            val method = resolveKernelMethod(service, "getRichMediaElement", 1) ?: return null
+            val cl = hostClassLoader() ?: return null
+            val peer = (invokeGetter(record, "getPeerUid") as? String).orEmpty()
+            val chatType = (invokeGetter(record, "getChatType") as? Number)?.toInt() ?: 0
+            val meta = chatMeta[file.chatId]
+            val candidates = forwardedFileTargets(
+                file, ForwardedFilePeer(peer, chatType), meta?.let { ForwardedFilePeer(it.peerUid, it.chatType) },
+            )
+            val size = (invokeGetter(element, "getFileSize") as? Number)?.toLong() ?: 0L
+            for (target in candidates) {
+                val keyPair = target.msgId to file.elementId
+                val transfer = ForwardedFileTransfer(size)
+                if (forwardedFileTransfers.putIfAbsent(keyPair, transfer) != null) continue
+                try {
+                    val request = buildRichMediaElementGetReq(
+                        cl, target.peer.uid, target.peer.chatType, target.msgId, file.elementId,
+                        downloadType = 1, thumbSize = 0, downSourceType = 0, triggerType = 0,
+                    ) ?: continue
+                    if (runCatching { method.second.invoke(method.first, request) }.isFailure) continue
+                    Log.i(TAG, "fileRecord: requested msg=${target.msgId} elem=${file.elementId}")
+                    // 未收到回调才尝试备用上下文；已开始传输则等待路径或错误，不并行重复下载。
+                    val started = withTimeoutOrNull(5_000L) {
+                        select {
+                            transfer.path.onAwait { false }
+                            transfer.started.onAwait { true }
+                        }
+                    } == true
+                    val path = if (started) {
+                        withTimeoutOrNull(120_000L) { transfer.path.await() }
+                    } else if (transfer.path.isCompleted) {
+                        transfer.path.await()
+                    } else null
+                    if (path != null) {
+                        synchronized(forwardedFilePaths) { forwardedFilePaths[file] = path }
+                        return path
+                    }
+                    // 已有传输时不启动其它上下文的重复下载。
+                    if (started && !transfer.path.isCompleted) return null
+                } finally {
+                    forwardedFileTransfers.remove(keyPair, transfer)
+                }
+            }
+            null
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (t: Throwable) {
+            Log.w(TAG, "fileRecord: download failed: ${t.javaClass.simpleName} ${t.message}")
+            null
+        }
+    }
+
     /** FileElement 的下载状态快照（progress 内核值基本只有 0/100，字节进度靠扫临时文件）。 */
     private class FileElementState(
         val progress: Int,
@@ -7438,7 +7559,11 @@ internal object TimBridge {
         return rawAtType to false
     }
 
-    private fun mapMsgRecord(chatId: String, record: Any?): MappedMessage? = try {
+    private fun mapMsgRecord(
+        chatId: String,
+        record: Any?,
+        forwardedIndex: Int? = null,
+    ): MappedMessage? = try {
         if (record == null) return null
         val meta = chatMeta[chatId]
         val msgId = (invokeGetter(record, "getMsgId") as? Number)?.toLong() ?: 0L
@@ -7447,10 +7572,18 @@ internal object TimBridge {
         val senderUin = (invokeGetter(record, "getSenderUin") as? Number)?.toLong() ?: 0L
         val isMe = (myUid != null && senderUid == myUid) ||
             (senderUin != 0L && senderUin.toString() == myUin)
-        val senderName = if (isMe) {
-            "我"
-        } else {
-            listOf(
+        val senderName = when {
+            forwardedIndex != null -> forwardedSenderName(
+                nickname = invokeGetter(record, "getSendNickName") as? String,
+                memberName = invokeGetter(record, "getSendMemberName") as? String,
+                remark = invokeGetter(record, "getSendRemarkName") as? String,
+                uin = senderUin,
+                unknown = runCatching {
+                    AppEnvironment.context.getString(com.material3tim.R.string.chat_search_unknown_sender)
+                }.getOrDefault("未知发送者"),
+            )
+            isMe -> "我"
+            else -> listOf(
                 invokeGetter(record, "getSendRemarkName") as? String,
                 invokeGetter(record, "getSendMemberName") as? String,
                 invokeGetter(record, "getSendNickName") as? String,
@@ -7473,6 +7606,7 @@ internal object TimBridge {
         val timeLabel = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(timeMillis))
         val isGroup = meta?.isGroup == true
         val senderAvatarPath = when {
+            forwardedIndex != null -> memberAvatarPath(senderUid, senderUin)
             isMe -> selfAvatarPath()
             isGroup -> memberAvatarPath(senderUid, senderUin)
             else -> meta?.let { chatAvatarPath(it) }
@@ -7490,11 +7624,16 @@ internal object TimBridge {
             requestPttDownload(record, msgId, described.elementId)
         }
         val message = ChatMessage(
-            id = "tim_${msgId}",
+            // 转发内层 msgId 可能重复或为 0，不能作为 Compose 列表行的唯一键。
+            id = forwardedIndex?.let { forwardedMessageRowId(it, msgId) } ?: "tim_$msgId",
             chatId = chatId,
             seq = recordSeq,
             senderName = senderName,
-            senderSeed = ((senderUin xor (senderUin ushr 32)).toInt() and 0x7fffffff),
+            senderSeed = if (forwardedIndex != null && senderUin == 0L) {
+                (senderUid.ifBlank { senderName }).hashCode() and Int.MAX_VALUE
+            } else {
+                (senderUin xor (senderUin ushr 32)).toInt() and Int.MAX_VALUE
+            },
             isMe = isMe,
             atMe = atMe,
             type = described.type,
@@ -7503,13 +7642,16 @@ internal object TimBridge {
             isRead = true,
             voiceSeconds = described.voiceSeconds,
             fileSize = described.fileSize,
-            showSenderName = isGroup && !isMe,
+            showSenderName = forwardedIndex != null || (isGroup && !isMe),
             senderAvatarPath = senderAvatarPath,
             imagePath = described.imagePath,
             imageWidth = described.imageWidth,
             imageHeight = described.imageHeight,
             isEmojiImage = described.emojiImage,
-            mediaPath = described.mediaPath,
+            // 转发附件不能从全局仅按 elementId 的媒体缓存取路径（可能是另一条消息的文件）。
+            mediaPath = if (forwardedIndex != null && described.type == ChatMessageType.FILE) {
+                forwardedFileElement(record, described.elementId)?.let(::completedForwardedElementPath)
+            } else described.mediaPath,
             timeSeparator = null,
             timestampMs = timeMillis,
             chatRecordTitle = described.recordTitle,
@@ -12099,8 +12241,8 @@ internal object TimBridge {
 
     /** 原始 MsgRecord → ChatMessage（按时间排序 + 回复预览解析）。 */
     private fun mapChatRecordMessages(chatId: String, raw: List<Any?>): List<ChatMessage> {
-        val mapped = raw.mapNotNull { record ->
-            mapMsgRecord(chatId, record)?.let { it.timeMillis to it.message }
+        val mapped = raw.mapIndexedNotNull { index, record ->
+            mapMsgRecord(chatId, record, forwardedIndex = index)?.let { it.timeMillis to it.message }
         }
         val ordered = if (mapped.size >= 2 && mapped.first().first > mapped.last().first) {
             mapped.reversed()
@@ -21420,6 +21562,8 @@ internal class TimMessageSource : MessageSource {
         elementId: Long,
         knownPath: String?,
     ): Boolean = TimBridge.downloadAndOpenFile(chatId, msgId, elementId, knownPath)
+
+    override suspend fun downloadForwardedFile(file: ForwardedFile): String? = TimBridge.downloadForwardedFile(file)
 
     override fun openLocalFile(path: String): Boolean = TimBridge.openLocalFile(path)
 

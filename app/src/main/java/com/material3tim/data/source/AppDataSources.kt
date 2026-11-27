@@ -1,5 +1,7 @@
 package com.material3tim.data.source
 
+import com.material3tim.data.model.ForwardedFile
+
 import com.material3tim.data.model.ChatInfoData
 import com.material3tim.data.model.GroupAssistantData
 import com.material3tim.data.model.GroupNotice
@@ -259,6 +261,9 @@ interface MessageSource {
         elementId: Long,
         knownPath: String?,
     ): Boolean = false
+
+    /** 下载合并转发内的附件；仅返回目标附件已确认下载完成的本地路径。 */
+    suspend fun downloadForwardedFile(file: ForwardedFile): String? = null
 
     /** 用系统应用通过 TIM FileProvider content:// 打开本地文件；成功拉起返回 true。 */
     fun openLocalFile(path: String): Boolean = false

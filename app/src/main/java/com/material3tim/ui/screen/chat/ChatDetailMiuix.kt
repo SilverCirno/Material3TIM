@@ -926,10 +926,10 @@ private fun MessageRowMiuix(
             horizontalAlignment = if (isMe) Alignment.End else Alignment.Start,
         ) {
             // 群聊：别人消息按 showSenderName 显示；自己消息（bridge showSenderName=false）在群聊里同样显示昵称。
-            val showSenderLabel = group.isGroupStart && if (isMe) isGroupChat else message.showSenderName
+            val showSenderLabel = group.isGroupStart && (message.showSenderName || (isMe && isGroupChat))
             if (showSenderLabel) {
                 Text(
-                    text = if (isMe) {
+                    text = if (isMe && !message.showSenderName) {
                         // bridge 对自己消息的 senderName 通常是「我」：优先真实群名片，其次 LiveProfile 昵称，最后「我」。
                         message.senderName
                             .takeIf { it.isNotBlank() && it != stringResource(R.string.chat_sender_me) }
