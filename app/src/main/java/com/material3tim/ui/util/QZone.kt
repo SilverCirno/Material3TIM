@@ -17,17 +17,14 @@ import com.material3tim.R
  * @param uin QQ 号（他人资料页传目标 QQ 号；自己的「我的」页传当前账号）。
  */
 fun openQZone(context: Context, uin: String): Boolean {
-    val qq = uin.trim()
-        .filter { it.isDigit() }
-        .takeIf { (it.toLongOrNull() ?: 0L) > 0L }
-        .orEmpty()
+    val qq = uin.trim().takeIf { value ->
+        value.all { it in '0'..'9' } && (value.toLongOrNull() ?: 0L) > 0L
+    }.orEmpty()
     val candidates = buildList {
         if (qq.isNotEmpty()) {
-            // open_homepage 才是「某个人的个人空间」；to_friend_feeds 是动态流，
-            // 之前放在第一位会打开成好友动态而不是资料页对应的人。
+            // 只回退到同一用户的个人主页，不用好友动态流替代。
             add("mqqapi://qzone/open_homepage?uin=$qq&src_type=internal&version=1")
             add("mqqapi://qzone/open_homepage?uin=$qq")
-            add("mqqapi://qzone/to_friend_feeds?uin=$qq&src_type=internal&version=1")
         } else {
             add("mqqapi://qzone/open_homepage")
         }
